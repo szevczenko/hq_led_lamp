@@ -1,2 +1,2 @@
-# Product Kconfig options are added here in subsequent MRs.
-# See KITCHEN_LED_CONTROLLER_PRODUCTION_PLAN.md §6.2 for the planned options.
+# ESP-IDF loads Kconfig.projbuild from component directories, not the project
+# root. Product options live in main/Kconfig.projbuild.
