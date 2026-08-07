@@ -1,0 +1,23 @@
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
+
+# Generated partition binary
+*.bin
+
+# Editor and OS artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/settings.json
+
+# Certificates and private keys — never commit
+*.key
+*.pem
+*.p12
+/cert/
+
+# Manufacturing secrets
+/config/manufacturing.json
