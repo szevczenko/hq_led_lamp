@@ -1,2 +1,2 @@
-# ESP-IDF loads Kconfig.projbuild from component directories, not the project
-# root. Product options live in main/Kconfig.projbuild.
+# ESP-IDF automatically loads Kconfig.projbuild from the project root and from
+# component directories. Product options live in main/Kconfig.projbuild.
