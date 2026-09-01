@@ -6,6 +6,18 @@ if(NOT DEFINED CONFIG_KLC_LED_PWM_FREQUENCY_HZ OR
     return()
 endif()
 
+# --- Board profile vs IDF target check --------------------------------------
+# Ensure the selected board profile matches the configured ESP-IDF target.
+if(DEFINED IDF_TARGET)
+    if(CONFIG_KLC_BOARD_ESP32_WROOM_32D AND NOT IDF_TARGET STREQUAL "esp32")
+        message(FATAL_ERROR "KLC: Board ESP32-WROOM-32D requires IDF_TARGET=esp32 (got '${IDF_TARGET}').")
+    elseif(CONFIG_KLC_BOARD_ESP32_S3 AND NOT IDF_TARGET STREQUAL "esp32s3")
+        message(FATAL_ERROR "KLC: Board ESP32-S3 requires IDF_TARGET=esp32s3 (got '${IDF_TARGET}').")
+    elseif(CONFIG_KLC_BOARD_ESP32_C6 AND NOT IDF_TARGET STREQUAL "esp32c6")
+        message(FATAL_ERROR "KLC: Board ESP32-C6 requires IDF_TARGET=esp32c6 (got '${IDF_TARGET}').")
+    endif()
+endif()
+
 # --- PWM clock-budget check -------------------------------------------------
 # ESP32 LEDC high-speed timer is clocked from APB (80 MHz).
 # Valid if: frequency * 2^resolution <= APB_CLK_HZ
