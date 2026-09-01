@@ -37,10 +37,14 @@ endif()
 # --- Input-only GPIO check (ESP32-WROOM-32D) --------------------------------
 # GPIOs 34-39 have no output driver on ESP32.
 if(CONFIG_KLC_BOARD_ESP32_WROOM_32D AND
-   DEFINED CONFIG_KLC_LED_PWM_GPIO AND
-   CONFIG_KLC_LED_PWM_GPIO GREATER_EQUAL 34)
-    message(FATAL_ERROR
-        "KLC: GPIO ${CONFIG_KLC_LED_PWM_GPIO} is input-only on ESP32-WROOM-32D "
-        "(GPIOs 34-39 have no output driver). "
-        "Set KLC_LED_PWM_GPIO to an output-capable GPIO (0-33).")
+   DEFINED CONFIG_KLC_LED_PWM_GPIO)
+    if(CONFIG_KLC_LED_PWM_GPIO GREATER 39)
+        message(FATAL_ERROR
+            "KLC: GPIO ${CONFIG_KLC_LED_PWM_GPIO} is not a valid ESP32 GPIO (valid: 0-39; GPIOs 34-39 are input-only).")
+    elseif(CONFIG_KLC_LED_PWM_GPIO GREATER_EQUAL 34)
+        message(FATAL_ERROR
+            "KLC: GPIO ${CONFIG_KLC_LED_PWM_GPIO} is input-only on ESP32-WROOM-32D "
+            "(GPIOs 34-39 have no output driver). "
+            "Set KLC_LED_PWM_GPIO to an output-capable GPIO (0-33).")
+    endif()
 endif()
