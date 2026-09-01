@@ -28,8 +28,8 @@ set(_klc_apb_hz 80000000)
 if(_klc_clk_req GREATER ${_klc_apb_hz})
     message(FATAL_ERROR
         "KLC: PWM ${CONFIG_KLC_LED_PWM_FREQUENCY_HZ} Hz x "
-        "${CONFIG_KLC_LED_PWM_RESOLUTION_BITS}-bit resolution requires "
-        "${_klc_clk_req} Hz >= APB clock (${_klc_apb_hz} Hz). "
+        "${CONFIG_KLC_LED_PWM_RESOLUTION_BITS}-bit resolution needs "
+        "${_klc_clk_req} Hz, which exceeds the APB clock (${_klc_apb_hz} Hz). "
         "Reduce KLC_LED_PWM_FREQUENCY_HZ or KLC_LED_PWM_RESOLUTION_BITS. "
         "Example: 20000 Hz x 11 bits = 40960000 Hz (valid).")
 endif()
