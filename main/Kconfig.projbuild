@@ -1,0 +1,90 @@
+menu "Kitchen LED Controller"
+
+    choice KLC_BOARD
+        prompt "Board profile"
+        default KLC_BOARD_ESP32_WROOM_32D
+        help
+            Select the hardware board. Each choice documents pin and peripheral
+            constraints for that module. The IDF_TARGET cmake variable must
+            match the selected board; cmake will reject mismatches.
+
+        config KLC_BOARD_ESP32_WROOM_32D
+            bool "ESP32-WROOM-32D"
+        config KLC_BOARD_ESP32_S3
+            bool "ESP32-S3 (placeholder — not production-ready)"
+        config KLC_BOARD_ESP32_C6
+            bool "ESP32-C6 (placeholder — not production-ready)"
+    endchoice
+
+    config KLC_LED_PWM_GPIO
+        int "LED PWM output GPIO"
+        range 0 48
+        default 18
+        help
+            GPIO driving the external MOSFET gate. Must be output-capable and
+            must not be a strapping pin on the selected board.
+            WROOM-32D safe choices: 13, 14, 16, 17, 18, 19, 21-23, 25-27,
+            32, 33. GPIOs 34-39 are input-only on ESP32 and are rejected at
+            configure time. The final pin must be confirmed from the schematic
+            before PCB release. This value is not a credential.
+
+    config KLC_LED_PWM_FREQUENCY_HZ
+        int "LED PWM frequency (Hz)"
+        range 1000 80000
+        default 20000
+        help
+            PWM carrier frequency driving the MOSFET. Must be confirmed with
+            the actual MOSFET switching characteristics to avoid audible noise
+            or excessive switching loss.
+            Constraint: frequency * 2^resolution must not exceed 80 000 000
+            (ESP32 APB clock). CMake rejects invalid combinations at configure
+            time.
+
+    config KLC_LED_PWM_RESOLUTION_BITS
+        int "LED PWM duty resolution (bits)"
+        range 8 15
+        default 11
+        help
+            Duty-cycle resolution. Higher values give finer brightness steps
+            at the cost of maximum achievable frequency. See the frequency
+            option for the combined APB-clock constraint.
+            At 20 kHz the maximum valid resolution on ESP32 is 11 bits
+            (20000 * 2048 = 40 960 000 < 80 000 000).
+
+    config KLC_LED_PWM_ACTIVE_LOW
+        bool "LED output is active-low"
+        default n
+        help
+            Enable when the power stage drives the LED off at logic-high and
+            on at logic-low. The OSAL PWM backend inverts the duty cycle when
+            this option is set.
+
+    config KLC_DEFAULT_BRIGHTNESS_PERCENT
+        int "Default brightness after state synchronization (%)"
+        range 0 100
+        default 100
+        help
+            Brightness applied once the device receives a valid desired state
+            from ThingsBoard. The hardware output stays off until that state
+            arrives regardless of this value. This is a hardware default, not
+            a credential.
+
+    config KLC_THINGSBOARD_SYNC_TIMEOUT_MS
+        int "ThingsBoard state synchronization timeout (ms)"
+        range 1000 60000
+        default 10000
+        help
+            Maximum time to wait for an authoritative power and brightness
+            state after MQTT connection. If the timeout expires the output
+            stays off and the device retries after reconnect backoff.
+
+    config KLC_TELEMETRY_PERIOD_MS
+        int "Periodic telemetry publish interval (ms)"
+        range 1000 3600000
+        default 30000
+        help
+            Interval between periodic health telemetry publishes. Telemetry
+            is also published on connect and on every state change. This value
+            is not a credential or token.
+
+endmenu

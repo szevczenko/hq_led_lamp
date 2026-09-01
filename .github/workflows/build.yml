@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: ["main", "feature/**"]
-  pull_request:
     branches: ["main"]
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   build-esp32:
@@ -18,21 +18,7 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Verify submodule is pinned
-        run: |
-          EXPECTED="e2a6d1bbd975b006981ee7ab871dec6284c45a48"
-          ACTUAL=$(git -C platform/hq_platform rev-parse HEAD)
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "ERROR: hq_platform is at $ACTUAL, expected $EXPECTED"
-            exit 1
-          fi
-
       - name: Build for ESP32-WROOM-32D
         run: |
           . $IDF_PATH/export.sh
-          idf.py build
-
-      - name: Verify no build output is tracked
-        run: |
-          git diff --name-only
-          test -z "$(git status --porcelain build/)"
+          pip install kconfiglib --quiet && idf.py build

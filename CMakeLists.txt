@@ -18,3 +18,5 @@ include(${HQ_REPO_ROOT}/cmake/modules.cmake)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(kitchen_led_controller)
+
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/klc_validate.cmake)

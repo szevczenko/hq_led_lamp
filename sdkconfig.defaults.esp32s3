@@ -1,0 +1,14 @@
+# ESP32-S3 placeholder board profile — not production-ready.
+# Build with: idf.py -DIDF_TARGET=esp32s3 build
+# Pin assignments and flash size must be confirmed before this profile
+# is used in production. No credentials or secrets are stored here.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_KLC_BOARD_ESP32_S3=y
+CONFIG_KLC_LED_PWM_GPIO=18
+CONFIG_KLC_LED_PWM_FREQUENCY_HZ=20000
+# 11-bit: 20000 * 2048 = 40 960 000 < 80 000 000 (APB clock)
+CONFIG_KLC_LED_PWM_RESOLUTION_BITS=11
+CONFIG_KLC_LED_PWM_ACTIVE_LOW=n
+CONFIG_KLC_DEFAULT_BRIGHTNESS_PERCENT=100
+CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS=10000
+CONFIG_KLC_TELEMETRY_PERIOD_MS=30000
