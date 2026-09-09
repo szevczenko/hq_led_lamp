@@ -9,7 +9,10 @@
  *   - osal_mkdir() fails when the volume is not mounted, returns
  *     OSAL_ERR_NAME_TAKEN for pre-registered directories, and otherwise
  *     creates the directory or returns the injected failure status,
- *   - osal_unmount() clears the mounted flag unless a failure is injected.
+ *   - osal_unmount() clears the mounted flag unless a failure is injected,
+ *   - osal_mkfs() and osal_rmfs() are recorded but never invoked by the
+ *     production bootstrap; their counters exist so the tests can prove no
+ *     format operation ever happens on the boot path.
  *
  * The mock deliberately provides only the narrow OSAL surface the bootstrap
  * uses, without pulling in the real OSAL headers (they would drag the whole
@@ -38,6 +41,8 @@ struct osal_fs_mock_state
     int mount_calls;
     int mkdir_calls;
     int unmount_calls;
+    int mkfs_calls;
+    int rmfs_calls;
 
     bool dir_exists[OSAL_FS_MOCK_MAX_DIRS];
     char dir_paths[OSAL_FS_MOCK_MAX_DIRS][OSAL_FS_MOCK_PATH_LEN];
@@ -98,6 +103,16 @@ int osal_fs_mock_mkdir_calls(void)
 int osal_fs_mock_unmount_calls(void)
 {
     return s.unmount_calls;
+}
+
+int osal_fs_mock_mkfs_calls(void)
+{
+    return s.mkfs_calls;
+}
+
+int osal_fs_mock_rmfs_calls(void)
+{
+    return s.rmfs_calls;
 }
 
 bool osal_fs_mock_is_mounted(void)
@@ -177,4 +192,25 @@ int32_t osal_mkdir(const char *path)
     int32_t status = s.mkdir_status;
     s.mkdir_status = OSAL_SUCCESS;
     return status;
+}
+
+int32_t osal_mkfs(char *address, const char *devname, const char *volname,
+                  size_t block_size, size_t num_blocks)
+{
+    (void)address;
+    (void)devname;
+    (void)volname;
+    (void)block_size;
+    (void)num_blocks;
+
+    ++s.mkfs_calls;
+    return OSAL_SUCCESS;
+}
+
+int32_t osal_rmfs(const char *devname)
+{
+    (void)devname;
+
+    ++s.rmfs_calls;
+    return OSAL_SUCCESS;
 }

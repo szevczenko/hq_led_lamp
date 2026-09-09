@@ -25,6 +25,12 @@ On `lamp_fs_init()`:
    product layer (`main/app_main.c`) wires that callback to
    `lamp_control_force_inactive()`, so the lamp output is off while storage
    is unusable, and skips configuration loading.
+4. A directory-creation failure never leaves a hidden mount behind: before
+   the error is returned the volume is unmounted through `osal_unmount()`,
+   so `lamp_fs_is_mounted()`, the OSAL backend state and a later retry stay
+   consistent.  If that unmount itself fails, the volume remains mounted in
+   the backend, `lamp_fs_is_mounted()` keeps reporting the true state, and
+   `LAMP_FS_ERR_UNMOUNT` is reported instead.
 
 The component is hardware-independent: it speaks only the portable OSAL
 filesystem API and never references ESP-IDF VFS, `esp_littlefs` or flash
@@ -40,18 +46,23 @@ configure time by `cmake/klc_validate.cmake`):
 | nvs      | data | nvs      | 0x9000   | 0x6000  | Wi-Fi credentials, cal data |
 | phy_init | data | phy      | 0xf000   | 0x1000  | PHY init data               |
 | otadata  | data | ota      | 0x10000  | 0x2000  | active OTA slot selection   |
+| coredump | data | coredump | 0x12000  | 0xE000  | Coredump/padding            |
 | ota_0    | app  | ota_0    | 0x20000  | 0x1C0000| OTA slot 0 (1792 KiB)       |
 | ota_1    | app  | ota_1    | 0x1E0000 | 0x1C0000| OTA slot 1 (1792 KiB)       |
-| storage  | data | littlefs | 0x3A0000 | 0x40000 | LittleFS volume (256 KiB)   |
+| storage  | data | littlefs | 0x3A0000 | 0x60000 | LittleFS volume (384 KiB)   |
 
 Sizing rationale:
 
 - The measured application image is far below 1 MiB, so 1792 KiB per OTA
   slot leaves a large safety margin for future firmware growth (ThingsBoard
   stack, TLS, Wi-Fi provisioning).
-- LittleFS starts at 256 KiB per the plan (section 7.1) — comfortably above
-  the 64 KiB example storage — holding certificates, configuration, OTA
-  state and diagnostics.
+- ESP-IDF requires app partitions to be 64 KiB aligned, and otadata ends at
+  0x12000, so a coredump partition fills 0x12000-0x20000, keeping the table
+  gap-free while both OTA slots stay 64 KiB aligned.
+- The LittleFS partition gets the whole remaining tail of the 4 MiB flash
+  (384 KiB) — comfortably above the 256 KiB minimum from the plan
+  (section 7.1) — holding certificates, configuration, OTA state and
+  diagnostics.
 - The 4 MiB WROOM-32D flash SKU fills exactly with no gaps.  The configure
   step re-checks offsets, alignment, overlaps and the flash-size bound and
   fails the build on any violation (including a flash-size/CSV mismatch, so
@@ -101,12 +112,19 @@ filesystem double with failure injection and call recording:
 - existing directories (`OSAL_ERR_NAME_TAKEN`): idempotent success, no
   fail-safe, contents untouched,
 - mount failure: fail-safe runs exactly once, no directory touched
-  (existing storage preserved),
-- directory failure: fail-safe runs, sequence stops, volume stays mounted,
+  (existing storage preserved), no format attempted,
+- directory failure: fail-safe runs, sequence stops, and the volume is
+  unmounted before the error is returned — no residual mount, backend and
+  `lamp_fs_is_mounted()` agree, a retry is clean,
+- directory failure with a failing unmount: `LAMP_FS_ERR_UNMOUNT` is
+  reported and `lamp_fs_is_mounted()` stays consistent with the still-
+  mounted backend,
+- no format: `osal_mkfs()`/`osal_rmfs()` counters stay zero across every
+  boot scenario (first mount, mount failure, directory failure),
 - ordering regression: directory creation only ever follows a successful
   mount,
 - lifecycle/argument edge cases (unmount when not mounted, NULL/empty path,
-  re-init after unmount).
+  re-init after unmount, retry after a failed bootstrap).
 
 ```sh
 cmake -S tests/lamp_fs -B build-lamp-fs-tests

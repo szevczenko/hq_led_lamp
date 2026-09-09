@@ -5,6 +5,17 @@ build_esp/
 build_review/
 build_tsan/
 build-*/
+build-lamp-fs-tests/
+build-lamp-control-tests/
+
+# Generated CMake build artifacts (host-test and review builds)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+Testing/
 managed_components/
 dependencies.lock
 sdkconfig

@@ -2,41 +2,24 @@
  * @file app_main.c
  * @brief Kitchen LED Controller application entry point.
  *
- *  ## Investigation notes (read before resuming TASK-118 / TASK-107)
+ *  ## Boot-order contract (TASK-107 / TASK-118)
  *
- *   An on-hardware log was captured after flashing the current TASK-107 code:
- *   `mkdir "/cert"` etc. reported `Failed to mkdir ... Error (-17)` (EEXIST), yet
- *   boot still reported `Filesystem ready`. This was investigated and verified
- *   directly against the vendored `esp_littlefs` source and the OSAL backends:
+ *   1. lamp_control_init() — the output is initialized off and stays off
+ *      until a valid desired state arrives.
+ *   2. lamp_fs_init() — mounts the LittleFS "storage" partition at
+ *      /littlefs through the OSAL and creates /cert, /config, /state
+ *      idempotently.  The mount never formats (TASK-118 removed the
+ *      backend's format_if_mount_failed), and lamp_fs never calls
+ *      osal_mkfs()/osal_rmfs() on the boot path: formatting is reserved
+ *      for explicit manufacturing/provisioning operations.
+ *   3. On any filesystem failure the fail-safe below forces the output
+ *      inactive, the error is logged, storage is preserved untouched and
+ *      configuration is not loaded.  A failed directory bootstrap unmounts
+ *      the volume before returning, so no hidden mount survives.
+ *   4. Only a fully successful bootstrap reaches configuration loading.
  *
- *  - **The EEXIST log is not evidence of the TASK-118 bug and is not a defect.**
- *   `idf.py flash` (without `erase-flash`) never rewrites the `storage`
- *   partition, so a LittleFS filesystem created by an earlier boot of this same
- *   firmware persists across reflashes and already contains `/cert`,
- *   `/config`, `/state`. `osal_mkdir()` on ESP already maps `EEXIST` ->
- *   `OSAL_ERR_NAME_TAKEN` (`platform/hq_platform/src/osal/esp/osal_dir_impl.c`),
- *   and `lamp_fs_ensure_dir()` already treats that as `LAMP_FS_OK`. Do not
- *   "fix" this idempotent path again; it is correct as-is.
- *  - **The TASK-118 concern is still real and unresolved.** As of this
- *   verification, `platform/hq_platform/src/osal/esp/osal_mount_impl.c`
- *   `osal_mount()` still sets `format_if_mount_failed = true`. TASK-118 must
- *   still be implemented; it was not accidentally already fixed.
- *  - **A concrete, verified contradiction blocks TASK-107 as currently worded.**
- *   `components/lamp_fs/lamp_fs.c` `lamp_fs_init()` currently handles a
- *   directory-creation failure by only clearing the internal `s_mounted` flag
- *   (`s_mounted = false;`) — it never calls `osal_unmount()`. The existing test
- *   `tests/lamp_fs/lamp_fs_test.c::test_directory_failure_forces_fail_safe`
- *   explicitly asserts the **opposite** of the current task requirement:
- *   `TEST_ASSERT_TRUE(osal_fs_mock_is_mounted())` after a directory failure.
- *   Any agent that implements the "unmount before returning the error"
- *   requirement literally will break this existing, currently-passing test.
- *   The next implementer must update that assertion (and add an
- *   unmount-failure-handling test) in the same change, not treat the existing
- *   test as a spec to preserve.
- *  - Everything else already implemented for TASK-107 (`partitions.csv` layout,
- *   `/cert`/`/config`/`/state` idempotent creation, no `osal_mkfs()`/
- *   `osal_rmfs()` on the boot path) looks complete against the current
- *   requirements and should not be redone from scratch.
+ *  The idempotent mkdir (EEXIST -> OSAL_ERR_NAME_TAKEN -> LAMP_FS_OK) is
+ *  expected after a reflash onto persistent storage and is not a defect.
  */
 
 #include <stdbool.h>

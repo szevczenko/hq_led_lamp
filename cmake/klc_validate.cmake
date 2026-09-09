@@ -86,9 +86,19 @@ if(EXISTS "${_klc_partitions_csv}" AND DEFINED CONFIG_ESPTOOLPY_FLASHSIZE)
         math(EXPR _klc_flash_bytes "${_klc_flash_mb} * 1024 * 1024")
     endif()
 
-    file(STRINGS "${_klc_partitions_csv}" _klc_partition_lines)
+    # Read the file whole rather than with file(STRINGS): file(STRINGS)
+    # splits lines at embedded semicolons, turning long '#' comments into
+    # unmarked continuation fragments that could be mistaken for partition
+    # rows.  Escaping semicolons first keeps every comment intact as a
+    # single '#' line, so the parser can treat every non-comment row as a
+    # real partition definition and validate it.
+    file(READ "${_klc_partitions_csv}" _klc_csv_content)
+    string(REPLACE ";" "\\;" _klc_csv_content "${_klc_csv_content}")
+    string(REPLACE "\r" "" _klc_csv_content "${_klc_csv_content}")
+    string(REPLACE "\n" ";" _klc_partition_lines "${_klc_csv_content}")
     set(_klc_p_names "")
     set(_klc_p_types "")
+    set(_klc_p_subtypes "")
     set(_klc_p_offsets "")
     set(_klc_p_sizes "")
 
@@ -97,13 +107,9 @@ if(EXISTS "${_klc_partitions_csv}" AND DEFINED CONFIG_ESPTOOLPY_FLASHSIZE)
         if(_klc_line STREQUAL "" OR _klc_line MATCHES "^#")
             continue()
         endif()
-        # file(STRINGS) may split long '#' comments (the ones containing a
-        # semicolon) into multiple lines; the continuation fragment does not
-        # start with '#' anymore.  Real partition rows always begin with a
-        # known partition name, so anything else is treated as a comment.
-        if(NOT _klc_line MATCHES "^(nvs|phy_init|otadata|ota_0|ota_1|storage)[, ]")
-            continue()
-        endif()
+        # Every remaining line must be a real partition definition: any row
+        # that does not parse as one (or uses an unknown name) is an error,
+        # never silently skipped.
         # Split on commas and spaces; a trailing comma yields an empty
         # last field, so strip empty entries before indexing.
         string(REGEX REPLACE "[, ]+" ";" _klc_fields "${_klc_line}")
@@ -115,17 +121,23 @@ if(EXISTS "${_klc_partitions_csv}" AND DEFINED CONFIG_ESPTOOLPY_FLASHSIZE)
         endforeach()
         list(LENGTH _klc_clean _klc_nfields)
         if(_klc_nfields LESS 5)
-            # Comment continuation line (a '#' comment was split across
-            # file(STRINGS) lines): not a partition definition.
-            continue()
+            message(FATAL_ERROR
+                "KLC: line '${_klc_line}' in partitions.csv is not a comment "
+                "and not a complete partition row (need Name, Type, SubType, "
+                "Offset, Size).")
         endif()
-        # Skip comment-continuation fragments: a partition name in this
-        # table always matches a fixed identifier charset.
         list(GET _klc_clean 0 _klc_name)
         list(GET _klc_clean 1 _klc_type)
+        list(GET _klc_clean 2 _klc_subtype)
         list(GET _klc_clean 3 _klc_offset)
         list(GET _klc_clean 4 _klc_size)
         set(_klc_fields "")
+        if(NOT _klc_name MATCHES "^[A-Za-z0-9_-]+$")
+            message(FATAL_ERROR
+                "KLC: partition name '${_klc_name}' in partitions.csv uses "
+                "characters outside the allowed set (letters, digits, "
+                "underscore, hyphen).")
+        endif()
         if(NOT _klc_type MATCHES "^(app|data)$")
             message(FATAL_ERROR
                 "KLC: partition '${_klc_name}' has unknown type '${_klc_type}' "
@@ -138,43 +150,70 @@ if(EXISTS "${_klc_partitions_csv}" AND DEFINED CONFIG_ESPTOOLPY_FLASHSIZE)
                 "explicit hexadecimal offset and size fields "
                 "(got offset='${_klc_offset}', size='${_klc_size}').")
         endif()
-        if(_klc_offset STREQUAL "")
-            message(FATAL_ERROR
-                "KLC: partition '${_klc_name}' in partitions.csv must have an "
-                "explicit offset for the validation to be exact.")
-        endif()
         list(APPEND _klc_p_names "${_klc_name}")
         list(APPEND _klc_p_types "${_klc_type}")
+        list(APPEND _klc_p_subtypes "${_klc_subtype}")
         list(APPEND _klc_p_offsets "${_klc_offset}")
         list(APPEND _klc_p_sizes "${_klc_size}")
     endforeach()
 
     list(LENGTH _klc_p_names _klc_p_count)
     math(EXPR _klc_last "${_klc_p_count} - 1")
-    set(_klc_have_ota0 FALSE)
-    set(_klc_have_ota1 FALSE)
-    set(_klc_lfs_size 0)
 
+    # Every parsed row must belong to the fixed WROOM layout: an unexpected
+    # partition name is an error, never silently ignored.
+    set(_klc_expected_names "nvs;phy_init;otadata;coredump;ota_0;ota_1;storage")
     foreach(_klc_i RANGE ${_klc_last})
         list(GET _klc_p_names ${_klc_i} _klc_name)
-        if(_klc_name STREQUAL "ota_0")
-            set(_klc_have_ota0 TRUE)
-        elseif(_klc_name STREQUAL "ota_1")
-            set(_klc_have_ota1 TRUE)
-        elseif(_klc_name STREQUAL "storage")
-            list(GET _klc_p_sizes ${_klc_i} _klc_lfs_size)
+        list(FIND _klc_expected_names "${_klc_name}" _klc_name_idx)
+        if(_klc_name_idx EQUAL -1)
+            message(FATAL_ERROR
+                "KLC: partitions.csv contains unexpected partition "
+                "'${_klc_name}'. This fixed ESP32-WROOM-32D layout accepts "
+                "only: ${_klc_expected_names}.")
         endif()
     endforeach()
 
-    if(NOT _klc_have_ota0 OR NOT _klc_have_ota1)
-        message(FATAL_ERROR
-            "KLC: partitions.csv must define two OTA app slots (ota_0 and ota_1).")
-    endif()
+    # --- Required partitions: exact names, exactly once, with the expected
+    # --- type and subtype (TASK-107).  'coredump' is part of the layout as
+    # --- well: it pads otadata's end (0x12000) up to the 64 KiB app-slot
+    # --- alignment boundary so the table stays gap-free.
+    set(_klc_required_names "nvs;phy_init;otadata;coredump;ota_0;ota_1;storage")
+    set(_klc_required_types "data;data;data;data;app;app;data")
+    set(_klc_required_subtypes "nvs;phy;ota;coredump;ota_0;ota_1;littlefs")
+    set(_klc_lfs_size 0)
 
-    if(_klc_lfs_size EQUAL 0)
-        message(FATAL_ERROR
-            "KLC: partitions.csv must define a LittleFS 'storage' data partition.")
-    endif()
+    foreach(_klc_r RANGE 6)
+        list(GET _klc_required_names ${_klc_r} _klc_req_name)
+        list(GET _klc_required_types ${_klc_r} _klc_req_type)
+        list(GET _klc_required_subtypes ${_klc_r} _klc_req_subtype)
+        set(_klc_req_count 0)
+        foreach(_klc_i RANGE ${_klc_last})
+            list(GET _klc_p_names ${_klc_i} _klc_name)
+            if(NOT _klc_name STREQUAL _klc_req_name)
+                continue()
+            endif()
+            math(EXPR _klc_req_count "${_klc_req_count} + 1")
+            list(GET _klc_p_types ${_klc_i} _klc_type)
+            list(GET _klc_p_subtypes ${_klc_i} _klc_subtype)
+            if(NOT _klc_type STREQUAL _klc_req_type OR
+               NOT _klc_subtype STREQUAL _klc_req_subtype)
+                message(FATAL_ERROR
+                    "KLC: partition '${_klc_name}' must be "
+                    "${_klc_req_type}/${_klc_req_subtype} "
+                    "(got ${_klc_type}/${_klc_subtype} in partitions.csv).")
+            endif()
+            if(_klc_name STREQUAL "storage")
+                list(GET _klc_p_sizes ${_klc_i} _klc_lfs_size)
+            endif()
+        endforeach()
+        if(NOT _klc_req_count EQUAL 1)
+            message(FATAL_ERROR
+                "KLC: partitions.csv must define '${_klc_req_name}' "
+                "(${_klc_req_type}/${_klc_req_subtype}) exactly once "
+                "(found ${_klc_req_count} entries).")
+        endif()
+    endforeach()
 
     math(EXPR _klc_lfs_min "262144")
     if(_klc_lfs_size LESS _klc_lfs_min)
@@ -184,7 +223,7 @@ if(EXISTS "${_klc_partitions_csv}" AND DEFINED CONFIG_ESPTOOLPY_FLASHSIZE)
             "configuration and diagnostics.")
     endif()
 
-    # Overlap / alignment / bounds checks.
+    # Overlap / gap / alignment / bounds checks.
     set(_klc_prev_end 0)
     foreach(_klc_i RANGE ${_klc_last})
         list(GET _klc_p_names ${_klc_i} _klc_name)
@@ -200,6 +239,33 @@ if(EXISTS "${_klc_partitions_csv}" AND DEFINED CONFIG_ESPTOOLPY_FLASHSIZE)
             message(FATAL_ERROR
                 "KLC: partition '${_klc_name}' (offset ${_klc_offset}) overlaps "
                 "the previous partition (ends at ${_klc_prev_end}).")
+        endif()
+
+        if(_klc_flash_bytes GREATER 0)
+            if(_klc_i EQUAL 0)
+                # Everything below the first partition entry is reserved by
+                # the 2nd-stage bootloader: bootloader at 0x0-0x8000 and the
+                # partition table at 0x8000-0x9000.  The first partition must
+                # start exactly at 0x9000: any offset below intrudes into the
+                # bootloader/partition-table region, and any offset above
+                # leaves an unpartitioned gap between the reserved area and
+                # the first partition, violating the gap-free requirement.
+                if(NOT _klc_off EQUAL 36864)
+                    message(FATAL_ERROR
+                        "KLC: first partition '${_klc_name}' (offset "
+                        "${_klc_offset}) does not start at 0x9000. Offsets "
+                        "below 0x9000 intrude into the bootloader and "
+                        "partition-table region (0x0-0x9000); offsets above "
+                        "0x9000 leave an unpartitioned gap. The table must "
+                        "fill the flash with no gaps or overlaps.")
+                endif()
+            elseif(NOT _klc_off EQUAL _klc_prev_end)
+                message(FATAL_ERROR
+                    "KLC: partition '${_klc_name}' (offset ${_klc_offset}) "
+                    "leaves a gap: the previous partition ends at "
+                    "${_klc_prev_end}. The table must fill the flash with no "
+                    "gaps or overlaps.")
+            endif()
         endif()
 
         if(_klc_type STREQUAL "app")
@@ -227,6 +293,17 @@ if(EXISTS "${_klc_partitions_csv}" AND DEFINED CONFIG_ESPTOOLPY_FLASHSIZE)
 
         set(_klc_prev_end ${_klc_end})
     endforeach()
+
+    # The table must fill the flash exactly: the last partition's end has to
+    # match the configured flash size (no trailing gap).
+    if(_klc_flash_bytes GREATER 0 AND NOT _klc_prev_end EQUAL _klc_flash_bytes)
+        math(EXPR _klc_tail_gap "${_klc_flash_bytes} - ${_klc_prev_end}")
+        message(FATAL_ERROR
+            "KLC: partition table leaves ${_klc_tail_gap} unpartitioned bytes "
+            "at the end of the ${_klc_flash_mb} MB flash (last partition ends "
+            "at ${_klc_prev_end}, flash is ${_klc_flash_bytes} bytes). "
+            "The table must fill the flash with no gaps.")
+    endif()
 
     math(EXPR _klc_lfs_bytes "${_klc_lfs_size}")
     message(STATUS "KLC: partition table OK "

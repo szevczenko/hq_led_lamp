@@ -74,6 +74,21 @@ int osal_fs_mock_mkdir_calls(void);
 int osal_fs_mock_unmount_calls(void);
 
 /**
+ * @brief Number of osal_mkfs() calls since reset.
+ *
+ * The boot path must never format: this counter must stay 0 across every
+ * bootstrap scenario (the guard against silent credential destruction).
+ */
+int osal_fs_mock_mkfs_calls(void);
+
+/**
+ * @brief Number of osal_rmfs() calls since reset.
+ *
+ * Must stay 0 on the boot path, same contract as osal_fs_mock_mkfs_calls().
+ */
+int osal_fs_mock_rmfs_calls(void);
+
+/**
  * @brief Number of times the double reports the volume as mounted.
  *
  * Exposes the mock's internal mounted flag (set by a successful

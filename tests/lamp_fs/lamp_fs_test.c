@@ -13,9 +13,15 @@
  *   3. mount failure — a failed osal_mount() invokes the fail-safe exactly
  *      once, creates no directories, reports the storage untouched,
  *   4. directory failure — a failed osal_mkdir() invokes the fail-safe and
- *      reports the failure while earlier created directories survive,
- *   5. argument and lifecycle edge cases (NULL path, unmount when not
- *      mounted, idempotent re-init).
+ *      reports the failure while earlier created directories survive; the
+ *      volume is unmounted through osal_unmount() before the error is
+ *      returned, so no hidden mount is left behind (if the unmount itself
+ *      fails, LAMP_FS_ERR_UNMOUNT is reported and the mount state stays
+ *      consistent with the backend),
+ *   5. no format — osal_mkfs()/osal_rmfs() are never invoked on the boot
+ *      path in any scenario (credential storage is never reformatted),
+ *   6. argument and lifecycle edge cases (NULL path, unmount when not
+ *      mounted, idempotent re-init, retry after a failed bootstrap).
  */
 
 #include <string.h>
@@ -135,6 +141,9 @@ static void test_mount_failure_forces_fail_safe(void)
     TEST_ASSERT_EQUAL_INT(1, s_fail_safe_calls);
     /* No directory touched: existing storage preserved. */
     TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_mkdir_calls());
+    /* And no format either: a mount failure must never reformat storage. */
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_mkfs_calls());
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_rmfs_calls());
 }
 
 static void test_mount_failure_without_callback(void)
@@ -164,8 +173,80 @@ static void test_directory_failure_forces_fail_safe(void)
     TEST_ASSERT_EQUAL_INT(1, s_fail_safe_calls);
     /* Failure stops the sequence: /cert verified, /config attempted. */
     TEST_ASSERT_EQUAL_INT(2, osal_fs_mock_mkdir_calls());
-    /* The volume itself is left mounted (storage preserved for recovery). */
+    /* No hidden mount: the volume was unmounted before returning the
+     * error, so the component state and the backend state agree. */
+    TEST_ASSERT_EQUAL_INT(1, osal_fs_mock_unmount_calls());
+    TEST_ASSERT_FALSE(lamp_fs_is_mounted());
+    TEST_ASSERT_FALSE(osal_fs_mock_is_mounted());
+}
+
+static void test_directory_failure_unmount_failure_is_reported(void)
+{
+    /* Directory creation fails AND the recovery unmount fails: the error
+     * must be reported, and lamp_fs_is_mounted() must keep reflecting the
+     * still-mounted backend (no hidden mount with a lying is_mounted()). */
+    osal_fs_mock_add_existing_dir(LAMP_FS_DIR_CERT);
+    osal_fs_mock_set_mkdir_status(OSAL_ERROR);
+    osal_fs_mock_set_unmount_status(OSAL_ERROR);
+
+    lamp_fs_config_t config = { .fail_safe_cb = record_fail_safe };
+    lamp_fs_status_t status = lamp_fs_init(&config);
+
+    TEST_ASSERT_EQUAL_INT(LAMP_FS_ERR_UNMOUNT, status);
+    TEST_ASSERT_EQUAL_INT(1, s_fail_safe_calls);
+    TEST_ASSERT_EQUAL_INT(1, osal_fs_mock_unmount_calls());
+    /* Backend really is still mounted, so is_mounted() stays true. */
     TEST_ASSERT_TRUE(osal_fs_mock_is_mounted());
+    TEST_ASSERT_TRUE(lamp_fs_is_mounted());
+
+    /* The subsequent explicit unmount succeeds and restores consistency. */
+    osal_fs_mock_set_unmount_status(OSAL_SUCCESS);
+    TEST_ASSERT_EQUAL_INT(LAMP_FS_OK, lamp_fs_deinit());
+    TEST_ASSERT_FALSE(lamp_fs_is_mounted());
+    TEST_ASSERT_FALSE(osal_fs_mock_is_mounted());
+}
+
+static void test_retry_after_failed_directory_bootstrap(void)
+{
+    /* A failed bootstrap must be retryable cleanly: the second init finds
+     * no stale mount, mounts again and converges to a working layout. */
+    osal_fs_mock_set_mkdir_status(OSAL_ERROR);
+
+    lamp_fs_config_t config = { .fail_safe_cb = record_fail_safe };
+    TEST_ASSERT_EQUAL_INT(LAMP_FS_ERR_DIRECTORY, lamp_fs_init(&config));
+    TEST_ASSERT_FALSE(lamp_fs_is_mounted());
+    TEST_ASSERT_FALSE(osal_fs_mock_is_mounted());
+
+    /* Injected mkdir failure was one-shot; the retry succeeds normally. */
+    TEST_ASSERT_EQUAL_INT(LAMP_FS_OK, lamp_fs_init(&config));
+    TEST_ASSERT_TRUE(lamp_fs_is_mounted());
+    TEST_ASSERT_TRUE(osal_fs_mock_is_mounted());
+    TEST_ASSERT_EQUAL_INT(2, osal_fs_mock_mount_calls());
+    TEST_ASSERT_EQUAL_INT(4, osal_fs_mock_mkdir_calls());
+    /* Exactly one fail-safe run for the one failed attempt. */
+    TEST_ASSERT_EQUAL_INT(1, s_fail_safe_calls);
+}
+
+static void test_no_format_on_boot_path(void)
+{
+    /* Guard against silent credential destruction: in no scenario —
+     * success, mount failure, directory failure — may the bootstrap call
+     * osal_mkfs() or osal_rmfs(). */
+    TEST_ASSERT_EQUAL_INT(LAMP_FS_OK, lamp_fs_init(NULL));
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_mkfs_calls());
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_rmfs_calls());
+
+    osal_fs_mock_reset();
+    osal_fs_mock_set_mount_status(OSAL_ERROR);
+    (void)lamp_fs_init(NULL);
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_mkfs_calls());
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_rmfs_calls());
+
+    osal_fs_mock_reset();
+    osal_fs_mock_set_mkdir_status(OSAL_ERROR);
+    (void)lamp_fs_init(NULL);
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_mkfs_calls());
+    TEST_ASSERT_EQUAL_INT(0, osal_fs_mock_rmfs_calls());
 }
 
 static void test_ensure_dir_failure_reported(void)
@@ -237,6 +318,9 @@ int main(void)
     RUN_TEST(test_mount_failure_forces_fail_safe);
     RUN_TEST(test_mount_failure_without_callback);
     RUN_TEST(test_directory_failure_forces_fail_safe);
+    RUN_TEST(test_directory_failure_unmount_failure_is_reported);
+    RUN_TEST(test_retry_after_failed_directory_bootstrap);
+    RUN_TEST(test_no_format_on_boot_path);
     RUN_TEST(test_ensure_dir_failure_reported);
     RUN_TEST(test_ensure_dir_invalid_arguments);
     RUN_TEST(test_unmount_lifecycle);

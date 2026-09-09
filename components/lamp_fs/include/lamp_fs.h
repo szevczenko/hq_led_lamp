@@ -84,7 +84,11 @@ typedef enum lamp_fs_status {
     LAMP_FS_OK                   = 0,  /**< Mounted and directory layout ready. */
     LAMP_FS_ERR_MOUNT            = -1, /**< osal_mount() failed; storage untouched. */
     LAMP_FS_ERR_DIRECTORY        = -2, /**< Creating /cert, /config or /state failed. */
-    LAMP_FS_ERR_INVALID_ARGUMENT = -3  /**< Invalid argument (NULL path, empty path). */
+    LAMP_FS_ERR_INVALID_ARGUMENT = -3, /**< Invalid argument (NULL path, empty path). */
+    LAMP_FS_ERR_UNMOUNT          = -4  /**< osal_unmount() after a failed directory
+                                            bootstrap failed; the backend volume may
+                                            still be mounted (reflected by
+                                            lamp_fs_is_mounted()). */
 } lamp_fs_status_t;
 
 /* --------------------------------------------------------------------- */
@@ -144,8 +148,12 @@ typedef struct lamp_fs_config {
  *  2. Create LAMP_FS_DIR_CERT, LAMP_FS_DIR_CONFIG and LAMP_FS_DIR_STATE
  *     idempotently.  An existing directory (#OSAL_ERR_NAME_TAKEN) is
  *     success.  Any other directory error runs the fail-safe callback and
- *     returns #LAMP_FS_ERR_DIRECTORY; already-created directories and all
- *     existing file contents are preserved.
+ *     unmounts the volume through osal_unmount() before the failure is
+ *     returned, so the OSAL backend state, lamp_fs_is_mounted() and a
+ *     later retry stay consistent; already-created directories and all
+ *     existing file contents are preserved.  If that unmount itself fails,
+ *     the volume stays mounted in the backend and #LAMP_FS_ERR_UNMOUNT is
+ *     reported (lamp_fs_is_mounted() keeps reporting the true state).
  *
  * On success the filesystem is mounted and the three directories exist.
  * This must be called before loading any configuration or credentials.
@@ -155,7 +163,10 @@ typedef struct lamp_fs_config {
  * @return
  *  - #LAMP_FS_OK on success,
  *  - #LAMP_FS_ERR_MOUNT if the mount failed (storage untouched, output off),
- *  - #LAMP_FS_ERR_DIRECTORY if a directory could not be created (output off).
+ *  - #LAMP_FS_ERR_DIRECTORY if a directory could not be created (volume
+ *    unmounted, output off),
+ *  - #LAMP_FS_ERR_UNMOUNT if a directory failed and the subsequent unmount
+ *    failed as well (volume still mounted in the backend, output off).
  */
 lamp_fs_status_t lamp_fs_init(const lamp_fs_config_t *config);
 
@@ -190,7 +201,7 @@ bool lamp_fs_is_mounted(void);
  * they have formatted storage.
  *
  * @return #LAMP_FS_OK on success or when already unmounted, otherwise
- *         #LAMP_FS_ERR_MOUNT mapped from the OSAL error.
+ *         #LAMP_FS_ERR_UNMOUNT when the OSAL unmount failed.
  */
 lamp_fs_status_t lamp_fs_deinit(void);
 

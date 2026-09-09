@@ -107,8 +107,24 @@ lamp_fs_status_t lamp_fs_init(const lamp_fs_config_t *config)
         {
             /* Safe failure: keep whatever directories were created and all
              * existing file contents, force the output off, report it. */
-            s_mounted = false;
             run_fail_safe(config);
+
+            /* Do not leave a hidden mount behind: unmount the volume so the
+             * OSAL backend state, lamp_fs_is_mounted() and a later retry of
+             * lamp_fs_init() stay consistent.  The storage contents are
+             * untouched by the unmount. */
+            int32_t unmount_rc = osal_unmount(LAMP_FS_MOUNT_POINT);
+            if (unmount_rc != OSAL_SUCCESS)
+            {
+                /* The unmount failed, so the backend volume is still
+                 * mounted.  Keep lamp_fs_is_mounted() consistent with that
+                 * (true) instead of reporting a mount that no longer
+                 * exists, and surface the unmount failure separately. */
+                s_mounted = true;
+                return LAMP_FS_ERR_UNMOUNT;
+            }
+
+            s_mounted = false;
             return status;
         }
     }
@@ -126,7 +142,7 @@ lamp_fs_status_t lamp_fs_deinit(void)
     int32_t rc = osal_unmount(LAMP_FS_MOUNT_POINT);
     if (rc != OSAL_SUCCESS)
     {
-        return LAMP_FS_ERR_MOUNT;
+        return LAMP_FS_ERR_UNMOUNT;
     }
 
     s_mounted = false;
