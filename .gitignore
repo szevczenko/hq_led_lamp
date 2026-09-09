@@ -1,10 +1,24 @@
-# ESP-IDF build output
+# ESP-IDF and host-test build output
 build/
+build_asan/
+build_esp/
+build_review/
+build_tsan/
+build-*/
+managed_components/
+dependencies.lock
 sdkconfig
 sdkconfig.old
+*.map
+*.elf
 
-# Generated partition binary
+# Generated partition/firmware binaries
 *.bin
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
 
 # Editor and OS artifacts
 .DS_Store
@@ -18,10 +32,12 @@ sdkconfig.old
 *.pem
 *.p12
 /cert/
-**/__pycache__/**
 
 # Manufacturing secrets
 /config/manufacturing.json
 
 # ThingsBoard test-harness device tokens — never commit
 /scripts/thingsboard/*.token
+
+# Logs
+*.log

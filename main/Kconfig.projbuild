@@ -30,26 +30,30 @@ menu "Kitchen LED Controller"
 
     config KLC_LED_PWM_FREQUENCY_HZ
         int "LED PWM frequency (Hz)"
-        range 1000 80000
-        default 20000
+        range 1000 9765
+        default 8000
         help
             PWM carrier frequency driving the MOSFET. Must be confirmed with
             the actual MOSFET switching characteristics to avoid audible noise
             or excessive switching loss.
-            Constraint: frequency * 2^resolution must not exceed 80 000 000
-            (ESP32 APB clock). CMake rejects invalid combinations at configure
-            time.
+            Constraint: the ESP HAL PWM backend (hal_pwm_esp.c) runs LEDC at
+            a fixed 13-bit duty resolution, so
+            frequency * 2^13 must not exceed the 80 000 000 Hz APB clock.
+            CMake rejects invalid values at configure time; the practical
+            maximum is 9765 Hz (8000 Hz by default keeps divider margin).
 
     config KLC_LED_PWM_RESOLUTION_BITS
         int "LED PWM duty resolution (bits)"
         range 8 15
-        default 11
+        default 13
         help
-            Duty-cycle resolution. Higher values give finer brightness steps
-            at the cost of maximum achievable frequency. See the frequency
-            option for the combined APB-clock constraint.
-            At 20 kHz the maximum valid resolution on ESP32 is 11 bits
-            (20000 * 2048 = 40 960 000 < 80 000 000).
+            Duty-cycle resolution requested by the product layer. The ESP HAL
+            PWM backend (hal_pwm_esp.c) runs LEDC at a fixed 13-bit duty
+            resolution regardless of this value, so 13 is the only value that
+            matches the hardware backend; keep it at 13.
+            Constraint: frequency * 2^13 must not exceed 80 000 000 (ESP32
+            APB clock); see KLC_LED_PWM_FREQUENCY_HZ. CMake validates the
+            combined budget at configure time.
 
     config KLC_LED_PWM_ACTIVE_LOW
         bool "LED output is active-low"

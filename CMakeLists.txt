@@ -6,6 +6,7 @@ set(HQ_DEFCONFIG "${HQ_REPO_ROOT}/defconfig/esp.defconfig")
 
 set(EXTRA_COMPONENT_DIRS
     ${HQ_REPO_ROOT}/src/osal
+    ${HQ_REPO_ROOT}/src/hal/hq_hal
     ${HQ_REPO_ROOT}/src/thingsboard
     ${HQ_REPO_ROOT}/src/mongoose
     ${HQ_REPO_ROOT}/src/wifi
