@@ -18,6 +18,10 @@ sdkconfig.old
 *.pem
 *.p12
 /cert/
+**/__pycache__/**
 
 # Manufacturing secrets
 /config/manufacturing.json
+
+# ThingsBoard test-harness device tokens — never commit
+/scripts/thingsboard/*.token

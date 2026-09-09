@@ -400,6 +400,28 @@ Use a private CA:
 Development may use a short-lived test CA, but production firmware must not
 embed or trust development roots.
 
+### 9.5 Existing development tenant for early REST-API testing
+
+A ThingsBoard tenant already exists on a separate, already-running development
+instance at `http://home-assistance.local:8080`, distinct from the
+`thingsboard.home.arpa:8883` MQTT/TLS endpoint described above:
+
+- The tenant is reachable today over plain HTTPS/HTTP admin/REST access and is
+  used only for tenant administration, device provisioning, and REST-API-based
+  functional testing (see section 16.1). It is not the MQTT/TLS endpoint the
+  firmware connects to and does not replace the LAN deployment in TASK-116.
+- Authenticate REST calls with a tenant-scoped API key
+  (`X-Authorization: ApiKey ...`), never the deprecated JWT login flow, for
+  scripts and CI. See `Server-side-api` in the repository root for the full
+  REST reference (authentication, attributes, time series, and RPC endpoints).
+- Treat the API key as a secret: keep it in an ignored local file or
+  environment variable, never commit it, print it in test output, or attach it
+  to issues/PRs. Rotate/revoke any key that was ever pasted into a chat log,
+  ticket, or shared document.
+- Once the LAN deployment (TASK-116) exists, the same test-device and
+  functional-test scripts should be re-pointed at `thingsboard.home.arpa` by
+  configuration only, without code changes.
+
 ## 10. Authentication and Manufacturing Options
 
 ### 10.1 Option A: server TLS plus access token
@@ -884,6 +906,23 @@ Apply this checklist to every MR:
 - Reconnect and authoritative state resynchronization.
 - OTA success and all verification failures.
 - Server backup and restore.
+
+### 16.1 REST API functional tests (no firmware required)
+
+Run against the existing development tenant (section 9.5) using only the
+REST API documented in `Server-side-api`:
+
+- create or find a named test device idempotently and obtain its access token,
+- write shared attributes `power`/`brightness` and read them back,
+- send one-way and two-way RPC (`setPower`, `setBrightness`, `setState`,
+  `getState`) against a scripted mock device client and assert response shape,
+- publish and query telemetry matching the section 8.3 schema,
+- assert authentication failure and unreachable-server failure are reported
+  loudly and do not leave partial device/attribute state.
+
+These tests validate the ThingsBoard-side protocol contract independently of
+firmware progress and should run in CI whenever the development tenant is
+reachable.
 
 ### Hardware tests
 
