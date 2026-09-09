@@ -26,6 +26,7 @@
 
 #include "esp_log.h"
 
+#include "app_config.h"
 #include "hal_types.h"
 #include "lamp_control.h"
 #include "lamp_fs.h"
@@ -109,15 +110,59 @@ static bool bootstrap_filesystem(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* Configuration loading (placeholder — TASK-108)                          */
+/* Configuration loading (TASK-108)                                        */
 /* --------------------------------------------------------------------- */
+
+/**
+ * @brief Load the product documents through the configuration service.
+ *
+ * Runs only after a successful filesystem bootstrap.  Both documents are
+ * loaded with last-known-good recovery; on any failure the error is logged
+ * (never any document content) and boot continues in the safe degraded
+ * mode — the output is off until ThingsBoard supplies a valid desired
+ * state.  No lamp state is ever persisted: ThingsBoard is the
+ * desired-state authority in release 1.
+ *
+ * @return true when both documents are usable (loaded or recovered).
+ */
+static bool load_product_configuration(void)
+{
+    app_config_device_doc_t device;
+    app_config_status_t status = app_config_load_device(&device);
+    if ((status != APP_CONFIG_OK) && (status != APP_CONFIG_OK_RECOVERED))
+    {
+        ESP_LOGE(TAG, "device.json unavailable: %d (%s)%s",
+                 (int)status, app_config_status_name(status),
+                 (status == APP_CONFIG_OK_RECOVERED) ? "" :
+                 " (manufacturing flow must provision it)");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "device.json loaded%s: product='%s' hw='%s' tb='%s'",
+             (status == APP_CONFIG_OK_RECOVERED) ? " (recovered)" : "",
+             device.product, device.hardware_revision,
+             device.thingsboard_name);
+
+    app_config_manufacturing_doc_t manufacturing;
+    status = app_config_load_manufacturing(&manufacturing);
+    if ((status != APP_CONFIG_OK) && (status != APP_CONFIG_OK_RECOVERED))
+    {
+        ESP_LOGE(TAG, "manufacturing.json unavailable: %d (%s)",
+                 (int)status, app_config_status_name(status));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "manufacturing.json loaded%s: state=%d mode=%d",
+             (status == APP_CONFIG_OK_RECOVERED) ? " (recovered)" : "",
+             (int)manufacturing.manufacturing_state,
+             (int)manufacturing.credential_mode);
+
+    return true;
+}
 
 static void load_configuration(void)
 {
-    /* Configuration service (versioned device.json / mqtt.json parsing)
-     * arrives with TASK-108; it must only ever run after a successful
-     * filesystem bootstrap. */
-    ESP_LOGI(TAG, "Configuration loading not implemented yet (TASK-108)");
+    (void)load_product_configuration();
 }
 
 /* --------------------------------------------------------------------- */
