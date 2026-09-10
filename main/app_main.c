@@ -435,6 +435,10 @@ static void supervise_iteration(void)
     /* Log the parked/gate states only ONCE per state entry so a degraded
      * device does not flood the log at the supervisor cadence. */
     static app_state_t s_last_reported = APP_STATE_BOOT;
+    /* Edge tracker for the exhausted-retry notice below: logs once when
+     * app_state_retry_exhausted() turns true, independent of state-entry
+     * reporting. */
+    static bool s_last_exhausted = false;
 
     (void)app_state_poll(); /* feed + drive bounded retries (single owner) */
 
@@ -529,6 +533,18 @@ static void supervise_iteration(void)
             ESP_LOGW(TAG, "Safe-off (degraded): no retry scheduled; "
                           "waiting for provisioning / reset / OTA");
         }
+        /* Exhausted-park notice: log ONCE when the retry budget is spent,
+         * independent of the state-entry gating above.  A device that parks
+         * degraded with a retry still pending (retry_pending true) or that
+         * already reported its SAFE_OFF entry would otherwise never emit a
+         * clear "budget exhausted" diagnostic; the edge (false -> true)
+         * keeps the cadence bounded. */
+        if (app_state_retry_exhausted() && !s_last_exhausted)
+        {
+            ESP_LOGW(TAG, "Safe-off (degraded): retry budget exhausted; "
+                          "waiting for provisioning / reset / OTA");
+        }
+        s_last_exhausted = app_state_retry_exhausted();
         break;
 
     case APP_STATE_FATAL:

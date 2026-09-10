@@ -72,6 +72,16 @@
  *   any         -- RESET (EXTERNAL) --------------> BOOT
  *   any         -- FATAL (any owner) -------------> FATAL
  *
+ * The DISCONNECTED rows above are ENCODED in the table with owner
+ * APP_OWNER_MQTT, but the runtime app_owner_ok() deliberately widens every
+ * DISCONNECT-class row to ALSO accept APP_OWNER_NETWORK — both the Wi-Fi
+ * adapter (APP_OWNER_NETWORK) and the MQTT/TLS layer (APP_OWNER_MQTT) are
+ * legitimate reporters of "transport down".  The "(NETWORK/MQTT)" owner
+ * shown on those rows is that widened set: a row labeled MQTT therefore
+ * accepts NETWORK for DISCONNECT-class events (no behavior difference —
+ * this just makes the already-widened owner set explicit here and in the
+ * encoded table).
+ *
  * A successful transition back to #APP_STATE_SAFE_OFF/... is produced by
  * the events above; the module enforces them and drops everything else as
  * illegal (see "Stale and illegal callbacks").

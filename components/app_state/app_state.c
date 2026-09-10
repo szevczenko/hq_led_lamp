@@ -63,6 +63,11 @@ typedef struct app_state_transition {
  *   - RESET:        any state -> BOOT (owner EXTERNAL; new episode),
  *   - FATAL:        any state -> FATAL (any owner; always honored),
  *   - RETRY_DUE:    SAFE_OFF -> retry target (owner TIMER; new episode).
+ *
+ * The DISCONNECTED rows below are encoded with owner APP_OWNER_MQTT;
+ * app_owner_ok() deliberately widens DISCONNECT-class rows to ALSO accept
+ * APP_OWNER_NETWORK (both transports may report "transport down" — see the
+ * header table, which documents those rows as owned by NETWORK/MQTT).
  */
 static const app_state_transition_t APP_STATE_TRANSITIONS[] = {
     { APP_STATE_FILESYSTEM,    APP_EVENT_FS_OK,             APP_STATE_CONFIGURATION, APP_OWNER_FILESYSTEM,    APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          false },
@@ -355,7 +360,10 @@ static void app_enter_safe_off(const app_state_transition_t *entry)
     }
     else
     {
-        /* Degraded (non-retryable): park without an automatic retry. */
+        /* Degraded (non-retryable): park without an automatic retry.
+         * retry_attempts is deliberately NOT cleared: a degraded park must
+         * not refill the retry budget (that is the anti-storm rule — do not
+         * "reset the budget on degraded park" without revisiting this). */
         s_state.retry_pending   = false;
         s_state.retry_due_ms    = 0U;
         s_state.retry_exhausted = false;
