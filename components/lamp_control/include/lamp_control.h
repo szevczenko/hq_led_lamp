@@ -105,7 +105,8 @@ typedef enum lamp_status {
     LAMP_ERR_NOT_SUPPORTED       = -5,  /**< Requested configuration is not supported by the HAL backend. */
     LAMP_ERR_NO_RESOURCE         = -6,  /**< No HAL resource available (timer/channel). */
     LAMP_ERR_INTERNAL            = -7,  /**< Unexpected internal or HAL backend failure. */
-    LAMP_ERR_FAIL_OFF            = -8   /**< The fail-off (safety) action could not be completed; the output may still be active. */
+    LAMP_ERR_FAIL_OFF            = -8,  /**< The fail-off (safety) action could not be completed; the output may still be active. */
+    LAMP_ERR_BLOCKED_BY_FAIL_OFF = -9   /**< The request was rejected because a fail-off barrier is latched (see lamp_control_release_fail_off()). */
 } lamp_status_t;
 
 /* --------------------------------------------------------------------- */
@@ -312,15 +313,42 @@ lamp_status_t lamp_control_apply_state(const lamp_state_t *requested,
  * fallback); only when the HAL proves the output inactive is #LAMP_OK
  * returned.
  *
+ * Fail-off barrier (disconnect endpoint): on success this operation also
+ * latches a barrier so that every subsequent lamp_control_apply_state()
+ * is rejected with #LAMP_ERR_BLOCKED_BY_FAIL_OFF — an apply that was
+ * already waiting for the lock or that arrives later can never re-energize
+ * the output behind the fail-off's back.  Only the explicit re-enable
+ * transition lamp_control_release_fail_off() (or a fresh
+ * lamp_control_init() after lamp_control_deinit()) lifts the barrier.
+ *
  * @return
- *  - #LAMP_OK on success; the output is off,
+ *  - #LAMP_OK on success; the output is off and the fail-off barrier is
+ *    latched until lamp_control_release_fail_off(),
  *  - #LAMP_ERR_NOT_INITIALIZED if the lamp is not initialized,
  *  - #LAMP_ERR_FAIL_OFF if the fail-off escalation failed: the output could
  *    not be proven off, `output_active` is not cleared (it keeps its last
- *    known value), and the lamp stays initialized so the fail-off or the
- *    release can be retried.
+ *    known value), the barrier stays unchanged and the lamp stays
+ *    initialized so the fail-off or the release can be retried.
  */
 lamp_status_t lamp_control_force_inactive(void);
+
+/**
+ * @brief Explicit re-enable transition after a fail-off barrier.
+ *
+ * Clears the fail-off barrier latched by lamp_control_force_inactive(), so
+ * subsequent lamp_control_apply_state() calls are accepted again.  This is
+ * the documented reconnect/reenable transition: the owner of the lamp
+ * state (the application state machine, e.g. on network reconnect) decides
+ * when the output may be energized again; a fail-off always wins over any
+ * concurrent or later apply until this function runs.
+ *
+ * The function is idempotent and does not touch the hardware or the
+ * applied state: it only lifts the barrier.  After it returns, the
+ * caller applies a fresh desired state with lamp_control_apply_state().
+ *
+ * @return #LAMP_OK always (the release cannot fail).
+ */
+lamp_status_t lamp_control_release_fail_off(void);
 
 /**
  * @brief Deinitialize the lamp and release the PWM output.

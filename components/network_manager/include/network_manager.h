@@ -62,11 +62,15 @@
  *     returns.
  *   - Late-callback behavior: the Wi-Fi worker snapshots subscriptions before
  *     dispatching, so an event that raced with network_manager_stop() may
- *     still arrive afterwards.  The handler re-validates registration under
- *     the adapter lock and drops every such stale event: after stop() returns,
- *     no application callback runs again, so @c context is safe to release.
- *     A stale disconnect-class event still performs the (idempotent, safe)
- *     lamp fail-off before it is dropped.
+ *     still arrive afterwards.  Every subscription carries a per-start
+ *     generation token (passed through the manager's user_data); the handler
+ *     re-validates registration AND token under the adapter lock and drops
+ *     every stale event — including an event snapshot taken before a
+ *     stop()/start() cycle, which carries the previous session's token and is
+ *     never delivered to the new session's callbacks/context.  After stop()
+ *     returns, no application callback runs again, so @c context is safe to
+ *     release.  A stale disconnect-class event still performs the (idempotent,
+ *     safe) lamp fail-off before it is dropped.
  */
 
 #ifndef NETWORK_MANAGER_H

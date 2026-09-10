@@ -18,6 +18,8 @@ project(hq_led_lamp_lamp_control_tests LANGUAGES C)
 set(LAMP_CONTROL_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/lamp_control)
 set(HAL_INCLUDE_DIR  ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hal/include)
 
+find_package(Threads REQUIRED)
+
 add_executable(lamp_control_tests
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_test.c
     ${CMAKE_CURRENT_LIST_DIR}/hal_pwm_mock.c
@@ -35,6 +37,8 @@ target_include_directories(lamp_control_tests PRIVATE
 # Match the platform project's strict host-test flags where Unity tolerates
 # them; Unity's own sources rarely trigger warnings on current GCC/Clang.
 target_compile_options(lamp_control_tests PRIVATE -Wall -Wextra -Werror -Wpedantic)
+
+target_link_libraries(lamp_control_tests PRIVATE Threads::Threads)
 
 enable_testing()
 add_test(NAME lamp_control_tests COMMAND lamp_control_tests)

@@ -31,14 +31,20 @@
  *      and the user callback table live behind one OSAL mutex.  stop() clears
  *      the table under that mutex before unsubscribing, so any late event
  *      that raced the unsubscribe is dropped by re-validation instead of
- *      reaching an unregistered context.  stop() joins an in-flight callback
- *      (the handler holds the same mutex during delivery), so no application
+ *      reaching an unregistered context.  Every subscription carries a
+ *      per-start generation token (as the platform's user_data): a late event
+ *      from a previous session's dispatch snapshot carries the OLD token and
+ *      is dropped even after a fresh start() re-registered new
+ *      callbacks/context.  stop() joins an in-flight callback (the handler
+ *      holds the same mutex during delivery), so no application
  *      callback can run after stop() returns.
  */
 
 #include "network_manager.h"
 
 #include <stddef.h>
+#include <stdint.h>
+#include <stdatomic.h>
 
 #include "lamp_control.h"
 #include "osal_log.h"
@@ -52,17 +58,33 @@
 
 typedef struct network_ctx
 {
-  osal_mutex_id_t lock;              /**< Serializes start/stop/delivery.   */
+  _Atomic(osal_mutex_id_t) lock;     /**< Published atomically (CAS-adopted).*/
   network_callbacks_t callbacks;     /**< Valid only while started.         */
-  bool started;                      /**< Callbacks armed, API operational. */
-  uint32_t generation;               /**< Bumped on every stop/failed start. */
+  atomic_bool started;               /**< Callbacks armed, API operational. */
+  uint32_t active_token;             /**< Token of the armed registration
+                                          (valid under @c lock only).       */
+  uint32_t generation;               /**< Monotonic per-start token source. */
+  uint32_t stop_count;               /**< Number of completed stop()
+                                          disarms (valid under @c lock only).
+                                          A start() records this value when
+                                          it arms its session and re-checks
+                                          it after the platform
+                                          registration calls: a changed
+                                          count means a concurrent stop()
+                                          disarmed this session mid-
+                                          transaction, so the start must
+                                          abort and roll back instead of
+                                          returning NETWORK_OK (start/stop
+                                          transaction race). */
 } network_ctx_t;
 
 static network_ctx_t s_ctx = {
-  .lock       = NULL,
-  .callbacks  = { NULL, NULL, NULL },
-  .started    = false,
-  .generation = 0u,
+  .lock         = NULL,
+  .callbacks    = { NULL, NULL, NULL },
+  .started      = false,
+  .active_token = 0u,
+  .generation   = 0u,
+  .stop_count   = 0u,
 };
 
 /* --------------------------------------------------------------------- */
@@ -70,19 +92,22 @@ static network_ctx_t s_ctx = {
 /* --------------------------------------------------------------------- */
 
 /**
- * @brief Create the adapter mutex on first use.
+ * @brief Create the adapter mutex before concurrent use is possible.
  *
- * The adapter owns no constructor, so the mutex is created lazily.  The
- * documented lifecycle contract (a single lifecycle owner serializes
- * start()/stop()) makes this race-free in product use; the adopt-or-delete
- * pattern below additionally keeps a concurrent first start from leaking a
- * duplicate mutex.
+ * The adapter owns no constructor, so the mutex is created lazily — but the
+ * creation itself is race-free: an atomic compare-and-swap adopts exactly one
+ * winner's mutex, and every loser destroys its duplicate before anyone can
+ * observe it.  start()/stop() therefore never publish or delete a mutex
+ * concurrently, and once published the handle stays valid for the lifetime
+ * of the process (it is never deleted).
  *
  * @return true when the adapter lock is available.
  */
 static bool network_ensure_lock(void)
 {
-    if (s_ctx.lock != NULL)
+    osal_mutex_id_t current =
+        atomic_load_explicit(&s_ctx.lock, memory_order_acquire);
+    if (current != NULL)
     {
         return true;
     }
@@ -93,14 +118,18 @@ static bool network_ensure_lock(void)
         return false;
     }
 
-    if (s_ctx.lock != NULL)
+    osal_mutex_id_t expected = NULL;
+    if (atomic_compare_exchange_strong_explicit(&s_ctx.lock, &expected,
+                                                created,
+                                                memory_order_release,
+                                                memory_order_acquire))
     {
-        /* Another thread won the creation race; drop our duplicate. */
-        (void)osal_mutex_delete(created);
+        /* This thread adopted its mutex; a mutex was published only once. */
         return true;
     }
 
-    s_ctx.lock = created;
+    /* Another thread won the creation race; drop our duplicate. */
+    (void)osal_mutex_delete(created);
     return true;
 }
 
@@ -112,28 +141,49 @@ static bool network_ensure_lock(void)
  */
 static bool network_lock(void)
 {
-    return (s_ctx.lock != NULL) && (osal_mutex_take(s_ctx.lock) == OSAL_SUCCESS);
+    osal_mutex_id_t lock =
+        atomic_load_explicit(&s_ctx.lock, memory_order_acquire);
+    return (lock != NULL) && (osal_mutex_take(lock) == OSAL_SUCCESS);
 }
 
 /** @brief Release the adapter lock after a successful network_lock(). */
 static void network_unlock(void)
 {
-    (void)osal_mutex_give(s_ctx.lock);
+    osal_mutex_id_t lock = atomic_load_explicit(&s_ctx.lock,
+                                                memory_order_acquire);
+    if (lock != NULL)
+    {
+        (void)osal_mutex_give(lock);
+    }
 }
 
 /**
- * @brief Shared registration/rollback core: clear the callback table and
- *        bump the generation so any in-flight or late event is stale.
+ * @brief Arm a registration: store the callback table, publish a fresh
+ *        per-start generation token and mark the adapter started.
  *
  * @note Called with the lock held.
+ */
+static void network_arm_locked(const network_callbacks_t *callbacks)
+{
+    s_ctx.callbacks    = *callbacks;
+    s_ctx.active_token = ++s_ctx.generation;
+    atomic_store_explicit(&s_ctx.started, true, memory_order_release);
+}
+
+/**
+ * @brief Shared registration/rollback core: clear the callback table so any
+ *        in-flight or late event is stale.
+ *
+ * @note Called with the lock held.  The token of the disarmed registration
+ *       stays readable in s_ctx.active_token until the next arm, so the
+ *       caller can still unsubscribe with the exact user_data it registered.
  */
 static void network_disarm_locked(void)
 {
     s_ctx.callbacks.on_connected    = NULL;
     s_ctx.callbacks.on_disconnected = NULL;
     s_ctx.callbacks.context         = NULL;
-    s_ctx.started    = false;
-    s_ctx.generation += 1u;
+    atomic_store_explicit(&s_ctx.started, false, memory_order_release);
 }
 
 /* --------------------------------------------------------------------- */
@@ -146,17 +196,26 @@ static void network_disarm_locked(void)
  * The adapter lock is held across the invocation on purpose: it joins any
  * concurrent stop() and guarantees stop() never returns while a callback is
  * still running (the documented late-callback contract).
+ *
+ * @param [in] token - per-start generation token this event was subscribed
+ *                     with; a token that does not match the armed
+ *                     registration identifies a stale event from a previous
+ *                     adapter session and is dropped.
  */
-static void network_deliver_connected(void)
+static void network_deliver_connected(uint32_t token)
 {
     if (!network_lock())
     {
         return;
     }
 
-    if (!s_ctx.started || (s_ctx.callbacks.on_connected == NULL))
+    if (!atomic_load_explicit(&s_ctx.started, memory_order_acquire) ||
+        (token != s_ctx.active_token) ||
+        (s_ctx.callbacks.on_connected == NULL))
     {
-        /* Late callback racing stop(): the registration is already gone. */
+        /* Late callback racing stop(), or an event snapshot taken by the
+         * manager before a stop/restart cycle: the registration is gone or
+         * belongs to a different (older) session. */
         network_unlock();
         osal_log_debug("[net] dropped late connected event");
         return;
@@ -176,8 +235,11 @@ static void network_deliver_connected(void)
  * The lamp output is forced inactive BEFORE the application state machine is
  * informed, synchronously on this path, so Wi-Fi loss drives fail-off within
  * application latency even without any registered callback.
+ *
+ * @param [in] token - per-start generation token (see
+ *                     network_deliver_connected()).
  */
-static void network_deliver_disconnected(void)
+static void network_deliver_disconnected(uint32_t token)
 {
     /* Immediate fail-off: the electrical safety action must not wait for the
      * application callback.  Force-inactive is idempotent, so this is safe
@@ -194,9 +256,12 @@ static void network_deliver_disconnected(void)
         return;
     }
 
-    if (!s_ctx.started || (s_ctx.callbacks.on_disconnected == NULL))
+    if (!atomic_load_explicit(&s_ctx.started, memory_order_acquire) ||
+        (token != s_ctx.active_token) ||
+        (s_ctx.callbacks.on_disconnected == NULL))
     {
-        /* Late callback racing stop(): dropped, the lamp is already off. */
+        /* Late callback racing stop(), or an event from a previous session:
+         * dropped, the lamp is already off. */
         network_unlock();
         osal_log_debug("[net] dropped late disconnected event");
         return;
@@ -212,20 +277,24 @@ static void network_deliver_disconnected(void)
 /**
  * @brief Wi-Fi manager event hook: map manager events onto the product
  *        contract.  Everything outside the two product events is ignored.
+ *
+ * @c user_data carries the per-start generation token the adapter subscribed
+ * with, so a stale event from a manager dispatch snapshot taken before a
+ * stop/restart cycle can never be delivered to the new session's callbacks.
  */
 static void network_wifi_event_cb(wifi_mgmt_event_t event, void *user_data)
 {
-    (void)user_data;
+    const uint32_t token = (uint32_t)(uintptr_t)user_data;
 
     switch (event)
     {
         case WIFI_MGMT_EVENT_CONNECTED:
-            network_deliver_connected();
+            network_deliver_connected(token);
             break;
 
         case WIFI_MGMT_EVENT_DISCONNECTED:
         case WIFI_MGMT_EVENT_CONNECT_FAILED:
-            network_deliver_disconnected();
+            network_deliver_disconnected(token);
             break;
 
         default:
@@ -252,14 +321,19 @@ int network_manager_start(const network_callbacks_t *callbacks)
         return NETWORK_ERR_START_FAILED;
     }
 
-    if (s_ctx.started)
+    if (atomic_load_explicit(&s_ctx.started, memory_order_acquire))
     {
         network_unlock();
         return NETWORK_ERR_ALREADY_STARTED;
     }
 
-    s_ctx.callbacks = *callbacks;
-    s_ctx.started   = true;
+    network_arm_locked(callbacks);
+    const uint32_t token = s_ctx.active_token;
+    /* (review finding: start/stop transaction race) Snapshot the number of
+     * completed stop() disarms: if it changes while this start is inside
+     * its platform registration transaction, a concurrent stop() disarmed
+     * this session and the start must abort and roll everything back. */
+    const uint32_t stop_count_before = s_ctx.stop_count;
     network_unlock();
 
     /* Wi-Fi onboarding must complete before anything downstream (ThingsBoard)
@@ -268,21 +342,62 @@ int network_manager_start(const network_callbacks_t *callbacks)
     wifi_mgmt_set_wifi_type(T_WIFI_TYPE_CLIENT);
     wifi_mgmt_init();
 
+    /* The token travels as user_data: every event the manager delivers to
+     * this session's subscriptions carries it, and the handler drops any
+     * event whose token no longer matches (late delivery from a previous
+     * session's dispatch snapshot). */
     const bool subscribed =
         wifi_mgmt_subscribe(WIFI_MGMT_EVENT_CONNECTED,
-                            network_wifi_event_cb, NULL) &&
+                            network_wifi_event_cb,
+                            (void *)(uintptr_t)token) &&
         wifi_mgmt_subscribe(WIFI_MGMT_EVENT_DISCONNECTED,
-                            network_wifi_event_cb, NULL) &&
+                            network_wifi_event_cb,
+                            (void *)(uintptr_t)token) &&
         wifi_mgmt_subscribe(WIFI_MGMT_EVENT_CONNECT_FAILED,
-                            network_wifi_event_cb, NULL);
+                            network_wifi_event_cb,
+                            (void *)(uintptr_t)token);
 
     wifi_mgmt_start();
-    const bool ready = wifi_mgmt_wait_ready(NETWORK_START_TIMEOUT_MS);
 
-    if (!subscribed || !ready)
+    /* (review finding: start/stop transaction race) A stop() that ran while
+     * the registration/start calls above were in flight disarmed this
+     * session under the adapter lock (started -> false, stop_count ++).
+     * This start must then abort and roll back instead of returning
+     * NETWORK_OK for an adapter that a completed stop() already owns — the
+     * subscription set after a completed stop() is always empty. */
+    bool stopped_concurrently = false;
+    if (network_lock())
     {
-        osal_log_error("[net] Wi-Fi startup failed (subscribed=%d ready=%d)",
-                       (int)subscribed, (int)ready);
+        if (s_ctx.stop_count != stop_count_before)
+        {
+            stopped_concurrently = true;
+            network_disarm_locked();
+        }
+        network_unlock();
+    }
+
+    const bool ready = stopped_concurrently
+                           ? false
+                           : wifi_mgmt_wait_ready(NETWORK_START_TIMEOUT_MS);
+
+    /* Re-check after the (possibly blocking) wait: the stop may have landed
+     * during the wait instead of during the registration. */
+    if (!stopped_concurrently && network_lock())
+    {
+        if (s_ctx.stop_count != stop_count_before)
+        {
+            stopped_concurrently = true;
+            network_disarm_locked();
+        }
+        network_unlock();
+    }
+
+    if (!subscribed || !ready || stopped_concurrently)
+    {
+        osal_log_error("[net] Wi-Fi startup failed (subscribed=%d ready=%d "
+                       "stopped=%d)",
+                       (int)subscribed, (int)ready,
+                       (int)stopped_concurrently);
 
         /* Roll back so nothing stays registered and no late event can reach
          * the (about to be released) context.  Re-take the lock for the
@@ -295,11 +410,14 @@ int network_manager_start(const network_callbacks_t *callbacks)
         }
 
         (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECTED,
-                                    network_wifi_event_cb, NULL);
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
         (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_DISCONNECTED,
-                                    network_wifi_event_cb, NULL);
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
         (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECT_FAILED,
-                                    network_wifi_event_cb, NULL);
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
         (void)wifi_mgmt_stop();
 
         return NETWORK_ERR_START_FAILED;
@@ -307,8 +425,39 @@ int network_manager_start(const network_callbacks_t *callbacks)
 
     /* Explicit connect request.  The manager also auto-connects when it
      * loaded persisted credentials; requesting here keeps the product
-     * behavior independent of that internal detail. */
-    (void)wifi_mgmt_connect();
+     * behavior independent of that internal detail.  A synchronously
+     * rejected request is a startup failure: the same rollback/error path
+     * applies, plus the disconnect-class transition (fail-off first, then
+     * the application is informed) while the callbacks are still armed. */
+    if (!wifi_mgmt_connect())
+    {
+        osal_log_error("[net] Wi-Fi connect request rejected");
+
+        /* Disconnect-class transition while armed: forces the lamp output
+         * inactive and informs the application state machine. */
+        network_deliver_disconnected(token);
+
+        /* Roll back exactly like a startup failure: nothing stays
+         * registered, the adapter is left in the not-started state. */
+        if (network_lock())
+        {
+            network_disarm_locked();
+            network_unlock();
+        }
+
+        (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECTED,
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
+        (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_DISCONNECTED,
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
+        (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECT_FAILED,
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
+        (void)wifi_mgmt_stop();
+
+        return NETWORK_ERR_START_FAILED;
+    }
 
     osal_log_info("[net] network manager started");
     return NETWORK_OK;
@@ -330,17 +479,31 @@ void network_manager_stop(void)
 
     /* Disarm first (under the lock): any late Wi-Fi worker event that already
      * passed the manager's subscription snapshot is then dropped on delivery
-     * instead of reaching an unregistered context.  Holding the lock also
-     * joins an in-flight callback before we proceed. */
+     * instead of reaching an unregistered context — both by the started-flag
+     * check and by the session-token check.  Holding the lock also joins an
+     * in-flight callback before we proceed.  The token stays readable so the
+     * unsubscribe below removes exactly this session's subscriptions. */
+
+    /* (review finding: start/stop transaction race) A start() that is still
+     * inside its platform registration transaction observes the bumped
+     * stop_count under the lock after its wait/registration calls return,
+     * then disarms its own session and rolls everything back — so a
+     * completed stop() can never leave a live subscription behind and no
+     * start can return NETWORK_OK for an already-stopped adapter. */
+    s_ctx.stop_count++;
+    const uint32_t token = s_ctx.active_token;
     network_disarm_locked();
     network_unlock();
 
     (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECTED,
-                                network_wifi_event_cb, NULL);
+                                network_wifi_event_cb,
+                                (void *)(uintptr_t)token);
     (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_DISCONNECTED,
-                                network_wifi_event_cb, NULL);
+                                network_wifi_event_cb,
+                                (void *)(uintptr_t)token);
     (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECT_FAILED,
-                                network_wifi_event_cb, NULL);
+                                network_wifi_event_cb,
+                                (void *)(uintptr_t)token);
 
     /* Request a manager-side disconnect; the manager state machine owns the
      * actual Wi-Fi teardown. */
@@ -349,12 +512,26 @@ void network_manager_stop(void)
     osal_log_info("[net] network manager stopped");
 }
 
+osal_mutex_id_t network_manager_test_get_lock(void)
+{
+    /* Test-only peek at the published adapter mutex (atomic acquire load,
+     * same as network_lock()): NULL while the lock was never created. */
+    return atomic_load_explicit(&s_ctx.lock, memory_order_acquire);
+}
+
 bool network_manager_is_connected(void)
 {
     /* Deliberately lock-free so callbacks may call it (the delivery path
-     * holds the adapter lock).  s_started is a single flag written only by
-     * start/stop; the manager query is its own thread-safe source of truth. */
-    if (!s_ctx.started)
+     * holds the adapter lock) and so a concurrent stop() can never be joined
+     * by this query.  The lifecycle flag is an atomic read with acquire
+     * ordering: it is written only by start/stop (release stores under the
+     * adapter mutex), so the read is well-defined and the manager query
+     * below remains the thread-safe source of truth for the actual
+     * connection state.  In the window where a stop() has disarmed the
+     * adapter but a start() is still inside its (aborting) transaction, the
+     * armed flag is already false, so the query never reports a connection
+     * for an adapter that is being torn down. */
+    if (!atomic_load_explicit(&s_ctx.started, memory_order_acquire))
     {
         return false;
     }

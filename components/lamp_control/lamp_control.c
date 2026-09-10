@@ -26,13 +26,26 @@
  *
  * Concurrency
  * -----------
- * The module is a singleton (one physical lamp output).  Like the HAL
- * contract it is not thread-safe; callers must serialize access.
+ * The module is a singleton (one physical lamp output).  It serializes all
+ * state-touching operations internally (including force-inactive, which the
+ * network adapter drives from the Wi-Fi worker on disconnect), so concurrent
+ * calls can never corrupt the applied state or race the fail-off.
+ *
+ * Fail-off priority goes beyond serialization: a successful explicit
+ * lamp_control_force_inactive() latches a fail-off barrier, and every
+ * subsequent lamp_control_apply_state() is rejected with
+ * #LAMP_ERR_BLOCKED_BY_FAIL_OFF (re-forcing the output inactive) until the
+ * caller performs the explicit re-enable transition with
+ * lamp_control_release_fail_off().  An apply that is already waiting for
+ * the lock — or that arrives later — therefore can never re-energize the
+ * output behind a disconnect's back; the barrier is the disconnect
+ * endpoint, and only the documented re-enable transition lifts it.
  */
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "lamp_control.h"
 
@@ -47,9 +60,58 @@ typedef struct lamp_control_state {
     bool                 initialized; /**< PWM output initialized and not deinitialized. */
     hal_pin_t            pin;         /**< PWM pin; only valid while initialized. */
     lamp_applied_state_t applied;     /**< Last state successfully applied. */
+    bool                 fail_off_barrier; /**< Fail-off barrier latched by the
+                                            last successful explicit
+                                            force-inactive; blocks apply-state
+                                            until lamp_control_release_fail_off()
+                                            (see lamp_control.h). */
 } lamp_control_state_t;
 
-static lamp_control_state_t s_lamp;
+static lamp_control_state_t s_lamp = {
+    .initialized      = false,
+    .pin              = HAL_PIN_NONE,
+    .applied          = { false, LAMP_BRIGHTNESS_MIN, false },
+    .fail_off_barrier = false,
+};
+
+/* --------------------------------------------------------------------- */
+/* Internal serialization lock                                            */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Internal lock serializing every state-touching operation.
+ *
+ * The singleton lamp API is called from multiple threads in the product
+ * (the application/protocol path applies states while the network adapter
+ * drives the immediate fail-off from the Wi-Fi worker on disconnect), so
+ * all operations that read or write @c s_lamp — including
+ * lamp_control_force_inactive() — serialize against this lock.  It is a
+ * plain atomic spin lock: critical sections only touch the state struct
+ * and issue at most one HAL call, so they are short by construction.
+ *
+ * Ordering guarantee: a fail-off that begins after an apply-state started
+ * on another thread either waits for the apply to finish (and then forces
+ * the output off with consistent bookkeeping) or completes entirely before
+ * the apply starts.  A partially applied state is never observable, so a
+ * disconnect racing a concurrent apply-state always ends with an inactive
+ * output and uncorrupted applied state.
+ */
+static atomic_flag s_lamp_lock = ATOMIC_FLAG_INIT;
+
+/** @brief Acquire the internal lamp serialization lock. */
+static void lamp_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_lamp_lock,
+                                             memory_order_acquire)) {
+        /* Spin: critical sections are single-HAL-call short. */
+    }
+}
+
+/** @brief Release the internal lamp serialization lock. */
+static void lamp_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_lamp_lock, memory_order_release);
+}
 
 /* --------------------------------------------------------------------- */
 /* Helpers                                                               */
@@ -196,7 +258,7 @@ lamp_status_t lamp_brightness_from_duty(lamp_duty_t duty,
 /* Lifecycle and state operations                                        */
 /* --------------------------------------------------------------------- */
 
-lamp_status_t lamp_control_init(const lamp_control_config_t *config)
+static lamp_status_t lamp_control_init_locked(const lamp_control_config_t *config)
 {
     hal_pwm_config_t pwm_cfg;
     hal_status_t hs;
@@ -234,6 +296,10 @@ lamp_status_t lamp_control_init(const lamp_control_config_t *config)
     s_lamp.applied.power = false;
     s_lamp.applied.brightness_percent = LAMP_BRIGHTNESS_MIN;
     s_lamp.applied.output_active = false;
+    /* A fresh initialization clears any fail-off barrier latched before a
+     * deinit: initialization is the re-enable transition for a
+     * deinitialized lamp, so re-initialization starts clean. */
+    s_lamp.fail_off_barrier = false;
 
     /* Initialize PWM at the configured inactive level before enabling it:
      * the HAL contract already starts the output at the logical INACTIVE
@@ -267,8 +333,19 @@ lamp_status_t lamp_control_init(const lamp_control_config_t *config)
     return LAMP_OK;
 }
 
-lamp_status_t lamp_control_apply_state(const lamp_state_t *requested,
-                                       lamp_applied_state_t *applied_out)
+lamp_status_t lamp_control_init(const lamp_control_config_t *config)
+{
+    lamp_status_t status;
+
+    lamp_lock();
+    status = lamp_control_init_locked(config);
+    lamp_unlock();
+
+    return status;
+}
+
+static lamp_status_t lamp_control_apply_state_locked(
+    const lamp_state_t *requested, lamp_applied_state_t *applied_out)
 {
     lamp_duty_t duty;
     float duty_percent;
@@ -330,7 +407,41 @@ lamp_status_t lamp_control_apply_state(const lamp_state_t *requested,
     return LAMP_OK;
 }
 
-lamp_status_t lamp_control_force_inactive(void)
+lamp_status_t lamp_control_apply_state(const lamp_state_t *requested,
+                                       lamp_applied_state_t *applied_out)
+{
+    lamp_status_t status;
+
+    lamp_lock();
+    if (!s_lamp.initialized) {
+        /* Lifecycle check precedes the barrier check: deinit does not clear
+         * the latched barrier, so a deinitialized lamp must still report the
+         * documented not-initialized status, not the barrier status. */
+        status = LAMP_ERR_NOT_INITIALIZED;
+    } else if (s_lamp.fail_off_barrier) {
+        /* Fail-off barrier (review finding 2): an explicit force-inactive
+         * (the disconnect path) has latched the barrier, so this apply —
+         * whether it was already waiting for the lock or arrives later —
+         * must not re-energize the output.  Re-force the output inactive
+         * and reject until the caller performs the explicit re-enable
+         * transition (lamp_control_release_fail_off()); this preserves the
+         * "fail-off wins over any concurrent/later apply" priority. */
+        if (lamp_fail_off() != LAMP_OK) {
+            /* The re-force could not prove the output off: propagate the
+             * safety failure instead of masking it with the barrier status. */
+            status = LAMP_ERR_FAIL_OFF;
+        } else {
+            status = LAMP_ERR_BLOCKED_BY_FAIL_OFF;
+        }
+    } else {
+        status = lamp_control_apply_state_locked(requested, applied_out);
+    }
+    lamp_unlock();
+
+    return status;
+}
+
+static lamp_status_t lamp_control_force_inactive_locked(void)
 {
     if (!s_lamp.initialized) {
         return LAMP_ERR_NOT_INITIALIZED;
@@ -344,7 +455,41 @@ lamp_status_t lamp_control_force_inactive(void)
     return lamp_fail_off();
 }
 
-lamp_status_t lamp_control_deinit(void)
+lamp_status_t lamp_control_force_inactive(void)
+{
+    lamp_status_t status;
+
+    /* Serialized against apply-state/deinit so a fail-off driven from a
+     * foreign thread (network adapter, Wi-Fi worker) can never interleave
+     * with a concurrent state application on the lamp. */
+    lamp_lock();
+    status = lamp_control_force_inactive_locked();
+    if (status == LAMP_OK) {
+        /* Latch the fail-off barrier (review finding 2): the disconnect
+         * endpoint is "output off AND no later apply may re-enable it".
+         * lamp_control_apply_state() rejects until the explicit re-enable
+         * transition (lamp_control_release_fail_off()) clears the barrier. */
+        s_lamp.fail_off_barrier = true;
+    }
+    lamp_unlock();
+
+    return status;
+}
+
+lamp_status_t lamp_control_release_fail_off(void)
+{
+    /* Explicit re-enable transition: clears the fail-off barrier latched by
+     * lamp_control_force_inactive().  Idempotent and always safe — clearing
+     * a barrier that is not latched is a no-op; it never touches the
+     * hardware or the applied state. */
+    lamp_lock();
+    s_lamp.fail_off_barrier = false;
+    lamp_unlock();
+
+    return LAMP_OK;
+}
+
+static lamp_status_t lamp_control_deinit_locked(void)
 {
     hal_status_t hs;
 
@@ -373,7 +518,19 @@ lamp_status_t lamp_control_deinit(void)
     return LAMP_OK;
 }
 
-lamp_status_t lamp_control_get_applied_state(lamp_applied_state_t *applied_out)
+lamp_status_t lamp_control_deinit(void)
+{
+    lamp_status_t status;
+
+    lamp_lock();
+    status = lamp_control_deinit_locked();
+    lamp_unlock();
+
+    return status;
+}
+
+static lamp_status_t lamp_control_get_applied_state_locked(
+    lamp_applied_state_t *applied_out)
 {
     if (!s_lamp.initialized) {
         return LAMP_ERR_NOT_INITIALIZED;
@@ -385,4 +542,15 @@ lamp_status_t lamp_control_get_applied_state(lamp_applied_state_t *applied_out)
     *applied_out = s_lamp.applied;
 
     return LAMP_OK;
+}
+
+lamp_status_t lamp_control_get_applied_state(lamp_applied_state_t *applied_out)
+{
+    lamp_status_t status;
+
+    lamp_lock();
+    status = lamp_control_get_applied_state_locked(applied_out);
+    lamp_unlock();
+
+    return status;
 }

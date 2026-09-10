@@ -29,6 +29,8 @@
  *      credential-like content (SSID/password) is ever logged.
  */
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "lamp_control.h"
@@ -83,6 +85,20 @@ static network_callbacks_t make_callbacks(void *context)
         .context         = context,
     };
     return cb;
+}
+
+/* Start/stop transaction race test (review round 2, issue 1): worker that
+ * runs network_manager_start() on its own thread while the test stops the
+ * adapter mid-transaction. */
+static pthread_t  s_tx_thread;
+static atomic_int s_tx_result;
+
+static void *tx_start_worker(void *arg)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    atomic_store(&s_tx_result, network_manager_start(&cb));
+    (void)arg;
+    return NULL;
 }
 
 void setUp(void)
@@ -238,12 +254,14 @@ static void test_invalid_credentials_fail_off_and_stay_started(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
 
-    /* The manager accepts start but every connect attempt fails (wrong
-     * persisted credentials): the adapter maps that onto the disconnect
-     * path and stays started, so a corrected credential set (or an AP
-     * coming back) can still be picked up. */
+    /* Wrong persisted credentials: the manager accepts the start, the
+     * connect request itself is accepted, but the attempt fails
+     * asynchronously (CONNECT_FAILED): the adapter maps that onto the
+     * disconnect path and stays started, so a corrected credential set (or
+     * an AP coming back) can still be picked up.  (A connect request that
+     * is rejected synchronously is a different, startup-failure path and
+     * has its own test below.) */
     wifi_mock_config_t config = {
-        .fail_connect    = true,
         .connected_state = false,
     };
     wifi_mgmt_mock_set_config(&config);
@@ -351,6 +369,106 @@ static void test_late_event_after_stop_is_dropped_but_fails_off(void)
     TEST_ASSERT_EQUAL_UINT(fail_off_before + 1U,
                            lamp_mock_force_inactive_calls());
     TEST_ASSERT_EQUAL_UINT(disconnected_before, s_app.disconnected_calls);
+}
+
+/* Stale-token regression (review finding 1): the platform manager snapshots
+ * its subscriber list and can deliver an event AFTER stop() completed and a
+ * fresh start() registered new callbacks/context.  A late event from the
+ * OLD session carries the OLD per-start generation token and must never be
+ * delivered to the NEW session's callbacks/context. */
+static void test_stale_token_from_previous_session_is_dropped(void)
+{
+    static int first_ctx;
+    static int second_ctx;
+    network_callbacks_t cb = make_callbacks(&first_ctx);
+
+    /* Session 1: capture its per-start generation token. */
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    void *old_token =
+        wifi_mgmt_mock_get_subscribed_user_data(WIFI_MGMT_EVENT_CONNECTED);
+    TEST_ASSERT_NOT_NULL(old_token);
+    network_manager_stop();
+
+    /* Session 2: a different context, a fresh (never reused) token. */
+    cb = make_callbacks(&second_ctx);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    void *new_token =
+        wifi_mgmt_mock_get_subscribed_user_data(WIFI_MGMT_EVENT_CONNECTED);
+    TEST_ASSERT_NOT_NULL(new_token);
+    TEST_ASSERT_TRUE(old_token != new_token);
+
+    /* The new session works normally with its own token. */
+    TEST_ASSERT_EQUAL_INT(1, wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.connected_calls);
+    TEST_ASSERT_EQUAL_PTR(&second_ctx, s_app.last_context);
+
+    /* A late event from the manager's pre-restart dispatch snapshot: the
+     * handler is current, but the token belongs to the OLD session.  It
+     * must NOT reach the new context's callbacks. */
+    unsigned connected_before    = s_app.connected_calls;
+    unsigned disconnected_before = s_app.disconnected_calls;
+    unsigned fail_off_before     = lamp_mock_force_inactive_calls();
+
+    TEST_ASSERT_EQUAL_INT(
+        1, wifi_mgmt_mock_emit_with_user_data(WIFI_MGMT_EVENT_CONNECTED,
+                                              old_token));
+    TEST_ASSERT_EQUAL_UINT(connected_before, s_app.connected_calls);
+
+    /* A late DISCONNECT with the old token also drops the application
+     * callback; the (idempotent, safe) lamp fail-off still happens. */
+    TEST_ASSERT_EQUAL_INT(
+        1, wifi_mgmt_mock_emit_with_user_data(WIFI_MGMT_EVENT_DISCONNECTED,
+                                              old_token));
+    TEST_ASSERT_EQUAL_UINT(disconnected_before, s_app.disconnected_calls);
+    TEST_ASSERT_EQUAL_UINT(fail_off_before + 1U,
+                           lamp_mock_force_inactive_calls());
+
+    /* Positive control: the new session's token is still delivered. */
+    TEST_ASSERT_EQUAL_INT(
+        1, wifi_mgmt_mock_emit_with_user_data(WIFI_MGMT_EVENT_CONNECTED,
+                                              new_token));
+    TEST_ASSERT_EQUAL_UINT(connected_before + 1U, s_app.connected_calls);
+}
+
+/* Synchronous-connect-rejection regression (review finding 5): a connect
+ * request rejected by the manager is a startup failure with the same
+ * rollback/error path — and the disconnect-class transition (fail-off,
+ * then on_disconnected) is delivered while the callbacks are still armed. */
+static void test_synchronous_connect_rejection_is_startup_failure(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    wifi_mock_config_t config = { .fail_connect = true };
+    wifi_mock_counters_t counters;
+
+    wifi_mgmt_mock_set_config(&config);
+    TEST_ASSERT_EQUAL_INT(NETWORK_ERR_START_FAILED,
+                          network_manager_start(&cb));
+
+    /* The disconnect-class transition ran: fail-off, then the application. */
+    TEST_ASSERT_EQUAL_UINT(1U, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.lamp_off_calls_at_disconnect_entry);
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.disconnected_calls);
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.connected_calls);
+
+    /* The same rollback as a startup failure: nothing stays registered. */
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(1U, counters.connect_calls);
+    TEST_ASSERT_EQUAL_UINT(3U, counters.unsubscribe_calls);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.stop_calls);
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+
+    /* The adapter is left in the not-started state. */
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+    TEST_ASSERT_EQUAL_INT(0, wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.connected_calls);
+
+    /* A fresh start is allowed from the not-started state. */
+    config.fail_connect    = false;
+    config.connected_state = true;
+    wifi_mgmt_mock_set_config(&config);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    TEST_ASSERT_TRUE(network_manager_wait_connected(0));
 }
 
 static void test_stop_disarms_and_unsubscribes(void)
@@ -483,6 +601,56 @@ static void test_is_connected_false_before_start(void)
     TEST_ASSERT_FALSE(network_manager_wait_connected(0));
 }
 
+/* Start/stop transaction race regression (review round 2, issue 1): a
+ * start() that is still inside its platform registration transaction when a
+ * stop() completes must NOT return NETWORK_OK and must not leave any
+ * subscription behind — the subscription set after a completed stop() is
+ * always empty. */
+static void test_start_interrupted_by_stop_rolls_back_completely(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    wifi_mock_counters_t counters;
+
+    /* The mock blocks wifi_mgmt_wait_ready() until the test releases it:
+     * this parks a live start() inside its transaction, after it subscribed
+     * and started the manager. */
+    wifi_mgmt_mock_block_wait_ready();
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&s_tx_thread, NULL,
+                                            tx_start_worker, NULL));
+
+    /* Wait until the in-flight start() has subscribed, then run a full
+     * stop(): it must disarm the session and, per the transaction contract,
+     * force the racing start() to abort/roll back instead of succeeding. */
+    wifi_mgmt_mock_wait_blocked_in_wait_ready();
+    network_manager_stop();
+
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+
+    /* Let the start() continue: it must observe that its session was
+     * stopped, roll everything back and report a startup failure (NOT
+     * NETWORK_OK for an adapter that was already stopped). */
+    wifi_mgmt_mock_release_wait_ready();
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(s_tx_thread, NULL));
+
+    TEST_ASSERT_TRUE(atomic_load(&s_tx_result) != NETWORK_OK);
+
+    /* Nothing survives the completed stop(): no subscription and no armed
+     * callback; a fresh start works normally afterwards. */
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.connected_calls);
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.disconnected_calls);
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+    (void)counters;
+
+    wifi_mock_config_t config = { .connected_state = true };
+    wifi_mgmt_mock_set_config(&config);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    TEST_ASSERT_TRUE(network_manager_wait_connected(0));
+}
+
 /* --------------------------------------------------------------------- */
 /* 7. Secrecy: no credential content in adapter logs                      */
 /* --------------------------------------------------------------------- */
@@ -516,6 +684,225 @@ static void test_logs_never_contain_credential_content(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* 8. Concurrency: first-use races (review findings 3 and 4)              */
+/* --------------------------------------------------------------------- */
+
+/* The adapter mutex is created lazily on the very first API call and the
+ * started flag is a lock-free atomic, so the FIRST concurrent burst of
+ * start/stop/is_connected calls is exactly the window where a non-atomic
+ * started flag (finding 3) or a read-then-create lock (finding 4) would
+ * race.  These tests release a burst of threads through a pthread barrier
+ * so they genuinely collide on first use, and assert the invariants that
+ * must survive the collision: exactly one winning start session, no
+ * duplicate platform registrations left behind, coherent query results and
+ * a final lifecycle state a fresh start can build on. */
+
+#include <pthread.h>
+#include <stdatomic.h>
+
+#define CONCURRENT_THREADS 8
+
+/**
+ * The main Unity suite runs all tests in one process, so the TRUE
+ * first-use window (adapter lock still unpublished) is unreachable here
+ * once any earlier test has used the adapter API — silently running a
+ * "first-use" burst in that state was exactly the regression review round
+ * 3 (issue 4) flagged.  These published-lock burst tests therefore assert
+ * the lock IS already published, and the genuine first-use window is
+ * covered by the dedicated fresh-process executable
+ * tests/network_manager/concurrency (network_manager_concurrency_tests),
+ * which asserts the NULL-lock premise explicitly.
+ */
+
+typedef struct concurrency_result
+{
+    _Atomic unsigned start_ok;      /**< NETWORK_OK starts.                 */
+    _Atomic unsigned start_rejected;/**< ALREADY_STARTED / START_FAILED.    */
+    _Atomic unsigned stop_calls;    /**< stop() invocations completed.      */
+    _Atomic unsigned query_calls;   /**< is_connected() calls completed.    */
+} concurrency_result_t;
+
+static concurrency_result_t s_conc;
+static pthread_barrier_t    s_burst_barrier;
+
+static void *start_worker(void *arg)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+
+    (void)arg;
+    (void)pthread_barrier_wait(&s_burst_barrier);
+    switch (network_manager_start(&cb))
+    {
+        case NETWORK_OK:
+            atomic_fetch_add(&s_conc.start_ok, 1u);
+            break;
+        default:
+            /* ALREADY_STARTED or a clean START_FAILED: both are coherent
+             * rejections for a losing racer. */
+            atomic_fetch_add(&s_conc.start_rejected, 1u);
+            break;
+    }
+    return NULL;
+}
+
+static void *stop_worker(void *arg)
+{
+    (void)arg;
+    (void)pthread_barrier_wait(&s_burst_barrier);
+    network_manager_stop();
+    atomic_fetch_add(&s_conc.stop_calls, 1u);
+    return NULL;
+}
+
+static void *is_connected_worker(void *arg)
+{
+    (void)arg;
+    (void)pthread_barrier_wait(&s_burst_barrier);
+    /* Lock-free query racing start/stop: legal for the atomic started flag
+     * (finding 3) and it hammers the lazy mutex publication window
+     * (finding 4). */
+    (void)network_manager_is_connected();
+    atomic_fetch_add(&s_conc.query_calls, 1u);
+    return NULL;
+}
+
+static void run_concurrent_burst(void *(*entry)(void *), unsigned count)
+{
+    pthread_t threads[CONCURRENT_THREADS];
+
+    TEST_ASSERT_EQUAL_INT(0, pthread_barrier_init(&s_burst_barrier, NULL,
+                                                  count));
+    for (unsigned i = 0u; i < count; ++i)
+    {
+        TEST_ASSERT_EQUAL_INT(0, pthread_create(&threads[i], NULL, entry,
+                                                NULL));
+    }
+    for (unsigned i = 0u; i < count; ++i)
+    {
+        TEST_ASSERT_EQUAL_INT(0, pthread_join(threads[i], NULL));
+    }
+    TEST_ASSERT_EQUAL_INT(0, pthread_barrier_destroy(&s_burst_barrier));
+}
+
+/* Concurrent start collision with the lock ALREADY published (review
+ * findings 3 and 4): exactly one start may win; the others must be rejected
+ * coherently — and the manager must end up with a single, consistent
+ * registration set (no duplicate subscribers from racing arm/subscribe
+ * paths).
+ *
+ * The TRUE first-use window (unpublished lock) cannot be reached inside a
+ * Unity suite where earlier tests have already used the adapter API; that
+ * case is covered by the dedicated fresh-process executable
+ * tests/network_manager/concurrency (network_manager_concurrency_tests),
+ * which asserts the NULL-lock premise explicitly.  This test covers the
+ * complementary published-lock lifecycle race. */
+static void test_concurrent_first_start_race_is_safe(void)
+{
+    wifi_mock_counters_t counters;
+
+    /* Premise of this variant: the lock is already published by the earlier
+     * tests of this suite (the fresh-process first-use case lives in the
+     * standalone concurrency executable, which asserts the opposite). */
+    TEST_ASSERT_NOT_NULL_MESSAGE(network_manager_test_get_lock(),
+                                 "premise: published-lock variant (the "
+                                 "fresh-process first-use burst lives in "
+                                 "tests/network_manager/concurrency)");
+
+    memset(&s_conc, 0, sizeof(s_conc));
+    run_concurrent_burst(start_worker, CONCURRENT_THREADS);
+
+    /* Exactly one session owns the adapter; the rest were rejected without
+     * corrupting the lifecycle state (no invalid mutex use, no torn flag). */
+    TEST_ASSERT_EQUAL_UINT(1U, atomic_load(&s_conc.start_ok));
+    TEST_ASSERT_EQUAL_UINT(CONCURRENT_THREADS - 1U,
+                           atomic_load(&s_conc.start_rejected));
+
+    /* The winner's onboarding ran: station mode selected and the three
+     * product events subscribed exactly once (the losers never subscribed:
+     * they were rejected under the adapter lock before touching the
+     * manager). */
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
+    TEST_ASSERT_EQUAL_UINT(3U, counters.subscribe_calls);
+
+    /* The adapter is operational after the race: events deliver normally
+     * to the one armed session. */
+    TEST_ASSERT_EQUAL_INT(1, wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.connected_calls);
+
+    network_manager_stop();
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+}
+
+/* Concurrent start/stop/is_connected collision with the lock ALREADY
+ * published (review findings 3 and 4): start threads, stop threads and
+ * lock-free query threads all race through the same mutex and atomic flag.
+ * The invariants are structural: no deadlock or corruption (every call
+ * returns), the query is answered, and the end state is a clean adapter
+ * that a fresh start can arm again.
+ *
+ * The unpublished-lock first-use window is covered by the dedicated
+ * fresh-process executable tests/network_manager/concurrency
+ * (network_manager_concurrency_tests). */
+static void test_concurrent_first_start_stop_is_connected_race_is_safe(void)
+{
+    memset(&s_conc, 0, sizeof(s_conc));
+
+    /* Premise of this variant: the lock is already published (see the
+     * fresh-process standalone burst for the unpublished window). */
+    TEST_ASSERT_NOT_NULL_MESSAGE(network_manager_test_get_lock(),
+                                 "premise: published-lock variant (the "
+                                 "fresh-process first-use burst lives in "
+                                 "tests/network_manager/concurrency)");
+
+    /* One burst: half the threads start, a quarter stop, a quarter query —
+     * all released together against the already-published lock. */
+    TEST_ASSERT_EQUAL_INT(0, pthread_barrier_init(&s_burst_barrier, NULL,
+                                                  CONCURRENT_THREADS));
+    pthread_t threads[CONCURRENT_THREADS];
+    for (unsigned i = 0u; i < CONCURRENT_THREADS; ++i)
+    {
+        void *(*entry)(void *) = (i < CONCURRENT_THREADS / 2U)
+                                     ? start_worker
+                                     : (i % 2U == 0U) ? stop_worker
+                                                      : is_connected_worker;
+        TEST_ASSERT_EQUAL_INT(0, pthread_create(&threads[i], NULL, entry,
+                                                NULL));
+    }
+    for (unsigned i = 0u; i < CONCURRENT_THREADS; ++i)
+    {
+        TEST_ASSERT_EQUAL_INT(0, pthread_join(threads[i], NULL));
+    }
+    TEST_ASSERT_EQUAL_INT(0, pthread_barrier_destroy(&s_burst_barrier));
+
+    /* Every worker made it through the race alive and coherent. */
+    TEST_ASSERT_EQUAL_UINT(CONCURRENT_THREADS,
+                           atomic_load(&s_conc.start_ok) +
+                               atomic_load(&s_conc.start_rejected) +
+                               atomic_load(&s_conc.stop_calls) +
+                               atomic_load(&s_conc.query_calls));
+
+    /* Whatever the interleaving produced, the lifecycle settles into a
+     * coherent state: stop() is idempotent and leaves the adapter stopped
+     * with nothing registered and no application callback delivered. */
+    network_manager_stop();
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.connected_calls);
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.disconnected_calls);
+
+    /* A fresh start still works: the lock survived the creation race and
+     * the lifecycle state is arming again. */
+    network_callbacks_t cb = make_callbacks(NULL);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    TEST_ASSERT_NOT_NULL(
+        wifi_mgmt_mock_get_subscribed_user_data(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_INT(1, wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.connected_calls);
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
 
@@ -543,6 +930,7 @@ int main(void)
 
     /* 5. stale callbacks */
     RUN_TEST(test_late_event_after_stop_is_dropped_but_fails_off);
+    RUN_TEST(test_stale_token_from_previous_session_is_dropped);
     RUN_TEST(test_stop_disarms_and_unsubscribes);
     RUN_TEST(test_stop_is_idempotent);
 
@@ -550,11 +938,18 @@ int main(void)
     RUN_TEST(test_start_rejects_invalid_callbacks);
     RUN_TEST(test_double_start_is_rejected);
     RUN_TEST(test_failed_start_rolls_back_and_allows_restart);
+    RUN_TEST(test_synchronous_connect_rejection_is_startup_failure);
     RUN_TEST(test_restart_with_new_context);
+    RUN_TEST(test_start_interrupted_by_stop_rolls_back_completely);
     RUN_TEST(test_is_connected_false_before_start);
 
     /* 7. secrecy */
     RUN_TEST(test_logs_never_contain_credential_content);
+
+    /* 8. concurrency: first-use races for the started flag and the lazy
+     *    lock (review findings 3 and 4). */
+    RUN_TEST(test_concurrent_first_start_race_is_safe);
+    RUN_TEST(test_concurrent_first_start_stop_is_connected_race_is_safe);
 
     return UNITY_END();
 }
