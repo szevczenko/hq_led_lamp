@@ -41,6 +41,12 @@ __pycache__/
 *.p12
 /cert/
 
+# ThingsBoard development stack (server/) — generated runtime material
+# (development CA/certs, real environment, and durable database storage)
+/server/.env
+/server/certs/
+/server/data/
+
 # Manufacturing secrets
 /config/manufacturing.json
 

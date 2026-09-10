@@ -1,0 +1,16 @@
+# Development Caddyfile - HTTPS termination for the ThingsBoard web UI.
+#
+# Terminates TLS with the development server certificate (SAN
+# DNS:thingsboard.home.arpa, signed by server/certs/ca.crt) and proxies to
+# the ThingsBoard HTTP endpoint inside the Docker network.
+#
+# The admin browser must be able to resolve thingsboard.home.arpa to this
+# host and should trust server/certs/ca.crt (see server/README.md).
+
+{$TB_DNS_NAME:thingsboard.home.arpa} {
+	tls /certs/server.crt /certs/server.key
+
+	encode gzip
+
+	reverse_proxy thingsboard:9090
+}
