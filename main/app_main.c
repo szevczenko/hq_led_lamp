@@ -2,7 +2,7 @@
  * @file app_main.c
  * @brief Kitchen LED Controller application entry point.
  *
- *  ## Boot-order contract (TASK-107 / TASK-118)
+ *  ## Boot-order contract (TASK-107 / TASK-118 / TASK-109)
  *
  *   1. lamp_control_init() — the output is initialized off and stays off
  *      until a valid desired state arrives.
@@ -17,6 +17,14 @@
  *      configuration is not loaded.  A failed directory bootstrap unmounts
  *      the volume before returning, so no hidden mount survives.
  *   4. Only a fully successful bootstrap reaches configuration loading.
+ *   5. Wi-Fi onboarding (TASK-109) runs next through the product-owned
+ *      network adapter.  ThingsBoard must never connect before the network:
+ *      s_network_ready is the gate — a ThingsBoard connect may only be
+ *      attempted after network_manager_wait_connected() reported a
+ *      connection ( ThingsBoard integration follows in its own task ).
+ *   6. On Wi-Fi loss the adapter forces the lamp output inactive
+ *      synchronously and informs the application state machine through
+ *      on_disconnected().
  *
  *  The idempotent mkdir (EEXIST -> OSAL_ERR_NAME_TAKEN -> LAMP_FS_OK) is
  *  expected after a reflash onto persistent storage and is not a defect.
@@ -30,9 +38,86 @@
 #include "hal_types.h"
 #include "lamp_control.h"
 #include "lamp_fs.h"
+#include "network_manager.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "klc";
+
+/* --------------------------------------------------------------------- */
+/* Network adapter wiring (TASK-109)                                       */
+/* --------------------------------------------------------------------- */
+
+/**
+ * Application network state machine flag.  It is set only after the network
+ * gate (network_manager_wait_connected) has confirmed a connection and is
+ * cleared on disconnect.  A ThingsBoard connect may only be attempted while
+ * this flag is set — the network contract of release 1.
+ */
+static bool s_network_ready = false;
+
+/**
+ * @brief Network connection established (Wi-Fi manager worker context).
+ *
+ * Called by the adapter after the network is up.  Only now may the
+ * ThingsBoard client begin its connect attempts; nothing here touches Wi-Fi
+ * credentials — the adapter and the manager keep them private.
+ */
+static void on_network_connected(void *context)
+{
+    (void)context;
+    s_network_ready = true;
+    ESP_LOGI(TAG, "Network connected; ThingsBoard connect is now allowed");
+}
+
+/**
+ * @brief Network lost or connect attempts exhausted (Wi-Fi worker context).
+ *
+ * The adapter has already forced the lamp output inactive synchronously on
+ * this path (fail-off within application latency); this callback only
+ * updates the application state machine.  ThingsBoard is considered down
+ * until the network gate passes again.
+ */
+static void on_network_disconnected(void *context)
+{
+    (void)context;
+    s_network_ready = false;
+    ESP_LOGW(TAG, "Network lost; lamp forced off by adapter, "
+                  "ThingsBoard stays disconnected until reconnect");
+}
+
+/**
+ * @return true when the network is started AND connected; false leaves the
+ *         application in the safe offline state (output off, no ThingsBoard).
+ */
+static bool start_network(void)
+{
+    static const network_callbacks_t callbacks = {
+        .on_connected    = on_network_connected,
+        .on_disconnected = on_network_disconnected,
+        .context         = NULL,
+    };
+
+    const int status = network_manager_start(&callbacks);
+    if (status != NETWORK_OK)
+    {
+        ESP_LOGE(TAG, "network_manager_start failed: %d (offline, output off)",
+                 (int)status);
+        return false;
+    }
+
+    /* The ThingsBoard ordering gate: block (bounded) until the network is
+     * connected.  ThingsBoard initialization that follows in its own task
+     * must run only behind this gate / the s_network_ready flag. */
+    if (!network_manager_wait_connected(NETWORK_CONNECT_TIMEOUT_MS))
+    {
+        ESP_LOGW(TAG, "No Wi-Fi connection within %u ms; "
+                      "ThingsBoard connect stays blocked",
+                 (unsigned)NETWORK_CONNECT_TIMEOUT_MS);
+        return false;
+    }
+
+    return true;
+}
 
 /* --------------------------------------------------------------------- */
 /* Lamp output                                                            */
@@ -190,4 +275,13 @@ void app_main(void)
     }
 
     load_configuration();
+
+    /* Wi-Fi onboarding (TASK-109) runs before any ThingsBoard connect
+     * attempt.  On failure (or timeout) the device stays offline in the
+     * safe state: the output is off and s_network_ready keeps the (later)
+     * ThingsBoard initialization gated. */
+    if (!start_network())
+    {
+        ESP_LOGW(TAG, "Continuing offline; ThingsBoard connect is blocked");
+    }
 }

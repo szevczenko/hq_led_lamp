@@ -11,5 +11,5 @@
 idf_component_register(
     SRCS "app_main.c"
     INCLUDE_DIRS "."
-    REQUIRES lamp_control lamp_fs app_config
+    REQUIRES lamp_control lamp_fs app_config network_manager
 )
