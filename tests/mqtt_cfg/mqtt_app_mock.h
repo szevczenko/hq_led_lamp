@@ -51,6 +51,19 @@ void mqtt_app_mock_simulate_connect_failure(
 /** @brief Simulate a disconnect after an established MQTT session. */
 void mqtt_app_mock_simulate_disconnect(mqtt_disconnect_reason_t reason);
 
+/**
+ * @brief Simulate the generic apply-config path (mqtt_config_save() ->
+ *        MQTT_CMD_TYPE_APPLY_CONFIG).
+ *
+ * Captures the current mqtt_config state into a snapshot (like the real
+ * platform's apply-config handler), consults the registered
+ * configuration-owner validation callback and mirrors the platform
+ * outcome: an approved candidate reconnects (connect event), a rejected
+ * one leaves the transport disconnected and notifies the failure observer
+ * with MQTT_CONNECT_FAILURE_REASON_CONFIG_REJECTED.
+ */
+void mqtt_app_mock_simulate_apply_config(void);
+
 #ifdef __cplusplus
 }
 #endif

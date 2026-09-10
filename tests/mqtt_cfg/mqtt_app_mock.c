@@ -6,6 +6,7 @@
 #include "mqtt_app_mock.h"
 
 #include <stdbool.h>
+#include <string.h>
 
 /* --------------------------------------------------------------------- */
 /* Mock state                                                             */
@@ -23,6 +24,7 @@ static mqtt_connect_failure_callback_t s_connect_failure_cb;
 static mqtt_connect_callback_t s_safety_connect_cb;
 static mqtt_disconnect_callback_t s_safety_disconnect_cb;
 static mqtt_connect_failure_callback_t s_safety_connect_failure_cb;
+static mqtt_config_validation_callback_t s_validation_cb;
 
 /* --------------------------------------------------------------------- */
 /* Mock control                                                           */
@@ -42,6 +44,7 @@ void mqtt_app_mock_reset(void)
     s_safety_connect_cb = NULL;
     s_safety_disconnect_cb = NULL;
     s_safety_connect_failure_cb = NULL;
+    s_validation_cb = NULL;
 }
 
 unsigned mqtt_app_mock_init_calls(void)
@@ -103,6 +106,76 @@ void mqtt_app_mock_simulate_disconnect(mqtt_disconnect_reason_t reason)
     }
 }
 
+void mqtt_app_mock_simulate_apply_config(void)
+{
+    mqtt_config_snapshot_t snapshot;
+    bool ssl = false;
+    bool skip = false;
+    mqtt_cert_source_t source = MQTT_CERT_SOURCE_NONE;
+    const char *value = NULL;
+    bool accepted = false;
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.address = mqtt_config_get_string(MQTT_CONFIG_VALUE_ADDRESS);
+    if (mqtt_config_get_bool(&ssl, MQTT_CONFIG_VALUE_SSL))
+    {
+        snapshot.ssl_enabled = ssl;
+    }
+    if (mqtt_config_get_bool(&skip, MQTT_CONFIG_VALUE_SKIP_VERIFY))
+    {
+        snapshot.skip_verify = skip;
+    }
+    if (mqtt_config_get_cert_source(&source, &value, MQTT_CONFIG_VALUE_CERT))
+    {
+        snapshot.cert_source = source;
+        snapshot.cert_value = value;
+    }
+    if (mqtt_config_get_cert_source(&source, &value,
+                                    MQTT_CONFIG_VALUE_CLIENT_CERT))
+    {
+        snapshot.client_cert_source = source;
+        snapshot.client_cert_value = value;
+    }
+    if (mqtt_config_get_cert_source(&source, &value,
+                                    MQTT_CONFIG_VALUE_CLIENT_KEY))
+    {
+        snapshot.client_key_source = source;
+        snapshot.client_key_value = value;
+    }
+
+    /* Mirror the real apply-config handler (mqtt_app.c): the reconnect only
+     * happens when a registered validation callback approves the exact
+     * snapshot of values that would be used; otherwise the transport is left
+     * disconnected and the failure observer is notified. */
+    if (s_validation_cb != NULL)
+    {
+        accepted = s_validation_cb(&snapshot);
+    }
+
+    if (accepted)
+    {
+        mqtt_app_mock_simulate_connect();
+    }
+    else
+    {
+        if (s_connected)
+        {
+            mqtt_app_mock_simulate_disconnect(
+                MQTT_DISCONNECT_REASON_EXPLICIT);
+        }
+        if (s_safety_connect_failure_cb != NULL)
+        {
+            s_safety_connect_failure_cb(
+                MQTT_CONNECT_FAILURE_REASON_CONFIG_REJECTED);
+        }
+        if (s_connect_failure_cb != NULL)
+        {
+            s_connect_failure_cb(
+                MQTT_CONNECT_FAILURE_REASON_CONFIG_REJECTED);
+        }
+    }
+}
+
 /* --------------------------------------------------------------------- */
 /* mqtt_app implementation (the surface mqtt_cfg uses)                    */
 /* --------------------------------------------------------------------- */
@@ -161,6 +234,12 @@ void mqtt_app_set_safety_callbacks(mqtt_connect_callback_t connect_cb,
     s_safety_connect_cb = connect_cb;
     s_safety_disconnect_cb = disconnect_cb;
     s_safety_connect_failure_cb = failure_cb;
+}
+
+void mqtt_app_set_config_validation_callback(
+    mqtt_config_validation_callback_t cb)
+{
+    s_validation_cb = cb;
 }
 
 bool mqtt_app_post_data(const char *topic, const char *message, int qos)

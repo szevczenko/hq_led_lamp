@@ -19,6 +19,7 @@
 
 #include "mqtt_cfg.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@
 #include "osal_error.h"
 #include "osal_file.h"
 #include "osal_log.h"
+#include "osal_mutex.h"
 #include "osal_task.h"
 
 /* --------------------------------------------------------------------- */
@@ -78,16 +80,98 @@ static mqtt_cfg_cert_snapshot_t s_applied_client_cert;
 static mqtt_cfg_cert_snapshot_t s_applied_client_key;
 
 /**
+ * @brief Module-owned lock serializing the verified-transport lifecycle.
+ *
+ * Guards the verified-apply latch, the applied snapshot and every verified
+ * transport check against the values the transport consumes (TASK-110
+ * finding 2): apply() publishes the verified values under this lock and
+ * connect() performs its entry check and its success-time re-check under
+ * the same lock, so a concurrent mqtt_cfg apply/connect can never observe
+ * or consume a half-written configuration.  The lock is never held across
+ * the blocking mqtt_app_deinit()/mqtt_app_init() calls, and the Mongoose
+ * safety callbacks plus the config-validation gate only touch the atomics
+ * below (never this lock), so no deadlock can form with the transport
+ * thread.
+ *
+ * Created lazily on first use (publish-once pattern); never deleted, so a
+ * published handle stays valid for the process lifetime.
+ */
+static _Atomic(osal_mutex_id_t) s_lock;
+
+/**
  * @brief Apply/connection generations prevent an old session from satisfying
  *        a newly applied configuration.
+ *
+ * Written by the apply/connect paths and read (and written) by the Mongoose
+ * safety callbacks running on the poll thread, so all four fields are C11
+ * atomics with acquire/release ordering: a connect or failure event
+ * published on the transport thread is never lost by the connect poll loop
+ * (TASK-110 finding 3).  The wait/generation state is established under the
+ * module lock BEFORE mqtt_app_init() starts the asynchronous connect;
+ * callbacks publish with release ordering and the poll loop consumes with
+ * acquire ordering.
  */
-static uint32_t s_apply_generation;
-static uint32_t s_connected_generation;
-static bool s_waiting_for_connection;
+static atomic_uint s_apply_generation;
+static atomic_uint s_connected_generation;
+static atomic_bool s_waiting_for_connection;
+static atomic_bool s_connect_failed;
 
 /* --------------------------------------------------------------------- */
 /* Local helpers                                                          */
 /* --------------------------------------------------------------------- */
+
+/**
+ * @brief Lazily publish the module lock (created once, never deleted).
+ *
+ * @return true when a lock handle is available (created or already
+ *         published); false only when creation itself failed.
+ */
+static bool mqtt_cfg_lock_ensure(void)
+{
+    osal_mutex_id_t lock =
+        atomic_load_explicit(&s_lock, memory_order_acquire);
+    if (lock != NULL)
+    {
+        return true;
+    }
+
+    osal_mutex_id_t created = NULL;
+    if (osal_mutex_create(&created, "mqtt_cfg") != OSAL_SUCCESS)
+    {
+        return false;
+    }
+
+    osal_mutex_id_t expected = NULL;
+    if (atomic_compare_exchange_strong_explicit(
+            &s_lock, &expected, created, memory_order_release,
+            memory_order_acquire))
+    {
+        /* This thread adopted its mutex; it was published exactly once. */
+        return true;
+    }
+
+    /* Another thread won the creation race; drop the duplicate. */
+    (void)osal_mutex_delete(created);
+    return true;
+}
+
+/** @brief Take the module lock (blocking; no-op-safe when unavailable). */
+static void mqtt_cfg_lock(void)
+{
+    if (mqtt_cfg_lock_ensure())
+    {
+        (void)osal_mutex_take(s_lock);
+    }
+}
+
+/** @brief Release the module lock taken by mqtt_cfg_lock(). */
+static void mqtt_cfg_unlock(void)
+{
+    if (atomic_load_explicit(&s_lock, memory_order_acquire) != NULL)
+    {
+        (void)osal_mutex_give(s_lock);
+    }
+}
 
 /**
  * @brief Force the lamp output inactive.
@@ -248,6 +332,13 @@ static bool mqtt_cfg_raw_json_has_nul_escape(const char *json)
 
 /**
  * @brief Validate a single string field against a printable-ASCII charset.
+ *
+ * Bounded-terminator rule (TASK-110 finding 1): the caller's fixed-size
+ * arrays must be NUL-terminated within their capacity before any unbounded
+ * string operation.  strnlen() therefore never scans past
+ * max_len + 1 bytes (the array size including the terminator slot); a
+ * missing terminator yields a length above max_len and is rejected as an
+ * invalid argument instead of causing an out-of-bounds read.
  */
 static bool mqtt_cfg_is_printable(const char *str, size_t max_len)
 {
@@ -258,7 +349,7 @@ static bool mqtt_cfg_is_printable(const char *str, size_t max_len)
         return false;
     }
 
-    len = strlen(str);
+    len = strnlen(str, max_len + 1u);
     if (len > max_len)
     {
         return false;
@@ -289,6 +380,13 @@ static bool mqtt_cfg_path_under_cert(const char *path)
     size_t prefix_len = strlen(prefix);
 
     if (path == NULL || path[0] == '\0')
+    {
+        return false;
+    }
+    /* Bounded-terminator rule (TASK-110 finding 1): the fixed-size path
+     * array must be NUL-terminated within its capacity before the unbounded
+     * strstr() scan below can run. */
+    if (strnlen(path, MQTT_CFG_PATH_MAX_LEN + 1u) > MQTT_CFG_PATH_MAX_LEN)
     {
         return false;
     }
@@ -806,16 +904,84 @@ static bool mqtt_cfg_applied_transport_matches(void)
                                          NULL, false, NULL);
 }
 
+/**
+ * @brief Verified-owner validation gate for the generic apply-config path
+ *        (TASK-121 platform gate; TASK-110 finding 4).
+ *
+ * The platform invokes this callback on the Mongoose poll thread from the
+ * mqtt_config_save() -> MQTT_CMD_TYPE_APPLY_CONFIG handler with an owned
+ * snapshot of the exact values the reconnect would use.  Only a candidate
+ * identical to the module's verified applied state is approved; anything
+ * else — SSL off, skip-verify on, raw or relocated certificate material, a
+ * different (e.g. plaintext or IP) address — is rejected, so no caller can
+ * make the transport reconnect from unverified values.  The platform fails
+ * closed when no callback is registered, and on rejection it leaves the
+ * transport disconnected and notifies the failure observer, which fails
+ * the lamp off (see mqtt_cfg_on_connect_failure()).
+ */
+static bool mqtt_cfg_config_gate(const mqtt_config_snapshot_t *candidate)
+{
+    char expected_address[MQTT_CFG_HOSTNAME_MAX_LEN + 16u];
+    bool accepted = false;
+
+    mqtt_cfg_lock();
+    if (candidate != NULL && s_verified_applied &&
+        mqtt_cfg_validate_fields(&s_applied_cfg) == MQTT_CFG_OK &&
+        snprintf(expected_address, sizeof(expected_address),
+                 MQTT_CFG_ADDRESS_FMT, s_applied_cfg.hostname,
+                 (unsigned)s_applied_cfg.port) >= 0)
+    {
+        if (candidate->address != NULL &&
+            strcmp(candidate->address, expected_address) == 0 &&
+            candidate->ssl_enabled && !candidate->skip_verify &&
+            candidate->cert_source == MQTT_CERT_SOURCE_FILE_PATH &&
+            candidate->cert_value != NULL &&
+            mqtt_cfg_path_under_cert(candidate->cert_value) &&
+            strcmp(candidate->cert_value, s_applied_cfg.ca_path) == 0)
+        {
+            if (s_applied_cfg.auth_mode == MQTT_CFG_AUTH_MTLS)
+            {
+                accepted =
+                    candidate->client_cert_source ==
+                        MQTT_CERT_SOURCE_FILE_PATH &&
+                    candidate->client_cert_value != NULL &&
+                    strcmp(candidate->client_cert_value,
+                           s_applied_cfg.client_cert_path) == 0 &&
+                    candidate->client_key_source ==
+                        MQTT_CERT_SOURCE_FILE_PATH &&
+                    candidate->client_key_value != NULL &&
+                    strcmp(candidate->client_key_value,
+                           s_applied_cfg.client_key_path) == 0;
+            }
+            else
+            {
+                accepted =
+                    candidate->client_cert_source == MQTT_CERT_SOURCE_NONE &&
+                    candidate->client_key_source == MQTT_CERT_SOURCE_NONE;
+            }
+        }
+    }
+    mqtt_cfg_unlock();
+    return accepted;
+}
+
 mqtt_cfg_status_t mqtt_cfg_validate(const mqtt_cfg_t *cfg)
 {
-    mqtt_cfg_status_t status = mqtt_cfg_validate_fields(cfg);
+    mqtt_cfg_status_t status;
 
+    mqtt_cfg_lock();
+    status = mqtt_cfg_validate_fields(cfg);
     if (status != MQTT_CFG_OK)
     {
         /* A rejected configuration also invalidates any previously applied
          * transport.  Otherwise a caller could load a bad document, observe
          * fail-off, and then reconnect stale transport state. */
         s_verified_applied = false;
+    }
+    mqtt_cfg_unlock();
+
+    if (status != MQTT_CFG_OK)
+    {
         mqtt_cfg_fail_off();
     }
     return status;
@@ -836,7 +1002,9 @@ mqtt_cfg_status_t mqtt_cfg_load(mqtt_cfg_t *out)
     {
         /* Every load failure forces the output inactive (fail-off
          * contract); an invalid argument is a failure like any other. */
+        mqtt_cfg_lock();
         s_verified_applied = false;
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_INVALID_ARGUMENT;
     }
@@ -893,7 +1061,9 @@ mqtt_cfg_status_t mqtt_cfg_load(mqtt_cfg_t *out)
     return MQTT_CFG_OK;
 
 fail:
+    mqtt_cfg_lock();
     s_verified_applied = false;
+    mqtt_cfg_unlock();
     cJSON_Delete(root);
     free(json);
     osal_log_error("mqtt_cfg: mqtt.json rejected: %d (%s)",
@@ -920,36 +1090,58 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
     mqtt_cfg_cert_snapshot_t ca_snapshot = { 0 };
     mqtt_cfg_cert_snapshot_t client_cert_snapshot = { 0 };
     mqtt_cfg_cert_snapshot_t client_key_snapshot = { 0 };
+    const char *str = NULL;
+    mqtt_cert_source_t source = MQTT_CERT_SOURCE_NONE;
+    const char *value = NULL;
+
+    /* Register this module as the verified configuration owner (TASK-121
+     * gate, finding 4): the generic mqtt_config_save() reconnect path can
+     * only restart the transport with values this callback approves
+     * (fail-closed otherwise), so no other caller — hq_cmd_mqtt or any
+     * direct mqtt_config setter — can reconnect from unverified values.
+     * Registration is idempotent and thread-safe. */
+    mqtt_app_set_config_validation_callback(mqtt_cfg_config_gate);
 
     /* A new apply invalidates and stops any old session before its transport
      * values can be replaced.  This is intentionally done even when the new
      * document later fails validation: a failed reconfiguration must not
-     * leave an old (possibly insecure) session usable. */
-    ++s_apply_generation;
-    if (s_apply_generation == 0u)
+     * leave an old (possibly insecure) session usable.  The generation and
+     * latch are updated under the module lock; the teardown itself runs
+     * outside it (mqtt_app_deinit() blocks on the transport thread, whose
+     * safety callbacks never take this lock). */
+    mqtt_cfg_lock();
+    uint32_t gen = atomic_load_explicit(&s_apply_generation,
+                                        memory_order_relaxed) + 1u;
+    if (gen == 0u)
     {
-        s_apply_generation = 1u;
+        gen = 1u;
     }
-    s_connected_generation = 0u;
-    s_waiting_for_connection = false;
+    atomic_store_explicit(&s_apply_generation, gen, memory_order_relaxed);
+    atomic_store_explicit(&s_connected_generation, 0u, memory_order_relaxed);
+    atomic_store_explicit(&s_waiting_for_connection, false,
+                          memory_order_relaxed);
     s_verified_applied = false;
+    mqtt_cfg_unlock();
+
     if (mqtt_app_is_connected())
     {
         mqtt_cfg_fail_off();
     }
     mqtt_app_deinit();
-    const char *str = NULL;
-    mqtt_cert_source_t source = MQTT_CERT_SOURCE_NONE;
-    const char *value = NULL;
 
     /* Every apply attempt re-arms the connect gate: a rejected (even
      * partially applied) configuration must never leave a usable transport
-     * state that mqtt_cfg_connect() could start. */
+     * state that mqtt_cfg_connect() could start.  The validated apply
+     * sequence (field validation, setters, self-check and snapshot publish)
+     * runs under the module lock, so a concurrent connect() can never read
+     * half-applied mqtt_config values (finding 2). */
+    mqtt_cfg_lock();
     s_verified_applied = false;
 
     status = mqtt_cfg_validate_fields(cfg);
     if (status != MQTT_CFG_OK)
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return status;
     }
@@ -961,6 +1153,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
     if (snprintf(address, sizeof(address), MQTT_CFG_ADDRESS_FMT,
                  cfg->hostname, (unsigned)cfg->port) < 0)
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_APPLY;
     }
@@ -970,6 +1163,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
         !mqtt_config_set_bool(true, MQTT_CONFIG_VALUE_SSL) ||
         !mqtt_config_set_bool(false, MQTT_CONFIG_VALUE_SKIP_VERIFY))
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_APPLY;
     }
@@ -979,6 +1173,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
      * (never a generic apply error, and never a disabled verification). */
     if (!mqtt_cfg_apply_cert_source(MQTT_CONFIG_VALUE_CERT, cfg->ca_path))
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_CA_PATH;
     }
@@ -990,6 +1185,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
             !mqtt_cfg_apply_cert_source(MQTT_CONFIG_VALUE_CLIENT_KEY,
                                         cfg->client_key_path))
         {
+            mqtt_cfg_unlock();
             mqtt_cfg_fail_off();
             return MQTT_CFG_ERR_CERT_PATH;
         }
@@ -1004,6 +1200,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
                                                MQTT_CONFIG_VALUE_CLIENT_KEY);
         if (!ok)
         {
+            mqtt_cfg_unlock();
             mqtt_cfg_fail_off();
             return MQTT_CFG_ERR_APPLY;
         }
@@ -1014,11 +1211,13 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
     str = mqtt_config_get_string(MQTT_CONFIG_VALUE_ADDRESS);
     if (str == NULL || strcmp(str, address) != 0)
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_APPLY;
     }
     if (!mqtt_config_get_bool(&flag, MQTT_CONFIG_VALUE_SSL) || !flag)
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_APPLY;
     }
@@ -1026,6 +1225,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
     {
         /* skip_verify must never be on for an accepted configuration. */
         (void)mqtt_config_set_bool(false, MQTT_CONFIG_VALUE_SKIP_VERIFY);
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_APPLY;
     }
@@ -1033,12 +1233,14 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
                                      MQTT_CONFIG_VALUE_CERT) ||
         source != MQTT_CERT_SOURCE_FILE_PATH)
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_CA_PATH;
     }
     if (value == NULL || strcmp(value, cfg->ca_path) != 0 ||
         !mqtt_cfg_capture_cert(MQTT_CONFIG_VALUE_CERT, &ca_snapshot))
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_CA_PATH;
     }
@@ -1049,6 +1251,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
          !mqtt_cfg_capture_cert(MQTT_CONFIG_VALUE_CLIENT_KEY,
                                 &client_key_snapshot)))
     {
+        mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_CERT_PATH;
     }
@@ -1062,9 +1265,10 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
     s_applied_client_cert = client_cert_snapshot;
     s_applied_client_key = client_key_snapshot;
     s_verified_applied = true;
+    mqtt_cfg_unlock();
 
     osal_log_info("mqtt_cfg: verified transport configured: %s client_id=%s",
-                  address, cfg->client_id);
+                  address, s_applied_cfg.client_id);
     return MQTT_CFG_OK;
 }
 
@@ -1084,15 +1288,21 @@ mqtt_cfg_status_t mqtt_cfg_load_and_apply(void)
 /* Connect (verified TLS)                                                 */
 /* --------------------------------------------------------------------- */
 
-static bool s_connect_failed;
-
 static void mqtt_cfg_on_connect(void)
 {
     /* Only a connect event observed while this call owns the current apply
-     * generation can release the barrier. */
-    if (s_waiting_for_connection)
+     * generation can release the barrier.  All fields are atomics: the
+     * callback runs on the Mongoose poll thread while the connect poll loop
+     * runs on the caller's thread, and publication uses release ordering
+     * (finding 3). */
+    if (atomic_load_explicit(&s_waiting_for_connection,
+                             memory_order_acquire))
     {
-        s_connected_generation = s_apply_generation;
+        atomic_store_explicit(
+            &s_connected_generation,
+            atomic_load_explicit(&s_apply_generation,
+                                 memory_order_acquire),
+            memory_order_release);
     }
 }
 
@@ -1103,19 +1313,33 @@ static void mqtt_cfg_on_disconnect(mqtt_disconnect_reason_t reason)
      * reconnect to release the lamp barrier: only a fresh successful
      * mqtt_cfg_connect() does that. */
     (void)reason;
-    s_waiting_for_connection = false;
-    s_connected_generation = 0u;
+    atomic_store_explicit(&s_waiting_for_connection, false,
+                          memory_order_release);
+    atomic_store_explicit(&s_connected_generation, 0u,
+                          memory_order_release);
     mqtt_cfg_fail_off();
 }
 
 static void mqtt_cfg_on_connect_failure(mqtt_connect_failure_reason_t reason)
 {
-    (void)reason;
     /* Fail-off contract: a TLS/transport connection failure forces the
      * output inactive immediately, before the poll loop reports it. */
-    s_waiting_for_connection = false;
-    s_connected_generation = 0u;
-    s_connect_failed = true;
+    atomic_store_explicit(&s_waiting_for_connection, false,
+                          memory_order_release);
+    atomic_store_explicit(&s_connected_generation, 0u,
+                          memory_order_release);
+    atomic_store_explicit(&s_connect_failed, true, memory_order_release);
+    if (reason == MQTT_CONNECT_FAILURE_REASON_CONFIG_REJECTED)
+    {
+        /* The generic save/apply path was refused because the candidate did
+         * not match the verified snapshot (finding 4).  The platform has
+         * already left the transport disconnected; also close the product's
+         * connect gate so the mutated state cannot be retried or re-enabled
+         * without another validated apply. */
+        mqtt_cfg_lock();
+        s_verified_applied = false;
+        mqtt_cfg_unlock();
+    }
     mqtt_cfg_fail_off();
 }
 
@@ -1127,27 +1351,49 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
     /* Only a fully applied verified configuration may start the transport.
      * The applied latch is owned by mqtt_cfg_apply() (set exclusively after
      * all setters and self-checks succeed, cleared before every apply and
-     * on every failure). */
-    if (!s_verified_applied || !mqtt_cfg_applied_transport_matches())
+     * on every failure).  The verified check and the values the transport
+     * consumes are covered by the module lock (finding 2): apply() cannot
+     * interleave between this check and the transport start, and the poll
+     * loop re-checks under the same lock before accepting success. */
+    mqtt_cfg_lock();
+    if (!s_verified_applied)
+    {
+        mqtt_cfg_unlock();
+        mqtt_app_deinit();
+        mqtt_cfg_fail_off();
+        return MQTT_CFG_ERR_NOT_APPLIED;
+    }
+    if (!mqtt_cfg_applied_transport_matches())
     {
         /* A mutation of any Mongoose value is treated exactly like a failed
          * configuration.  Close the gate so the changed state cannot be
          * retried without another validated apply. */
         s_verified_applied = false;
+        mqtt_cfg_unlock();
         mqtt_app_deinit();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_NOT_APPLIED;
     }
-
     address = mqtt_config_get_string(MQTT_CONFIG_VALUE_ADDRESS);
+    mqtt_cfg_unlock();
 
     /* Always discard a session that may have been started by another
      * consumer.  The current apply generation must receive a new connect
-     * event; merely observing an old connected flag is insufficient. */
+     * event; merely observing an old connected flag is insufficient.  The
+     * teardown runs outside the lock: mqtt_app_deinit() blocks on the
+     * transport thread, whose safety callbacks never take this lock. */
     mqtt_app_deinit();
-    s_connect_failed = false;
-    s_connected_generation = 0u;
-    s_waiting_for_connection = true;
+
+    /* Establish the wait state and generation BEFORE the asynchronous
+     * connect starts (finding 3): a connect or failure event published by
+     * the transport thread after mqtt_app_init() is never lost. */
+    mqtt_cfg_lock();
+    atomic_store_explicit(&s_connect_failed, false, memory_order_relaxed);
+    atomic_store_explicit(&s_connected_generation, 0u, memory_order_relaxed);
+    atomic_store_explicit(&s_waiting_for_connection, true,
+                          memory_order_release);
+    mqtt_cfg_unlock();
+
     mqtt_app_set_safety_callbacks(mqtt_cfg_on_connect,
                                   mqtt_cfg_on_disconnect,
                                   mqtt_cfg_on_connect_failure);
@@ -1155,10 +1401,27 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
 
     for (;;)
     {
-        if (s_connected_generation == s_apply_generation &&
-            mqtt_app_is_connected())
+        uint32_t apply_gen;
+        uint32_t connected_gen;
+        bool connect_failed;
+        bool connected;
+        bool matches;
+
+        mqtt_cfg_lock();
+        apply_gen = atomic_load_explicit(&s_apply_generation,
+                                         memory_order_acquire);
+        connected_gen = atomic_load_explicit(&s_connected_generation,
+                                             memory_order_acquire);
+        connect_failed = atomic_load_explicit(&s_connect_failed,
+                                              memory_order_acquire);
+        connected = connected_gen == apply_gen && mqtt_app_is_connected();
+        matches = mqtt_cfg_applied_transport_matches();
+
+        if (connected && s_verified_applied && matches)
         {
-            s_waiting_for_connection = false;
+            atomic_store_explicit(&s_waiting_for_connection, false,
+                                  memory_order_release);
+            mqtt_cfg_unlock();
             osal_log_info("mqtt_cfg: verified TLS connection established (%s)",
                           address);
             /* Re-enable contract (TASK-110): the lamp fail-off barrier is
@@ -1174,13 +1437,42 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
             }
             return MQTT_CFG_OK;
         }
-        if (s_connect_failed)
+        if (connected && !(s_verified_applied && matches))
         {
+            /* TOCTOU (finding 2): mqtt_config was mutated while the connect
+             * was in flight, so the transport may have consumed unverified
+             * values despite the successful entry check.  Refuse, close the
+             * gate and fail off: the connection either uses the verified
+             * snapshot or is refused with fail-off — never a spurious
+             * success on mutated values. */
+            s_verified_applied = false;
+            atomic_store_explicit(&s_waiting_for_connection, false,
+                                  memory_order_release);
+            atomic_store_explicit(&s_connected_generation, 0u,
+                                  memory_order_release);
+            mqtt_cfg_unlock();
+            mqtt_app_deinit();
+            mqtt_cfg_fail_off();
+            return MQTT_CFG_ERR_NOT_APPLIED;
+        }
+        if (connect_failed)
+        {
+            mqtt_cfg_unlock();
             return MQTT_CFG_ERR_CONNECT;
         }
         if (timeout_ms == 0u || waited >= timeout_ms)
         {
-            break; /* single immediate check */
+            /* single immediate check, or the bounded wait expired */
+            atomic_store_explicit(&s_waiting_for_connection, false,
+                                  memory_order_release);
+            atomic_store_explicit(&s_connected_generation, 0u,
+                                  memory_order_release);
+            mqtt_cfg_unlock();
+            osal_log_error(
+                "mqtt_cfg: verified TLS connection timed out after %u ms",
+                (unsigned)timeout_ms);
+            mqtt_cfg_fail_off();
+            return MQTT_CFG_ERR_CONNECT;
         }
 
         uint32_t step = MQTT_CFG_CONNECT_POLL_MS;
@@ -1188,14 +1480,8 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
         {
             step = timeout_ms - waited;
         }
+        mqtt_cfg_unlock();
         (void)osal_task_delay_ms(step);
         waited += step;
     }
-
-    s_waiting_for_connection = false;
-    s_connected_generation = 0u;
-    osal_log_error("mqtt_cfg: verified TLS connection timed out after %u ms",
-                   (unsigned)timeout_ms);
-    mqtt_cfg_fail_off();
-    return MQTT_CFG_ERR_CONNECT;
 }

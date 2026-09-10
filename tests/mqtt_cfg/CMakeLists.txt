@@ -55,6 +55,7 @@ add_executable(mqtt_cfg_tests
     ${OSAL_IMPL_DIR}/osal_dir_impl.c
     ${OSAL_IMPL_DIR}/osal_mount_impl.c
     ${OSAL_IMPL_DIR}/osal_log_impl.c
+    ${OSAL_IMPL_DIR}/osal_mutex_impl.c
     ${OSAL_IMPL_DIR}/osal_task_impl.c
     ${OSAL_IMPL_DIR}/osal_assert.c
     ${OSAL_COMMON_DIR}/osal_error.c

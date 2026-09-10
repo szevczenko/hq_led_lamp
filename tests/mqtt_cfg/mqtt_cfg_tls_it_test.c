@@ -370,6 +370,55 @@ static void test_invalid_ca_path_rejected(void)
     TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
 }
 
+static void test_generic_save_rejected_post_apply_mutation(void)
+{
+    /* Finding 4 (real platform chain): after a successful verified connect,
+     * mutating mqtt_config to unsafe values and saving through the generic
+     * mqtt_config_save() -> MQTT_CMD_TYPE_APPLY_CONFIG path must be refused
+     * by the verified-owner gate registered by mqtt_cfg.  The transport must
+     * NOT reconnect with the mutated values, the lamp is forced off and the
+     * verified connect gate is closed (only a fresh validated apply can
+     * reopen it). */
+    bool flag = false;
+    uint32_t waited = 0u;
+
+    TEST_ASSERT_TRUE_MESSAGE(provision_ca("ca.crt"), "provision trusted CA");
+    TEST_ASSERT_TRUE_MESSAGE(write_mqtt_doc(TRUSTED_HOSTNAME, "mqtts"),
+                             "write mqtt.json");
+
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load_and_apply());
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_connect(CONNECT_TIMEOUT_MS));
+    TEST_ASSERT_TRUE(mqtt_app_is_connected());
+    TEST_ASSERT_TRUE(mqtt_config_get_bool(&flag,
+                                          MQTT_CONFIG_VALUE_SKIP_VERIFY));
+    TEST_ASSERT_FALSE(flag);
+    (void)lamp_mock_reset();
+
+    /* Mutate to skip-verify + plaintext and save, exactly like the generic
+     * console path (hq_cmd_mqtt) would. */
+    TEST_ASSERT_TRUE(mqtt_config_set_bool(true, MQTT_CONFIG_VALUE_SKIP_VERIFY));
+    TEST_ASSERT_TRUE(mqtt_config_set_string(
+        "mqtt://127.0.0.1:18884", MQTT_CONFIG_VALUE_ADDRESS));
+    TEST_ASSERT_TRUE(mqtt_config_save());
+
+    /* The rejection is decided asynchronously on the Mongoose thread: wait
+     * for the transport to be torn down and the fail-off observer to run. */
+    while (waited < CONNECT_TIMEOUT_MS && mqtt_app_is_connected() &&
+           lamp_mock_force_inactive_calls() == 0u)
+    {
+        (void)osal_task_delay_ms(25u);
+        waited += 25u;
+    }
+
+    TEST_ASSERT_FALSE(mqtt_app_is_connected());
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_release_calls());
+
+    /* The verified gate stays closed: the mutated transport cannot be
+     * started without another validated apply. */
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_NOT_APPLIED, mqtt_cfg_connect(0u));
+}
+
 /* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
@@ -405,6 +454,7 @@ int main(void)
     RUN_TEST(test_hostname_mismatch_fails_verification_and_force_off);
     RUN_TEST(test_plaintext_rejected_before_transport);
     RUN_TEST(test_invalid_ca_path_rejected);
+    RUN_TEST(test_generic_save_rejected_post_apply_mutation);
 
     MongooseProcess_Deinit();
     failures = UNITY_END();

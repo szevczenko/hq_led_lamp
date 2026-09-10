@@ -40,6 +40,7 @@
  *      auth_mode "mtls", and are cleared on downgrade.
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -49,6 +50,7 @@
 #include "osal_error.h"
 #include "osal_file.h"
 #include "osal_mount.h"
+#include "osal_task.h"
 #include "unity.h"
 
 #include "lamp_control_mock.h"
@@ -872,6 +874,204 @@ static void test_invalid_auth_mode_rejected(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* Regression tests (TASK-110 review findings 1-4)                        */
+/* --------------------------------------------------------------------- */
+
+typedef struct {
+    mqtt_cfg_status_t status;
+} mqtt_cfg_connect_ctx_t;
+
+static void *mqtt_cfg_connect_worker(void *arg)
+{
+    mqtt_cfg_connect_ctx_t *ctx = (mqtt_cfg_connect_ctx_t *)arg;
+
+    ctx->status = mqtt_cfg_connect(5000u);
+    return NULL;
+}
+
+static void test_non_terminated_fields_rejected_without_oob(void)
+{
+    /* Finding 1: public validation of a hand-built mqtt_cfg_t must never
+     * run strlen() over a fixed-size field that lacks a NUL terminator.  A
+     * full (non-terminated) array must be rejected with a bounds/policy
+     * error through the same validators, not read out of bounds. */
+    mqtt_cfg_t cfg;
+
+    TEST_ASSERT_TRUE(provision_pem(host_pem_path("ca.crt"), "/cert/ca.crt"));
+    TEST_ASSERT_TRUE(write_doc(DEV_MQTT_V1));
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load(&cfg));
+
+    /* hostname ... */
+    memset(cfg.hostname, 'a', sizeof(cfg.hostname));
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_HOSTNAME, mqtt_cfg_validate(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_HOSTNAME, mqtt_cfg_apply(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+
+    /* client ID ... */
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load(&cfg));
+    memset(cfg.client_id, 'a', sizeof(cfg.client_id));
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_BOUNDS, mqtt_cfg_validate(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_BOUNDS, mqtt_cfg_apply(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+
+    /* CA path ... */
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load(&cfg));
+    memset(cfg.ca_path, 'a', sizeof(cfg.ca_path));
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_CA_PATH, mqtt_cfg_validate(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_CA_PATH, mqtt_cfg_apply(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+
+    /* client cert / key paths ... */
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load(&cfg));
+    memset(cfg.client_cert_path, 'a', sizeof(cfg.client_cert_path));
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_CERT_PATH, mqtt_cfg_validate(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_CERT_PATH, mqtt_cfg_apply(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load(&cfg));
+    memset(cfg.client_key_path, 'a', sizeof(cfg.client_key_path));
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_CERT_PATH, mqtt_cfg_validate(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    (void)lamp_mock_reset();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_CERT_PATH, mqtt_cfg_apply(&cfg));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+}
+
+static void test_connect_refused_when_config_mutated_during_poll(void)
+{
+    /* Finding 2: after the entry match check, a concurrent mutation of the
+     * public mqtt_config values must not be silently used by the in-flight
+     * connect (TOCTOU).  The connect either uses the verified snapshot or is
+     * refused with fail-off; the barrier is never released on mutated
+     * values. */
+    pthread_t thread;
+    mqtt_cfg_connect_ctx_t ctx;
+
+    TEST_ASSERT_TRUE(provision_pem(host_pem_path("ca.crt"), "/cert/ca.crt"));
+    TEST_ASSERT_TRUE(write_doc(DEV_MQTT_V1));
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load_and_apply());
+    (void)lamp_mock_reset();
+
+    /* Start an in-flight connect (the transport will connect while polling)
+     * and mutate the transport address from this thread mid-connect: the
+     * success decision must observe the mutation and refuse. */
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&thread, NULL,
+                                            mqtt_cfg_connect_worker, &ctx));
+    (void)osal_task_delay_ms(50u);
+    TEST_ASSERT_TRUE(mqtt_config_set_string(
+        "mqtts://192.0.2.10:8883", MQTT_CONFIG_VALUE_ADDRESS));
+    mqtt_app_mock_simulate_connect();
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(thread, NULL));
+
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_NOT_APPLIED, (int)ctx.status);
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_release_calls());
+    TEST_ASSERT_FALSE(mqtt_app_mock_is_connected());
+}
+
+static void test_connect_failure_during_poll_fails_off(void)
+{
+    /* Finding 3: a failure event arriving exactly while mqtt_cfg_connect()
+     * is polling is observed immediately (synchronized event flags) —
+     * fail-off, never a spurious timed-out success and never a missed
+     * event. */
+    pthread_t thread;
+    mqtt_cfg_connect_ctx_t ctx;
+    uint32_t started_ms;
+
+    TEST_ASSERT_TRUE(provision_pem(host_pem_path("ca.crt"), "/cert/ca.crt"));
+    TEST_ASSERT_TRUE(write_doc(DEV_MQTT_V1));
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load_and_apply());
+    (void)lamp_mock_reset();
+
+    started_ms = osal_task_get_time_ms();
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&thread, NULL,
+                                            mqtt_cfg_connect_worker, &ctx));
+    (void)osal_task_delay_ms(50u);
+    mqtt_app_mock_simulate_connect_failure(
+        MQTT_CONNECT_FAILURE_REASON_TRANSPORT_ERROR);
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(thread, NULL));
+
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_CONNECT, (int)ctx.status);
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_release_calls());
+    /* The failure event was observed while polling: the connect returned
+     * promptly instead of burning the full 5000 ms timeout. */
+    TEST_ASSERT_TRUE((osal_task_get_time_ms() - started_ms) < 1000u);
+}
+
+static void test_generic_save_accepts_verified_values(void)
+{
+    /* Positive gate check (finding 4): the generic save/apply path is
+     * approved while the transport still matches the verified snapshot, so
+     * a legitimate reconnect is not blocked. */
+    TEST_ASSERT_TRUE(provision_pem(host_pem_path("ca.crt"), "/cert/ca.crt"));
+    TEST_ASSERT_TRUE(write_doc(DEV_MQTT_V1));
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load_and_apply());
+
+    mqtt_app_mock_simulate_connect();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_connect(0u));
+    (void)lamp_mock_reset();
+
+    mqtt_app_mock_simulate_apply_config();
+    TEST_ASSERT_TRUE(mqtt_app_mock_is_connected());
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_release_calls());
+}
+
+static void test_generic_save_path_cannot_bypass_verified_gate(void)
+{
+    /* Finding 4: after a successful verified connect, mutating mqtt_config
+     * and triggering the generic save/apply path must NOT reconnect the
+     * transport with the mutated values.  The verified-owner gate rejects
+     * the candidate, the transport stays disconnected and the lamp is
+     * forced off (fail-off), with the connect gate closed for retries. */
+    unsigned init_before;
+    bool flag = false;
+
+    TEST_ASSERT_TRUE(provision_pem(host_pem_path("ca.crt"), "/cert/ca.crt"));
+    TEST_ASSERT_TRUE(write_doc(DEV_MQTT_V1));
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load_and_apply());
+
+    mqtt_app_mock_simulate_connect();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_connect(0u));
+    init_before = mqtt_app_mock_init_calls();
+    (void)lamp_mock_reset();
+
+    /* Mutate the transport to plaintext/unsafe values and save: the generic
+     * mqtt_config_save() path is exactly how hq_cmd_mqtt would do it. */
+    TEST_ASSERT_TRUE(mqtt_config_set_bool(true, MQTT_CONFIG_VALUE_SKIP_VERIFY));
+    TEST_ASSERT_TRUE(mqtt_config_set_string(
+        "mqtt://192.0.2.10:1883", MQTT_CONFIG_VALUE_ADDRESS));
+    TEST_ASSERT_TRUE(mqtt_config_get_bool(&flag,
+                                          MQTT_CONFIG_VALUE_SKIP_VERIFY));
+    TEST_ASSERT_TRUE(flag);
+    mqtt_app_mock_simulate_apply_config();
+
+    TEST_ASSERT_FALSE(mqtt_app_mock_is_connected());
+    TEST_ASSERT_EQUAL_UINT(init_before, mqtt_app_mock_init_calls());
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_release_calls());
+
+    /* The verified gate is closed: no further connect without a fresh
+     * validated apply. */
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_NOT_APPLIED, mqtt_cfg_connect(0u));
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
 
@@ -910,6 +1110,11 @@ int main(void)
     RUN_TEST(test_load_failure_leaves_output_object_untouched);
     RUN_TEST(test_load_null_argument_forces_fail_off);
     RUN_TEST(test_invalid_auth_mode_rejected);
+    RUN_TEST(test_non_terminated_fields_rejected_without_oob);
+    RUN_TEST(test_connect_refused_when_config_mutated_during_poll);
+    RUN_TEST(test_connect_failure_during_poll_fails_off);
+    RUN_TEST(test_generic_save_accepts_verified_values);
+    RUN_TEST(test_generic_save_path_cannot_bypass_verified_gate);
 
     return UNITY_END();
 }
