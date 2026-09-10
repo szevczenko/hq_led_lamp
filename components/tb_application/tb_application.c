@@ -1,6 +1,7 @@
 /**
  * @file tb_application.c
- * @brief ThingsBoard desired-state synchronization implementation (TASK-112)
+ * @brief ThingsBoard application logic: desired-state synchronization
+ *        (TASK-112) and server-side RPC control (TASK-113)
  *
  * See tb_application.h for the normative contract.  Implementation notes:
  *
@@ -26,13 +27,22 @@
  *     match the current session, and each attempt has a unique number so a
  *     duplicated or late response for an already-consumed attempt is
  *     rejected instead of being applied twice,
+ *   - server-side RPC control (TASK-113): every successful connection also
+ *     (re-)arms tb_rpc_subscribe_server().  The handler validates the four
+ *     documented methods with bounded method/payload lengths and strict
+ *     JSON types/ranges, applies the hardware state BEFORE any success
+ *     response, publishes telemetry only after a successful change and
+ *     returns structured success/error JSON.  RPC never writes shared
+ *     attributes (transient control channel),
  *   - lock discipline: all module state is guarded by one OSAL mutex.
  *     Transport calls (subscribe/request) are always issued with the lock
  *     released, because the platform can invoke the response callback
  *     synchronously on an error path; the callbacks take the lock
  *     themselves, so no re-entrant deadlock can form.  lamp_control never
  *     calls back into this module, so holding the module lock while calling
- *     lamp_control is safe.
+ *     lamp_control is safe.  The RPC handler (transport thread) also holds
+ *     the module lock while applying and responding; tb_rpc_respond only
+ *     publishes and never calls back into this module.
  */
 
 #include "tb_application.h"
@@ -48,6 +58,8 @@
 #include "osal_task.h"
 #include "tb_attributes.h"
 #include "tb_client.h"
+#include "tb_rpc.h"
+#include "tb_telemetry.h"
 
 /* --------------------------------------------------------------------- */
 /* Internal constants                                                     */
@@ -56,6 +68,12 @@
 /** @brief Shared-attribute keys requested as one synchronization operation. */
 #define TB_APPLICATION_KEY_POWER "power"
 #define TB_APPLICATION_KEY_BRIGHTNESS "brightness"
+
+/** @brief Documented server-side RPC method names (TASK-113). */
+#define TB_APPLICATION_RPC_METHOD_SET_POWER "setPower"
+#define TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS "setBrightness"
+#define TB_APPLICATION_RPC_METHOD_SET_STATE "setState"
+#define TB_APPLICATION_RPC_METHOD_GET_STATE "getState"
 
 /* --------------------------------------------------------------------- */
 /* Internal module state                                                  */
@@ -618,6 +636,557 @@ static void tb_app_on_attr_response(tb_request_result_t result,
 
     osal_mutex_give(s_tb.lock);
 }
+/* --------------------------------------------------------------------- */
+/* Server-side RPC control (TASK-113)                                     */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Publish a response to a server RPC request.
+ *
+ * The response is built as a single structured JSON object by the caller;
+ * this helper serializes it and hands it to the platform responder.  The
+ * platform responder only publishes; it never calls back into this module,
+ * so this is safe with the module lock held.
+ */
+static void tb_app_rpc_respond(uint32_t request_id, const cJSON *root)
+{
+    char *json;
+
+    if (root == NULL)
+    {
+        return;
+    }
+    json = cJSON_PrintUnformatted(root);
+    if (json == NULL)
+    {
+        osal_log_error("[tb_app] RPC response build failed (id=%u)",
+                       (unsigned)request_id);
+        return;
+    }
+    if (tb_rpc_respond(s_tb.client, request_id, json) != 0)
+    {
+        osal_log_error("[tb_app] RPC response publish failed (id=%u)",
+                       (unsigned)request_id);
+    }
+    cJSON_free(json);
+}
+
+/**
+ * @brief Build a success response carrying the resulting desired+applied
+ *        state, and publish it.
+ *
+ * Only ever called AFTER lamp_control_apply_state() returned LAMP_OK, so a
+ * `"success":true` response never precedes hardware application.
+ */
+static void tb_app_rpc_respond_success(uint32_t request_id,
+                                       const lamp_state_t *desired,
+                                       const lamp_applied_state_t *applied)
+{
+    cJSON *root;
+    cJSON *desired_obj;
+    cJSON *applied_obj;
+
+    root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        return;
+    }
+
+    cJSON_AddBoolToObject(root, "success", true);
+
+    if (desired != NULL)
+    {
+        desired_obj = cJSON_CreateObject();
+        if (desired_obj != NULL)
+        {
+            cJSON_AddBoolToObject(desired_obj, "power", desired->power);
+            cJSON_AddNumberToObject(desired_obj, "brightness",
+                                    (double)desired->brightness_percent);
+            cJSON_AddItemToObject(root, "desired", desired_obj);
+        }
+    }
+
+    if (applied != NULL)
+    {
+        applied_obj = cJSON_CreateObject();
+        if (applied_obj != NULL)
+        {
+            cJSON_AddBoolToObject(applied_obj, "power", applied->power);
+            cJSON_AddNumberToObject(applied_obj, "brightness",
+                                    (double)applied->brightness_percent);
+            cJSON_AddBoolToObject(applied_obj, "output_active",
+                                  applied->output_active);
+            cJSON_AddItemToObject(root, "applied", applied_obj);
+        }
+    }
+
+    tb_app_rpc_respond(request_id, root);
+    cJSON_Delete(root);
+}
+
+/**
+ * @brief Build and publish a structured error response.
+ *
+ * @p error is one of the documented classes ("unknown method",
+ * "invalid payload", "hardware failure"); @p reason carries the validation
+ * detail for invalid payloads and @p method echoes the offending method
+ * name for unknown methods (bounded before it reaches this point).
+ */
+static void tb_app_rpc_respond_error(uint32_t request_id, const char *error,
+                                     const char *reason, const char *method)
+{
+    cJSON *root;
+
+    root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        return;
+    }
+
+    cJSON_AddBoolToObject(root, "success", false);
+    cJSON_AddStringToObject(root, "error", error);
+    if (reason != NULL)
+    {
+        cJSON_AddStringToObject(root, "reason", reason);
+    }
+    if (method != NULL)
+    {
+        cJSON_AddStringToObject(root, "method", method);
+    }
+
+    tb_app_rpc_respond(request_id, root);
+    cJSON_Delete(root);
+}
+
+/**
+ * @brief Publish `power`/`brightness` telemetry after a successful change.
+ *
+ * Called only on the success path of a set* RPC: telemetry is published
+ * exclusively after a hardware change succeeded, never for invalid
+ * requests, hardware failures or getState.  Best-effort: a publish failure
+ * only logs a warning (the RPC itself already succeeded).
+ */
+static void tb_app_rpc_publish_telemetry(const lamp_state_t *desired)
+{
+    cJSON *root;
+    char *json;
+
+    root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        return;
+    }
+    cJSON_AddBoolToObject(root, "power", desired->power);
+    cJSON_AddNumberToObject(root, "brightness",
+                            (double)desired->brightness_percent);
+
+    json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json == NULL)
+    {
+        return;
+    }
+    if (tb_telemetry_send_json(s_tb.client, json) != 0)
+    {
+        osal_log_warning("[tb_app] RPC change telemetry publish failed");
+    }
+    cJSON_free(json);
+}
+
+/**
+ * @brief Apply a validated RPC desired state and report the outcome.
+ *
+ * The hardware is applied BEFORE any response: a success response is only
+ * published after lamp_control_apply_state() returned LAMP_OK, and the
+ * applied state is only recorded then.  Any apply failure produces a
+ * "hardware failure" error response and leaves the applied state (and the
+ * module's desired state) untouched.
+ *
+ * The lamp control fail-off barrier (latched by a disconnect/rejection
+ * fail-off) is intentionally NOT released here: RPC is transient control
+ * and must never re-enable the output behind the synchronizer's fail-off
+ * — while the barrier is latched the apply is rejected with
+ * #LAMP_ERR_BLOCKED_BY_FAIL_OFF and reported as a hardware failure.
+ */
+static void tb_app_rpc_apply_and_respond(uint32_t request_id,
+                                         const lamp_state_t *desired)
+{
+    lamp_applied_state_t applied;
+
+    memset(&applied, 0, sizeof(applied));
+    if (lamp_control_apply_state(desired, &applied) != LAMP_OK)
+    {
+        osal_log_warning("[tb_app] RPC apply failed; hardware failure "
+                         "response (id=%u)", (unsigned)request_id);
+        tb_app_rpc_respond_error(request_id, "hardware failure", NULL, NULL);
+        return;
+    }
+
+    /* Record the new desired state so getState (and the sync duplicate
+     * detection) stay consistent across the sync and RPC channels. */
+    s_tb.applied = *desired;
+    s_tb.has_applied = true;
+
+    tb_app_rpc_respond_success(request_id, desired, &applied);
+    tb_app_rpc_publish_telemetry(desired);
+}
+
+/**
+ * @brief Snapshot the currently applied hardware state as the unchanged
+ *        base for single-field set methods.
+ *
+ * @return true and a valid @p out on success; false (hardware failure)
+ *         when the lamp control cannot report an applied state.
+ */
+static bool tb_app_rpc_current_state(lamp_state_t *out)
+{
+    lamp_applied_state_t applied;
+
+    if (lamp_control_get_applied_state(&applied) != LAMP_OK)
+    {
+        return false;
+    }
+    out->power = applied.power;
+    out->brightness_percent = applied.brightness_percent;
+    return true;
+}
+
+/** @brief Does the params object contain the named field at all? */
+static bool tb_app_rpc_has_field(const cJSON *params, const char *key)
+{
+    return cJSON_GetObjectItemCaseSensitive(params, key) != NULL;
+}
+
+/**
+ * @brief Parse the required boolean `power` field (exact JSON type).
+ *
+ * The field must be present (checked by the caller) and a JSON boolean;
+ * anything else is a wrong type and leaves @p out untouched.
+ */
+static bool tb_app_rpc_parse_power(const cJSON *params, bool *out)
+{
+    const cJSON *item =
+        cJSON_GetObjectItemCaseSensitive(params, "power");
+
+    if (!cJSON_IsBool(item))
+    {
+        return false;
+    }
+    *out = cJSON_IsTrue(item);
+    return true;
+}
+
+/**
+ * @brief Is the required `brightness` field present and a JSON number?
+ *
+ * Separates the "wrong type" rejection from the range rejection so the RPC
+ * error response can carry the precise reason.
+ */
+static bool tb_app_rpc_brightness_type_ok(const cJSON *params)
+{
+    return cJSON_IsNumber(
+        cJSON_GetObjectItemCaseSensitive(params, "brightness"));
+}
+
+/**
+ * @brief Parse the required `brightness` field (exact type + range).
+ *
+ * The field must be present (checked by the caller) and a JSON number
+ * (checked via tb_app_rpc_brightness_type_ok()); this function then
+ * enforces the value contract: an integer (fractional values are rejected,
+ * never truncated) in the closed interval 0..100 (never clamped).
+ */
+static bool tb_app_rpc_parse_brightness(const cJSON *params, uint8_t *out)
+{
+    const cJSON *item =
+        cJSON_GetObjectItemCaseSensitive(params, "brightness");
+
+    if (!cJSON_IsNumber(item))
+    {
+        return false;
+    }
+    if ((item->valueint < 0) || (item->valueint > (int)LAMP_BRIGHTNESS_MAX))
+    {
+        return false;
+    }
+    if ((double)item->valueint != item->valuedouble)
+    {
+        return false;
+    }
+    *out = (uint8_t)item->valueint;
+    return true;
+}
+
+/** @brief `setPower` handler: requires a boolean `power`. */
+static void tb_app_rpc_handle_set_power(uint32_t request_id,
+                                        const cJSON *params)
+{
+    lamp_state_t desired;
+    bool power;
+
+    if (!tb_app_rpc_has_field(params, "power"))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "missing power", NULL);
+        return;
+    }
+    if (!tb_app_rpc_parse_power(params, &power))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "wrong type", NULL);
+        return;
+    }
+    if (!tb_app_rpc_current_state(&desired))
+    {
+        tb_app_rpc_respond_error(request_id, "hardware failure", NULL, NULL);
+        return;
+    }
+    desired.power = power;
+    tb_app_rpc_apply_and_respond(request_id, &desired);
+}
+
+/** @brief `setBrightness` handler: requires an integer brightness 0..100. */
+static void tb_app_rpc_handle_set_brightness(uint32_t request_id,
+                                             const cJSON *params)
+{
+    lamp_state_t desired;
+    uint8_t brightness;
+
+    if (!tb_app_rpc_has_field(params, "brightness"))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "missing brightness", NULL);
+        return;
+    }
+    if (!tb_app_rpc_brightness_type_ok(params))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "wrong type", NULL);
+        return;
+    }
+    if (!tb_app_rpc_parse_brightness(params, &brightness))
+    {
+        /* A JSON number outside 0..100 or a fractional percentage: the
+         * value contract is violated (never wrapped, clamped or
+         * truncated). */
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "out of range", NULL);
+        return;
+    }
+    if (!tb_app_rpc_current_state(&desired))
+    {
+        tb_app_rpc_respond_error(request_id, "hardware failure", NULL, NULL);
+        return;
+    }
+    desired.brightness_percent = brightness;
+    tb_app_rpc_apply_and_respond(request_id, &desired);
+}
+
+/** @brief `setState` handler: requires both boolean `power` and 0..100
+ *         integer `brightness`. */
+static void tb_app_rpc_handle_set_state(uint32_t request_id,
+                                        const cJSON *params)
+{
+    lamp_state_t desired;
+    bool power;
+    uint8_t brightness;
+
+    if (!tb_app_rpc_has_field(params, "power"))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "missing power", NULL);
+        return;
+    }
+    if (!tb_app_rpc_has_field(params, "brightness"))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "missing brightness", NULL);
+        return;
+    }
+    if (!tb_app_rpc_parse_power(params, &power) ||
+        !tb_app_rpc_brightness_type_ok(params))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "wrong type", NULL);
+        return;
+    }
+    if (!tb_app_rpc_parse_brightness(params, &brightness))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "out of range", NULL);
+        return;
+    }
+
+    desired.power = power;
+    desired.brightness_percent = brightness;
+    tb_app_rpc_apply_and_respond(request_id, &desired);
+}
+
+/**
+ * @brief `getState` handler: returns the desired and applied state.
+ *
+ * Reports the module's last applied complete valid desired state (from
+ * synchronization or a previous successful RPC set) and the lamp's applied
+ * hardware state.  The params object is accepted (it must be a JSON object,
+ * enforced by the dispatcher) and its contents are ignored: getState takes
+ * no arguments.  Reading state never changes the hardware, so no telemetry
+ * is published.
+ */
+static void tb_app_rpc_handle_get_state(uint32_t request_id,
+                                        const cJSON *params)
+{
+    lamp_applied_state_t applied;
+
+    (void)params;
+
+    memset(&applied, 0, sizeof(applied));
+    if (lamp_control_get_applied_state(&applied) != LAMP_OK)
+    {
+        tb_app_rpc_respond_error(request_id, "hardware failure", NULL, NULL);
+        return;
+    }
+
+    tb_app_rpc_respond_success(request_id,
+                               s_tb.has_applied ? &s_tb.applied : NULL,
+                               &applied);
+}
+
+/**
+ * @brief Server RPC callback (from tb_rpc_subscribe_server, transport
+ *        thread).
+ *
+ * The complete validation pipeline for the four documented methods:
+ *   - requests that arrive while the module/transport is not connected or
+ *     after deinit are dropped (nothing is applied or reported),
+ *   - the method name and the params payload are length-bounded BEFORE any
+ *     parsing or comparison,
+ *   - an empty/missing method or an oversized method is an invalid payload,
+ *   - any method other than the four documented ones is an unknown method
+ *     (its bounded name is echoed in the error response),
+ *   - params must parse as a JSON object; per-method handlers then enforce
+ *     the required fields, exact JSON types and the brightness range,
+ *   - a validated set applies the hardware BEFORE any success response and
+ *     publishes telemetry only on success; getState reads state.
+ */
+static void tb_app_on_server_rpc(const char *method, const char *params_json,
+                                 uint32_t request_id, void *user_data)
+{
+    const char *method_name = (method != NULL) ? method : "";
+    size_t method_len;
+    cJSON *params = NULL;
+
+    (void)user_data;
+
+    osal_mutex_take(s_tb.lock);
+    if (!s_tb.initialized || !tb_app_is_connected())
+    {
+        /* Stale request after disconnect/teardown: dropped, output and
+         * applied state unchanged. */
+        osal_log_warning("[tb_app] dropped RPC request while disconnected");
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+
+    /* Bounded method: reject before any parsing or comparison. */
+    method_len = strlen(method_name);
+    if (method_len == 0u)
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "missing method", NULL);
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+    if (method_len > TB_APPLICATION_RPC_METHOD_MAX_LEN)
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "method too long", NULL);
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+
+    /* Bounded payload: reject before parsing the params object. */
+    if ((params_json != NULL) &&
+        (strlen(params_json) > TB_APPLICATION_RPC_PARAMS_MAX_LEN))
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "payload too long", NULL);
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+
+    if ((strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_POWER) != 0) &&
+        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS) != 0) &&
+        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_STATE) != 0) &&
+        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_GET_STATE) != 0))
+    {
+        tb_app_rpc_respond_error(request_id, "unknown method", NULL,
+                                 method_name);
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+
+    params = cJSON_Parse((params_json != NULL) ? params_json : "{}");
+    if (params == NULL)
+    {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "malformed json", NULL);
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+    if (!cJSON_IsObject(params))
+    {
+        cJSON_Delete(params);
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "wrong type", NULL);
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+
+    if (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_POWER) == 0)
+    {
+        tb_app_rpc_handle_set_power(request_id, params);
+    }
+    else if (strcmp(method_name,
+                    TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS) == 0)
+    {
+        tb_app_rpc_handle_set_brightness(request_id, params);
+    }
+    else if (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_STATE) == 0)
+    {
+        tb_app_rpc_handle_set_state(request_id, params);
+    }
+    else
+    {
+        tb_app_rpc_handle_get_state(request_id, params);
+    }
+
+    cJSON_Delete(params);
+    osal_mutex_give(s_tb.lock);
+}
+
+/**
+ * @brief (Re-)arm the server-side RPC control subscription.
+ *
+ * Called after every successful connection with the module lock released.
+ * The platform tb_rpc subscription is idempotent (one server callback
+ * total), so reconnecting simply keeps the armed callback; a transport
+ * that lost its subscriptions gets them re-registered here.
+ */
+static void tb_app_subscribe_rpc(void)
+{
+    int rc;
+
+    if (!s_tb.initialized || (s_tb.client == NULL))
+    {
+        return;
+    }
+
+    rc = tb_rpc_subscribe_server(s_tb.client, tb_app_on_server_rpc, NULL);
+    if (rc != 0)
+    {
+        osal_log_warning("[tb_app] server RPC subscribe failed: %d", rc);
+    }
+}
 
 /* --------------------------------------------------------------------- */
 /* Public lifecycle                                                       */
@@ -749,6 +1318,11 @@ void tb_application_on_connected(tb_client_t *client)
     osal_mutex_give(s_tb.lock);
 
     tb_app_run_transport();
+
+    /* Server-side RPC control (TASK-113): transient service/test control
+     * over the same lamp.  The platform subscription is idempotent, so
+     * reconnecting simply (re-)arms the single server-RPC callback. */
+    tb_app_subscribe_rpc();
 }
 
 void tb_application_on_disconnected(tb_client_t *client)

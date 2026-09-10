@@ -1,12 +1,13 @@
 /**
  * @file tb_application_test.c
- * @brief Host mock tests for the ThingsBoard desired-state synchronizer
- *        (TASK-112)
+ * @brief Host mock tests for the ThingsBoard application logic: desired-
+ *        state synchronizer (TASK-112) and server-side RPC control
+ *        (TASK-113)
  *
  * Runs the production components/tb_application code against the REAL
- * platform ThingsBoard client/attributes sources (tb_client.c,
- * tb_attributes.c, ...) and the platform's own mqtt_app test double
- * (mqtt_app_mock), exactly like the platform's tb_tests, plus a
+ * platform ThingsBoard client/attributes/RPC sources (tb_client.c,
+ * tb_attributes.c, tb_rpc.c, ...) and the platform's own mqtt_app test
+ * double (mqtt_app_mock), exactly like the platform's tb_tests, plus a
  * lamp-control double (lamp_control_mock.h).
  *
  * Transport simulation
@@ -22,6 +23,10 @@
  *     runs synchronously on the test thread.
  *   - mqtt_app_mock_deliver_message("v1/devices/me/attributes") delivers
  *     shared-attribute updates through tb_attributes_subscribe.
+ *   - mqtt_app_mock_deliver_message("v1/devices/me/rpc/request/<id>")
+ *     delivers server RPC requests through the real tb_rpc machinery; the
+ *     RPC handler runs synchronously and publishes the response to
+ *     "v1/devices/me/rpc/response/<id>", which the mock records.
  *   - mqtt_app_mock_simulate_remote_disconnect() / _simulate_connect()
  *     drive the disconnect/connect glue.
  *
@@ -46,6 +51,21 @@
  *     fresh session and ThingsBoard stays authoritative after reconnect,
  *   - bounded retry budget exhaustion parks the module (output off) until
  *     the next reconnect resets the budget.
+ *
+ * Coverage per the TASK-113 definition of done (server-side RPC control):
+ *   - valid setPower / setBrightness / setState and getState calls apply in
+ *     order (hardware first, then success response, then telemetry) and
+ *     return the resulting desired+applied state,
+ *   - malformed requests (invalid JSON), missing required fields, wrong
+ *     JSON types, out-of-range/fractional brightness, oversized method and
+ *     payload bounds, and unknown methods are rejected with structured
+ *     error JSON,
+ *   - invalid RPC never modifies the applied state and never publishes
+ *     telemetry,
+ *   - a hardware failure (lamp apply error) produces a "hardware failure"
+ *     error response — never a success response — and leaves the applied
+ *     state unchanged,
+ *   - getState reports the desired and applied state.
  */
 
 #include <stdio.h>
@@ -246,6 +266,182 @@ static int request_publish_count(void)
         }
     }
     return count;
+}
+
+/* --------------------------------------------------------------------- */
+/* Server-side RPC helpers (TASK-113)                                     */
+/* --------------------------------------------------------------------- */
+
+#define RPC_REQUEST_TOPIC_PREFIX  "v1/devices/me/rpc/request/"
+#define RPC_RESPONSE_TOPIC_PREFIX "v1/devices/me/rpc/response/"
+#define TELEMETRY_TOPIC           "v1/devices/me/telemetry"
+
+/** @brief Deliver a server RPC request for @p request_id. */
+static void deliver_rpc(uint32_t request_id, const char *method,
+                        const char *params)
+{
+    char topic[128];
+    char payload[TB_APPLICATION_MAX_PAYLOAD_BYTES + 128];
+
+    snprintf(topic, sizeof(topic), "%s%u", RPC_REQUEST_TOPIC_PREFIX,
+             (unsigned)request_id);
+    snprintf(payload, sizeof(payload), "{\"method\":\"%s\",\"params\":%s}",
+             method, params);
+    mqtt_app_mock_deliver_message(topic, payload, strlen(payload));
+}
+
+/** @brief Deliver a raw payload on the server-RPC request topic (for
+ *         malformed overall JSON, which the platform tb_rpc layer drops). */
+static void deliver_rpc_raw(uint32_t request_id, const char *payload)
+{
+    char topic[128];
+
+    snprintf(topic, sizeof(topic), "%s%u", RPC_REQUEST_TOPIC_PREFIX,
+             (unsigned)request_id);
+    mqtt_app_mock_deliver_message(topic, payload, strlen(payload));
+}
+
+/** @brief Number of RPC response publishes to @p request_id (0 or 1). */
+static int rpc_response_count(uint32_t request_id)
+{
+    char prefix[64];
+    int count = 0;
+
+    snprintf(prefix, sizeof(prefix), "%s%u", RPC_RESPONSE_TOPIC_PREFIX,
+             (unsigned)request_id);
+    for (int i = 0; i < mock_publish_count; i++)
+    {
+        if (strcmp(mock_publishes[i].topic, prefix) == 0)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+/**
+ * @brief Return the RPC response message for @p request_id (latest), or
+ *        NULL when none was published.
+ */
+static const char *rpc_response_message(uint32_t request_id)
+{
+    char prefix[64];
+
+    snprintf(prefix, sizeof(prefix), "%s%u", RPC_RESPONSE_TOPIC_PREFIX,
+             (unsigned)request_id);
+    for (int i = mock_publish_count - 1; i >= 0; i--)
+    {
+        if (strcmp(mock_publishes[i].topic, prefix) == 0)
+        {
+            return mock_publishes[i].message;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Parse the RPC response for @p request_id and assert one exists.
+ *
+ * The caller owns the returned cJSON object and must cJSON_Delete() it.
+ */
+static cJSON *rpc_parse_response(uint32_t request_id)
+{
+    const char *msg = rpc_response_message(request_id);
+
+    TEST_ASSERT_NOT_NULL(msg);
+    return cJSON_Parse(msg);
+}
+
+/** @brief Number of telemetry publishes recorded so far. */
+static int telemetry_publish_count(void)
+{
+    int count = 0;
+
+    for (int i = 0; i < mock_publish_count; i++)
+    {
+        if (strcmp(mock_publishes[i].topic, TELEMETRY_TOPIC) == 0)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+/** @brief Latest telemetry JSON payload, or NULL when none was published. */
+static const char *latest_telemetry_message(void)
+{
+    for (int i = mock_publish_count - 1; i >= 0; i--)
+    {
+        if (strcmp(mock_publishes[i].topic, TELEMETRY_TOPIC) == 0)
+        {
+            return mock_publishes[i].message;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Assert the RPC response to @p request_id is a generic structured
+ *        success and return a parsed copy (caller cJSON_Delete()s it).
+ */
+static cJSON *rpc_assert_success(uint32_t request_id)
+{
+    cJSON *response = rpc_parse_response(request_id);
+
+    TEST_ASSERT_NOT_NULL(response);
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(response, "success")));
+    TEST_ASSERT_NULL(cJSON_GetObjectItemCaseSensitive(response, "error"));
+    return response;
+}
+
+/**
+ * @brief Assert the RPC response to @p request_id is a structured error
+ *        with the documented @p error class and optional @p reason.
+ */
+static void rpc_assert_error(uint32_t request_id, const char *error,
+                             const char *reason)
+{
+    cJSON *response = rpc_parse_response(request_id);
+    cJSON *error_item;
+    cJSON *reason_item;
+
+    TEST_ASSERT_NOT_NULL(response);
+    TEST_ASSERT_TRUE(cJSON_IsFalse(
+        cJSON_GetObjectItemCaseSensitive(response, "success")));
+    error_item = cJSON_GetObjectItemCaseSensitive(response, "error");
+    TEST_ASSERT_TRUE(cJSON_IsString(error_item));
+    TEST_ASSERT_EQUAL_STRING(error, error_item->valuestring);
+    reason_item = cJSON_GetObjectItemCaseSensitive(response, "reason");
+    if (reason == NULL)
+    {
+        TEST_ASSERT_NULL(reason_item);
+    }
+    else
+    {
+        TEST_ASSERT_TRUE(cJSON_IsString(reason_item));
+        TEST_ASSERT_EQUAL_STRING(reason, reason_item->valuestring);
+    }
+    cJSON_Delete(response);
+}
+
+/**
+ * @brief Synchronize a complete valid state and enter the SYNCED state.
+ *
+ * Shared helper for the RPC tests: after this the module has applied
+ * @p power/@p brightness exactly once.
+ */
+static void rpc_sync_state(bool power, uint8_t brightness)
+{
+    char payload[64];
+
+    app_init(10000u);
+    connect_client();
+    snprintf(payload, sizeof(payload),
+             "{\"shared\":{\"power\":%s,\"brightness\":%u}}",
+             power ? "true" : "false", (unsigned)brightness);
+    deliver_response(last_request_id(), payload);
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
 }
 
 void setUp(void)
@@ -825,6 +1021,410 @@ static void test_lifecycle_and_state_queries(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* Server-side RPC control (TASK-113)                                     */
+/* --------------------------------------------------------------------- */
+
+/**
+ * Valid setPower: hardware is applied BEFORE the success response; the
+ * success response carries the resulting desired+applied state and telemetry
+ * is published only after the successful change.  Reading state and errors
+ * never publish telemetry.
+ */
+static void test_rpc_set_power_valid(void)
+{
+    cJSON *response;
+    cJSON *desired;
+    cJSON *applied;
+    cJSON *telemetry;
+    int telemetry_before;
+
+    rpc_sync_state(true, 80u);
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+
+    telemetry_before = telemetry_publish_count();
+    deliver_rpc(1u, "setPower", "{\"power\":false}");
+
+    /* Hardware applied first: apply count grew and the reported hardware
+     * state already reflects the change. */
+    TEST_ASSERT_EQUAL_UINT(2u, lamp_mock_apply_calls());
+    TEST_ASSERT_FALSE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(1u));
+    TEST_ASSERT_EQUAL_INT(telemetry_before + 1, telemetry_publish_count());
+
+    response = rpc_assert_success(1u);
+    desired = cJSON_GetObjectItemCaseSensitive(response, "desired");
+    TEST_ASSERT_TRUE(cJSON_IsObject(desired));
+    TEST_ASSERT_FALSE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(desired, "power")));
+    TEST_ASSERT_EQUAL_INT(80, cJSON_GetObjectItemCaseSensitive(
+                                  desired, "brightness")->valueint);
+    applied = cJSON_GetObjectItemCaseSensitive(response, "applied");
+    TEST_ASSERT_TRUE(cJSON_IsObject(applied));
+    TEST_ASSERT_FALSE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(applied, "power")));
+    TEST_ASSERT_EQUAL_INT(80, cJSON_GetObjectItemCaseSensitive(
+                                  applied, "brightness")->valueint);
+    TEST_ASSERT_TRUE(cJSON_IsFalse(
+        cJSON_GetObjectItemCaseSensitive(applied, "output_active")));
+    cJSON_Delete(response);
+
+    /* The telemetry publish reflects exactly the successful change. */
+    TEST_ASSERT_NOT_NULL(latest_telemetry_message());
+    telemetry = cJSON_Parse(latest_telemetry_message());
+    TEST_ASSERT_NOT_NULL(telemetry);
+    TEST_ASSERT_FALSE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(telemetry, "power")));
+    TEST_ASSERT_EQUAL_INT(80, cJSON_GetObjectItemCaseSensitive(
+                                  telemetry, "brightness")->valueint);
+    cJSON_Delete(telemetry);
+}
+
+/**
+ * Valid setBrightness: a single-field change keeps the current power and
+ * applies the new brightness; success response + telemetry follow the change.
+ */
+static void test_rpc_set_brightness_valid(void)
+{
+    cJSON *response;
+    cJSON *desired;
+    cJSON *applied;
+
+    rpc_sync_state(true, 20u);
+
+    deliver_rpc(2u, "setBrightness", "{\"brightness\":42}");
+
+    TEST_ASSERT_EQUAL_UINT(2u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(42u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(2u));
+    TEST_ASSERT_EQUAL_INT(1, telemetry_publish_count());
+
+    response = rpc_assert_success(2u);
+    desired = cJSON_GetObjectItemCaseSensitive(response, "desired");
+    TEST_ASSERT_TRUE(cJSON_IsObject(desired));
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(desired, "power")));
+    TEST_ASSERT_EQUAL_INT(42, cJSON_GetObjectItemCaseSensitive(
+                                  desired, "brightness")->valueint);
+    applied = cJSON_GetObjectItemCaseSensitive(response, "applied");
+    TEST_ASSERT_TRUE(cJSON_IsObject(applied));
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(applied, "power")));
+    TEST_ASSERT_EQUAL_INT(42, cJSON_GetObjectItemCaseSensitive(
+                                  applied, "brightness")->valueint);
+    cJSON_Delete(response);
+}
+
+/**
+ * Valid setState: both fields are required and applied together; success
+ * response + telemetry follow the successful change.
+ */
+static void test_rpc_set_state_valid(void)
+{
+    cJSON *response;
+    cJSON *desired;
+    cJSON *applied;
+
+    rpc_sync_state(true, 60u);
+
+    /* power=false + brightness=0 is a complete, valid, applied state. */
+    deliver_rpc(3u, "setState", "{\"power\":false,\"brightness\":0}");
+
+    TEST_ASSERT_EQUAL_UINT(2u, lamp_mock_apply_calls());
+    TEST_ASSERT_FALSE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(3u));
+    TEST_ASSERT_EQUAL_INT(1, telemetry_publish_count());
+
+    response = rpc_assert_success(3u);
+    desired = cJSON_GetObjectItemCaseSensitive(response, "desired");
+    TEST_ASSERT_FALSE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(desired, "power")));
+    TEST_ASSERT_EQUAL_INT(0, cJSON_GetObjectItemCaseSensitive(
+                                  desired, "brightness")->valueint);
+    applied = cJSON_GetObjectItemCaseSensitive(response, "applied");
+    TEST_ASSERT_FALSE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(applied, "power")));
+    TEST_ASSERT_EQUAL_INT(0, cJSON_GetObjectItemCaseSensitive(
+                                  applied, "brightness")->valueint);
+    cJSON_Delete(response);
+}
+
+/**
+ * Valid getState: returns the desired+applied state; reading never applies
+ * the hardware and never publishes telemetry.
+ */
+static void test_rpc_get_state_valid(void)
+{
+    cJSON *response;
+    cJSON *desired;
+    cJSON *applied;
+
+    rpc_sync_state(true, 55u);
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+
+    deliver_rpc(4u, "getState", "{}");
+
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(4u));
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+
+    response = rpc_assert_success(4u);
+    desired = cJSON_GetObjectItemCaseSensitive(response, "desired");
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(desired, "power")));
+    TEST_ASSERT_EQUAL_INT(55, cJSON_GetObjectItemCaseSensitive(
+                                  desired, "brightness")->valueint);
+    applied = cJSON_GetObjectItemCaseSensitive(response, "applied");
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(applied, "power")));
+    TEST_ASSERT_EQUAL_INT(55, cJSON_GetObjectItemCaseSensitive(
+                                  applied, "brightness")->valueint);
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(applied, "output_active")));
+    cJSON_Delete(response);
+}
+
+/**
+ * A fully malformed request payload never reaches the module: the platform
+ * tb_rpc layer drops it before parsing, so no response is published and an
+ * invalid RPC can never modify the applied state.
+ */
+static void test_rpc_malformed_payload_dropped(void)
+{
+    rpc_sync_state(true, 80u);
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+
+    deliver_rpc_raw(5u, "{not valid json");
+
+    TEST_ASSERT_EQUAL_INT(0, rpc_response_count(5u));
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+}
+
+/**
+ * Missing required fields are rejected with structured invalid-payload errors;
+ * no apply, no telemetry and the applied state stays untouched.
+ */
+static void test_rpc_missing_field_rejected(void)
+{
+    rpc_sync_state(true, 77u);
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+
+    deliver_rpc(6u, "setPower", "{}");
+    rpc_assert_error(6u, "invalid payload", "missing power");
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(6u));
+
+    deliver_rpc(7u, "setBrightness", "{}");
+    rpc_assert_error(7u, "invalid payload", "missing brightness");
+
+    /* setState requires BOTH fields; a partial object is invalid. */
+    deliver_rpc(8u, "setState", "{\"power\":true}");
+    rpc_assert_error(8u, "invalid payload", "missing brightness");
+
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(77u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+}
+
+/**
+ * Wrong JSON types (power must be a boolean, brightness must be a
+ * number, params must be an object) are rejected with structured
+ * invalid-payload errors; no apply, no telemetry.
+
+ * (power=1 parses as a cJSON number, never a boolean.)
+ */
+static void test_rpc_wrong_type_rejected(void)
+{
+    rpc_sync_state(true, 80u);
+
+    deliver_rpc(9u, "setPower", "{\"power\":\"true\"}");
+    rpc_assert_error(9u, "invalid payload", "wrong type");
+
+    deliver_rpc(10u, "setBrightness", "{\"brightness\":\"50\"}");
+    rpc_assert_error(10u, "invalid payload", "wrong type");
+
+    deliver_rpc(11u, "setState", "{\"power\":1,\"brightness\":50}");
+    rpc_assert_error(11u, "invalid payload", "wrong type");
+
+    /* The params payload must be a JSON object. */
+    deliver_rpc(12u, "setPower", "\"power\"");
+    rpc_assert_error(12u, "invalid payload", "wrong type");
+
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+}
+
+/**
+ * Brightness outside the closed interval 0..100 (and fractional values,
+ * which are never truncated to an integer) are rejected with structured
+ * invalid-payload errors; no apply, no telemetry.
+
+ * A rejected RPC never modifies the applied state.
+ */
+static void test_rpc_brightness_out_of_range_rejected(void)
+{
+    rpc_sync_state(true, 80u);
+
+    deliver_rpc(13u, "setBrightness", "{\"brightness\":101}");
+    rpc_assert_error(13u, "invalid payload", "out of range");
+
+    deliver_rpc(14u, "setBrightness", "{\"brightness\":-1}");
+    rpc_assert_error(14u, "invalid payload", "out of range");
+
+    /* Fractional brightness: never wrapped or truncated. */
+    deliver_rpc(15u, "setBrightness", "{\"brightness\":50.5}");
+    rpc_assert_error(15u, "invalid payload", "out of range");
+
+    deliver_rpc(16u, "setState", "{\"power\":true,\"brightness\":200}");
+    rpc_assert_error(16u, "invalid payload", "out of range");
+
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+}
+
+/**
+ * An undocumented method name is rejected as unknown method with the
+ * bounded method name echoed in the structured error response; no apply,
+ * no telemetry.
+
+ */
+static void test_rpc_unknown_method_rejected(void)
+{
+    cJSON *response;
+    cJSON *method;
+
+    rpc_sync_state(true, 80u);
+
+    deliver_rpc(17u, "setColor", "{\"x\":1}");
+
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(17u));
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+
+    response = rpc_parse_response(17u);
+    TEST_ASSERT_NOT_NULL(response);
+    TEST_ASSERT_TRUE(cJSON_IsFalse(
+        cJSON_GetObjectItemCaseSensitive(response, "success")));
+    TEST_ASSERT_TRUE(cJSON_IsString(
+        cJSON_GetObjectItemCaseSensitive(response, "error")));
+    TEST_ASSERT_EQUAL_STRING("unknown method",
+                             cJSON_GetObjectItemCaseSensitive(response, "error")->valuestring);
+    method = cJSON_GetObjectItemCaseSensitive(response, "method");
+    TEST_ASSERT_TRUE(cJSON_IsString(method));
+    TEST_ASSERT_EQUAL_STRING("setColor", method->valuestring);
+    cJSON_Delete(response);
+}
+
+/**
+ * Method name and params payload are length-bounded BEFORE any parsing or
+ * comparison: an oversized method or payload is rejected as invalid
+ * payload and never touches the hardware or telemetry.
+
+ */
+static void test_rpc_method_and_payload_bounds_rejected(void)
+{
+    char long_method[TB_APPLICATION_RPC_METHOD_MAX_LEN + 2u];
+    char padded[TB_APPLICATION_RPC_PARAMS_MAX_LEN + 64u];
+    char big_params[sizeof(padded) + 64u];
+
+    rpc_sync_state(true, 80u);
+
+    /* Oversized method name: rejected before comparison. */
+    memset(long_method, 'm', sizeof(long_method) - 1u);
+    long_method[sizeof(long_method) - 1u] = '\0';
+    TEST_ASSERT_TRUE(strlen(long_method) > TB_APPLICATION_RPC_METHOD_MAX_LEN);
+    deliver_rpc(18u, long_method, "{}");
+    rpc_assert_error(18u, "invalid payload", "method too long");
+
+    /* Oversized params payload: rejected before parsing. */
+    memset(padded, 'p', sizeof(padded) - 1u);
+    padded[sizeof(padded) - 1u] = '\0';
+    snprintf(big_params, sizeof(big_params), "{\"pad\":\"%s\"}", padded);
+    TEST_ASSERT_TRUE(strlen(big_params) > TB_APPLICATION_RPC_PARAMS_MAX_LEN);
+    deliver_rpc(19u, "setState", big_params);
+    rpc_assert_error(19u, "invalid payload", "payload too long");
+
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+}
+
+/**
+ * A hardware failure (lamp apply error) never produces a success
+ * response: the RPC returns a structured "hardware failure" error, publishes
+ * no telemetry and leaves both the hardware-applied state and the module's
+ * desired state unchanged.  The success response path is only reachable
+ * AFTER lamp_control_apply_state() returned #LAMP_OK.
+
+ */
+static void test_rpc_hardware_failure_rejected(void)
+{
+    bool has_state = false;
+    tb_application_desired_state_t module_state;
+
+    rpc_sync_state(true, 80u);
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+
+    /* Inject a lamp apply failure: never a success response. */
+    lamp_mock_set_apply_result(LAMP_ERR_INTERNAL);
+    deliver_rpc(20u, "setPower", "{\"power\":false}");
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(20u));
+    TEST_ASSERT_EQUAL_UINT(2u, lamp_mock_apply_calls());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    rpc_assert_error(20u, "hardware failure", NULL);
+
+    /* Hardware applied state unchanged (sync state preserved). */
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+    TEST_ASSERT_EQUAL(TB_APPLICATION_OK,
+                      tb_application_get_desired_state(s_client, &has_state,
+                                                       &module_state));
+    TEST_ASSERT_TRUE(has_state);
+    TEST_ASSERT_TRUE(module_state.power);
+    TEST_ASSERT_EQUAL_UINT(80u, module_state.brightness_percent);
+
+    /* A second method class fails the same way. */
+    deliver_rpc(21u, "setBrightness", "{\"brightness\":0}");
+    TEST_ASSERT_EQUAL_INT(1, rpc_response_count(21u));
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    rpc_assert_error(21u, "hardware failure", NULL);
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+}
+
+/**
+ * Requests arriving while the transport is disconnected are dropped:
+ * nothing is applied or reported and the applied state stays untouched. (The
+ * return structure only applies to live transport sessions.)
+ */
+static void test_rpc_disconnected_dropped(void)
+{
+    unsigned apply_before;
+
+    rpc_sync_state(true, 80u);
+    mqtt_app_mock_simulate_remote_disconnect();
+    TEST_ASSERT_FALSE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() >= 1u);
+
+    apply_before = lamp_mock_apply_calls();
+    deliver_rpc(22u, "setPower", "{\"power\":false}");
+    TEST_ASSERT_EQUAL_INT(0, rpc_response_count(22u));
+    TEST_ASSERT_EQUAL_UINT(apply_before, lamp_mock_apply_calls());
+    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
 
@@ -848,5 +1448,17 @@ int main(void)
     RUN_TEST(test_invalid_update_fails_off);
     RUN_TEST(test_retry_budget_exhaustion_then_reconnect);
     RUN_TEST(test_lifecycle_and_state_queries);
+    RUN_TEST(test_rpc_set_power_valid);
+    RUN_TEST(test_rpc_set_brightness_valid);
+    RUN_TEST(test_rpc_set_state_valid);
+    RUN_TEST(test_rpc_get_state_valid);
+    RUN_TEST(test_rpc_malformed_payload_dropped);
+    RUN_TEST(test_rpc_missing_field_rejected);
+    RUN_TEST(test_rpc_wrong_type_rejected);
+    RUN_TEST(test_rpc_brightness_out_of_range_rejected);
+    RUN_TEST(test_rpc_unknown_method_rejected);
+    RUN_TEST(test_rpc_method_and_payload_bounds_rejected);
+    RUN_TEST(test_rpc_hardware_failure_rejected);
+    RUN_TEST(test_rpc_disconnected_dropped);
     return UNITY_END();
 }

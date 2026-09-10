@@ -1,17 +1,23 @@
 /**
  * @file tb_application.h
- * @brief ThingsBoard desired-state synchronization application logic (TASK-112)
+ * @brief ThingsBoard application logic: desired-state synchronization
+ *        (TASK-112) and server-side RPC control (TASK-113)
  *
- * Normative public API of the product-owned ThingsBoard desired-state
- * synchronizer.  Shared attributes `power` and `brightness` are
- * authoritative; this module turns a fresh MQTT/TLS connection into a
- * complete, validated, session-consistent desired state applied to the lamp.
+ * Normative public API of the product-owned ThingsBoard application
+ * component.  Shared attributes `power` and `brightness` are authoritative
+ * for the lamp's desired state; this module turns a fresh MQTT/TLS
+ * connection into a complete, validated, session-consistent desired state
+ * applied to the lamp.  On top of that synchronization contract the module
+ * also owns the documented server-side RPC control surface (setPower /
+ * setBrightness / setState / getState), which is the transient
+ * service/test control channel described below.
  *
  * Behavioral reference: the platform ThingsBoard RGB lamp example
- * (platform/hq_platform/examples/common/thingboard_rgb_lamp.c) and the
- * ThingsBoard attributes primitives (tb_attributes.h).  This component
- * reuses those transport primitives unchanged and owns the product policy
- * around them.
+ * (platform/hq_platform/examples/common/thingboard_rgb_lamp.c), the
+ * platform ThingsBoard attributes primitives (tb_attributes.h) and the
+ * platform server-side RPC primitives (tb_rpc.h).  This component reuses
+ * those transport primitives unchanged and owns the product policy around
+ * them.
  *
  * Synchronization contract (per successful connection)
  * ----------------------------------------------------
@@ -85,6 +91,47 @@
  *     the output off again and re-enter synchronization with bounded
  *     backoff.
  *
+ * Server-side RPC control (TASK-113)
+ * ----------------------------------
+ * Every successful connection also (re-)arms the server-side RPC control
+ * surface through the platform tb_rpc primitives.  RPC is the *transient*
+ * service/test control channel: it drives the lamp hardware directly and
+ * never writes shared attributes (dashboards keep writing shared
+ * attributes; a server rule chain may synchronize RPC results into shared
+ * attributes explicitly).  Exactly four methods are supported:
+ *
+ *   - `setPower`      `{"power": <boolean>}`                         — required,
+ *   - `setBrightness` `{"brightness": <integer 0..100>}`             — required,
+ *   - `setState`      `{"power": <boolean>, "brightness": <0..100>}` — both required,
+ *   - `getState`      `{}`                                           — returns state.
+ *
+ * Validation is strict and happens before any hardware action:
+ *   - method name and params payload are length-bounded before parsing
+ *     (#TB_APPLICATION_RPC_METHOD_MAX_LEN /
+ *     #TB_APPLICATION_RPC_PARAMS_MAX_LEN),
+ *   - params must be a JSON object; required fields must be present with
+ *     exactly the documented JSON types (power: boolean; brightness:
+ *     integer, never fractional),
+ *   - brightness must be in the closed interval 0..100 (never clamped),
+ *   - any other method name is rejected as unknown.
+ *
+ * Ordering and reporting:
+ *   - the validated state is applied to the hardware BEFORE the success
+ *     response is published — a response carrying `"success":true` is only
+ *     ever published after lamp_control_apply_state() returned #LAMP_OK,
+ *   - `power`/`brightness` telemetry is published ONLY after a successful
+ *     hardware change (never for invalid requests, failures or getState),
+ *   - responses are structured JSON: success responses carry the resulting
+ *     `desired` and `applied` states; errors carry `"success":false` with
+ *     `"error"` set to one of `unknown method` / `invalid payload` /
+ *     `hardware failure` (plus a `reason` and/or `method` detail).
+ *
+ * An invalid RPC never modifies the applied state.  A valid RPC applies
+ * through lamp_control_apply_state() like a synchronized state, so the
+ * module's last-applied desired state (reported by getState and used for
+ * duplicate detection) stays consistent across both control channels; the
+ * next shared-attribute update remains authoritative afterwards.
+ *
  * Host testability
  * ----------------
  * The module speaks only the portable OSAL clock/mutex/log surface, cJSON,
@@ -141,6 +188,23 @@ typedef struct tb_client tb_client_t;
  * are rejected as invalid before parsing (bounded payloads).
  */
 #define TB_APPLICATION_MAX_PAYLOAD_BYTES 512u
+
+/**
+ * @brief Maximum accepted server-RPC method name length (bytes).
+ *
+ * Longer method names are rejected as invalid payload before any method
+ * comparison or parsing (bounded methods).
+ */
+#define TB_APPLICATION_RPC_METHOD_MAX_LEN 32u
+
+/**
+ * @brief Maximum accepted server-RPC params payload size (bytes).
+ *
+ * The RPC params object is re-serialized by the transport; payloads longer
+ * than this bound are rejected as invalid payload before parsing (bounded
+ * payloads).
+ */
+#define TB_APPLICATION_RPC_PARAMS_MAX_LEN TB_APPLICATION_MAX_PAYLOAD_BYTES
 
 /* --------------------------------------------------------------------- */
 /* Status type                                                            */

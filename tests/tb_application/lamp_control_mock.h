@@ -1,21 +1,25 @@
 /**
  * @file lamp_control_mock.h
  * @brief Test-only lamp-control double for tb_application host tests
- *        (TASK-112)
+ *        (TASK-112 / TASK-113)
  *
- * The synchronizer's lamp surface is:
+ * The application module's lamp surface is:
  *
  *   - lamp_control_force_inactive()  — fail-off on every rejection path and
  *     on disconnect,
  *   - lamp_control_apply_state()     — the only way a complete valid
  *     desired state reaches the output,
  *   - lamp_control_release_fail_off()— the module clears its own latched
- *     barrier immediately before applying.
+ *     barrier immediately before applying,
+ *   - lamp_control_get_applied_state()— read back the applied hardware
+ *     state (used by the server-RPC getState handler and as the unchanged
+ *     base for single-field set methods).
  *
  * The double records every call in that order and exposes the last applied
  * state so tests can assert "no output is enabled before valid complete
  * synchronization" (apply count stays 0 until a complete valid state
- * arrives) and that a rejected attempt only ever forces the output off.
+ * arrives), that a rejected attempt only ever forces the output off, and
+ * that an invalid RPC never modifies the applied state.
  */
 
 #ifndef LAMP_CONTROL_MOCK_H
