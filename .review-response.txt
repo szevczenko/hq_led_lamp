@@ -1,3 +1,0 @@
-ISSUE 1 (HIGH platform/hq_platform/src/mongoose/mqtt_app.c:1409): mqtt_app_deinit() did not clear mqtt_pending_candidate_valid, allowing an approved apply-config candidate to survive deinitialization and be reused after a later mqtt_app_init().
-STATUS: FIXED
-COMMENT: Made the pending-candidate validity bit atomic, invalidate it at mqtt_app_deinit() start and before fresh initialization, and invalidate it on ordinary disconnect/shutdown/rejection. The approved apply-config path is the only path that preserves the candidate across its internal disconnect-and-retry sequence; the candidate is retired after connect succeeds.

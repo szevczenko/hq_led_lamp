@@ -1,5 +1,7 @@
-# ESP-IDF and host-test build output — any build* name at the repo root
+# ESP-IDF and host-test build output — any build* name at the repo root,
+# plus the mqtt_cfg host-test scratch build dir (kept out of the MR)
 /build*/
+/tests/mqtt_cfg/build/
 
 # Generated CMake build artifacts (host-test and review builds)
 CMakeCache.txt
