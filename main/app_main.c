@@ -27,6 +27,11 @@
  *   6. On Wi-Fi loss the adapter forces the lamp output inactive
  *      synchronously and informs the application state machine through
  *      on_disconnected().
+ *   7. The single re-enable transition for the lamp fail-off barrier is a
+ *      successful verified MQTT/TLS connection (mqtt_cfg_connect(), TASK-110).
+ *      on_network_connected() only opens the connect gate — it never
+ *      releases the barrier, so a Wi-Fi connection alone, or any rejected
+ *      broker/TLS configuration, can never enable the output.
  *
  *  The idempotent mkdir (EEXIST -> OSAL_ERR_NAME_TAKEN -> LAMP_FS_OK) is
  *  expected after a reflash onto persistent storage and is not a defect.
@@ -40,6 +45,7 @@
 #include "hal_types.h"
 #include "lamp_control.h"
 #include "lamp_fs.h"
+#include "mqtt_cfg.h"
 #include "network_manager.h"
 #include "sdkconfig.h"
 
@@ -64,24 +70,20 @@ static const char *TAG = "klc";
  * Called by the adapter after the network is up.  Only now may the
  * ThingsBoard client begin its connect attempts; nothing here touches Wi-Fi
  * credentials — the adapter and the manager keep them private.
+ *
+ * Fail-off re-enable contract (TASK-110): this callback NEVER releases the
+ * lamp fail-off barrier.  The barrier latched by the disconnect path or by
+ * a rejected broker/TLS configuration stays latched until
+ * mqtt_cfg_connect() succeeds — i.e. until a valid configuration has been
+ * applied AND the verified MQTT/TLS connection has succeeded.  A Wi-Fi
+ * connection alone must not lift the barrier, otherwise a TLS
+ * configuration failure could be re-enabled by a later state application.
  */
 static void on_network_connected(void *context)
 {
     (void)context;
-    /* Explicit re-enable transition: the disconnect path latched the lamp
-     * fail-off barrier (lamp_control_force_inactive()), which keeps the
-     * output off — even against apply-states racing or arriving after the
-     * disconnect — until this documented release runs.  From here the
-     * application may energize the output again once a valid desired state
-     * arrives. */
-    lamp_status_t status = lamp_control_release_fail_off();
-    if (status != LAMP_OK)
-    {
-        /* Cannot fail today; surfaced for contract completeness. */
-        ESP_LOGE(TAG, "lamp_control_release_fail_off failed: %d",
-                 (int)status);
-    }
-    ESP_LOGI(TAG, "Network connected; ThingsBoard connect is now allowed");
+    ESP_LOGI(TAG, "Network connected; verified MQTT/TLS connect is now "
+                  "allowed (fail-off release is owned by mqtt_cfg_connect)");
 }
 
 /**
@@ -261,9 +263,35 @@ static bool load_product_configuration(void)
     return true;
 }
 
+/**
+ * @brief Load and validate the broker/TLS configuration (TASK-110).
+ *
+ * Runs after the filesystem bootstrap and behind
+ * network_manager_wait_connected() (see start_network()).  An accepted
+ * /config/mqtt.json always configures verified TLS (mqtts:// with the
+ * private CA and DNS-hostname verification) through the Mongoose
+ * mqtt_config API; mqtt_cfg rejects plaintext mode, skip_verify, empty CA
+ * paths and certificate paths outside /cert, and forces the lamp output
+ * inactive on any configuration failure, so a rejected or missing broker
+ * configuration can never enable the output.  The verified transport
+ * connect (mqtt_cfg_connect()) is consumed by the ThingsBoard tasks
+ * (TASK-111/112) behind the same network gate.
+ */
+static void load_broker_tls_configuration(void)
+{
+    mqtt_cfg_status_t status = mqtt_cfg_load_and_apply();
+    if (status != MQTT_CFG_OK)
+    {
+        ESP_LOGE(TAG, "Broker/TLS configuration rejected: %d (%s)"
+                      " (output forced off, ThingsBoard blocked)",
+                 (int)status, mqtt_cfg_status_name(status));
+    }
+}
+
 static void load_configuration(void)
 {
     (void)load_product_configuration();
+    load_broker_tls_configuration();
 }
 
 /* --------------------------------------------------------------------- */
