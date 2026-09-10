@@ -17,21 +17,33 @@
  *      configuration is not loaded.  A failed directory bootstrap unmounts
  *      the volume before returning, so no hidden mount survives.
  *   4. Only a fully successful bootstrap reaches configuration loading.
- *   5. Wi-Fi onboarding (TASK-109) runs next through the product-owned
+ *      Configuration loading itself is ordered: product documents
+ *      (device.json / manufacturing.json, TASK-108) and the broker/TLS
+ *      document (mqtt.json, TASK-110) first, then the device identity
+ *      (TASK-111).
+ *   5. Device identity (TASK-111) is loaded after configuration validation
+ *      and before any ThingsBoard initialization.  device_identity_load()
+ *      only trusts validated manufacturing/configuration records, rejects
+ *      missing, empty, oversized or malformed identity input, never logs
+ *      the token, and is FATAL safe-off: a missing or invalid identity
+ *      forces the output inactive and blocks the ThingsBoard session — the
+ *      device never falls back to anonymous or plaintext connectivity.
+ *   6. Wi-Fi onboarding (TASK-109) runs next through the product-owned
  *      network adapter.  ThingsBoard must never connect before the network:
  *      the gate is the consumed network_manager_wait_connected() call in
  *      start_network() — a ThingsBoard connect (TASK-110..112) may only be
  *      attempted behind that gate, re-checked with
  *      network_manager_is_connected() ( ThingsBoard integration follows in
  *      its own tasks ).
- *   6. On Wi-Fi loss the adapter forces the lamp output inactive
+ *   7. On Wi-Fi loss the adapter forces the lamp output inactive
  *      synchronously and informs the application state machine through
  *      on_disconnected().
- *   7. The single re-enable transition for the lamp fail-off barrier is a
+ *   8. The single re-enable transition for the lamp fail-off barrier is a
  *      successful verified MQTT/TLS connection (mqtt_cfg_connect(), TASK-110).
  *      on_network_connected() only opens the connect gate — it never
- *      releases the barrier, so a Wi-Fi connection alone, or any rejected
- *      broker/TLS configuration, can never enable the output.
+ *      releases the barrier, so a Wi-Fi connection alone, an invalid or
+ *      missing identity, or any rejected broker/TLS configuration can
+ *      never enable the output.
  *
  *  The idempotent mkdir (EEXIST -> OSAL_ERR_NAME_TAKEN -> LAMP_FS_OK) is
  *  expected after a reflash onto persistent storage and is not a defect.
@@ -42,6 +54,7 @@
 #include "esp_log.h"
 
 #include "app_config.h"
+#include "device_identity.h"
 #include "hal_types.h"
 #include "lamp_control.h"
 #include "lamp_fs.h"
@@ -288,10 +301,103 @@ static void load_broker_tls_configuration(void)
     }
 }
 
+/* --------------------------------------------------------------------- */
+/* Device identity loading (TASK-111)                                      */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Load the ThingsBoard access-token identity (TASK-111).
+ *
+ * Runs after the filesystem bootstrap and the product/broker configuration
+ * validation, and before any ThingsBoard initialization.  The identity
+ * module only trusts validated manufacturing/configuration records and
+ * rejects missing, empty, oversized or malformed identity input; on any
+ * rejection the lamp output is forced inactive (fatal safe-off) and the
+ * ThingsBoard session stays blocked — the device never falls back to an
+ * anonymous or plaintext session.
+ *
+ * Redaction contract: the error log carries the status and its name only.
+ * The token is a bearer credential and is NEVER logged, printed or echoed;
+ * the module itself performs no logging.
+ */
+static void load_device_identity(void)
+{
+    device_identity_status_t status = device_identity_load();
+    if (status != DEVICE_IDENTITY_OK)
+    {
+        ESP_LOGE(TAG, "Device identity rejected: %d (%s)"
+                      " (output forced off, ThingsBoard blocked)",
+                 (int)status, device_identity_status_name(status));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Device identity loaded (access-token auth, client id "
+                  "ready for ThingsBoard initialization)");
+}
+
 static void load_configuration(void)
 {
     (void)load_product_configuration();
     load_broker_tls_configuration();
+    load_device_identity();
+}
+
+/* --------------------------------------------------------------------- */
+/* ThingsBoard initialization ordering (TASK-111)                          */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Start the ThingsBoard session behind the verified-TLS and
+ *        identity gates.
+ *
+ * Called only after the network gate (start_network()) passed.  The boot
+ * order contract (TASK-111) is enforced here:
+ *
+ *   1. IDENTITY gate — the ThingsBoard session may only be initialized
+ *      with a validated identity (device_identity_is_loaded()).  A missing
+ *      or invalid identity was already fatal safe-off in
+ *      load_device_identity(); this gate re-checks so an anonymous session
+ *      can never be started as a fallback.
+ *   2. VERIFIED-TLS gate (TASK-110) — mqtt_cfg_connect() drives one
+ *      verified MQTT/TLS connection over the applied transport and is the
+ *      single re-enable transition for the lamp fail-off barrier.  The
+ *      identity is loaded and validated BEFORE this connect is consumed,
+ *      so a device can never reach the ThingsBoard transport without a
+ *      valid identity.
+ *
+ * After both gates pass, the ThingsBoard session (TASK-112) consumes the
+ * identity exactly here:
+ *
+ *     tb_client_config_t tb_cfg;                 // TASK-112
+ *     tb_cfg.access_token = device_identity_token_provider()();   // the token
+ *     (void)device_identity_client_id(&tb_cfg.client_id);        // stable id
+ *
+ * Nothing from the identity is logged on this path: the token is a bearer
+ * credential and never appears in the log.
+ */
+static void start_thingsboard(void)
+{
+    if (!device_identity_is_loaded())
+    {
+        ESP_LOGE(TAG, "Device identity unavailable; ThingsBoard session "
+                      "blocked, output stays off");
+        return;
+    }
+
+    mqtt_cfg_status_t status = mqtt_cfg_connect(NETWORK_CONNECT_TIMEOUT_MS);
+    if (status != MQTT_CFG_OK)
+    {
+        ESP_LOGE(TAG, "Verified TLS connect failed: %d (%s)"
+                      " (output forced off, ThingsBoard session blocked)",
+                 (int)status, mqtt_cfg_status_name(status));
+        return;
+    }
+
+    /* Valid identity + verified TLS: the ThingsBoard session is now allowed
+     * to initialize (TASK-112) with the access token from the token
+     * provider and the stable client ID. */
+    ESP_LOGI(TAG, "Verified TLS connected with validated identity; "
+                  "ThingsBoard session initialization allowed");
 }
 
 /* --------------------------------------------------------------------- */
@@ -318,14 +424,23 @@ void app_main(void)
         return;
     }
 
+    /* Configuration loading is ordered (TASK-108 / TASK-110 / TASK-111):
+     * product documents and the broker/TLS document are validated first,
+     * then the device identity runs its manufacturing/configuration gates.
+     * A rejected identity is fatal safe-off for the ThingsBoard session. */
     load_configuration();
 
     /* Wi-Fi onboarding (TASK-109) runs before any ThingsBoard connect
      * attempt.  On failure (or timeout) the device stays offline in the
      * safe state: the output is off and the consumed wait_connected() gate
-     * keeps the (later, TASK-110..112) ThingsBoard initialization blocked. */
+     * keeps the ThingsBoard initialization blocked. */
     if (!start_network())
     {
         ESP_LOGW(TAG, "Continuing offline; ThingsBoard connect is blocked");
+        return;
     }
+
+    /* Behind the network gate: identity first, then the verified TLS
+     * connect, then the ThingsBoard session (TASK-111 ordering). */
+    start_thingsboard();
 }
