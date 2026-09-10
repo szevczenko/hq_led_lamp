@@ -35,7 +35,13 @@
  *  10. rename classification — OSAL_ERR_OPERATION_NOT_SUPPORTED /
  *      OSAL_ERR_NOT_IMPLEMENTED yield APP_CONFIG_ERR_UNSUPPORTED; every
  *      other rename failure yields APP_CONFIG_ERR_IO, on the live
- *      replacement AND on the last-known-good promotion alike.
+ *      replacement AND on the last-known-good promotion alike,
+ *  11. review-round regression — status_is_missing() accepts ONLY the
+ *      documented missing-file statuses (argument failures and the
+ *      generic OSAL_ERROR stay APP_CONFIG_ERR_IO); a failed preserve
+ *      rename never destroys a stale "<live>.good.old"; a failed live
+ *      rename after promoting a fresh ".good" with no previous backup
+ *      removes that ".good" again.
  */
 
 #include <stdio.h>
@@ -1573,6 +1579,195 @@ static void test_live_rename_failure_after_good_promotion_preserves_both(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* 11. Missing-status classification boundaries (review finding 1)        */
+/* --------------------------------------------------------------------- */
+
+static void test_missing_status_classification_boundaries(void)
+{
+    /* Only OSAL_ERR_NAME_NOT_FOUND and the LittleFS LFS_ERR_NOENT mapping
+     * (OSAL_FS_ERR_PATH_INVALID) classify a load as NOT_FOUND.  Argument
+     * failures (OSAL_FS_ERR_NAME_TOO_LONG, OSAL_FS_ERR_PATH_TOO_LONG) and
+     * the generic OSAL_ERROR (transient storage failure) are IO, never
+     * NOT_FOUND, even when a validated backup exists next to the live
+     * document. */
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH,
+                                             DEVICE_V1));
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             DEVICE_V1));
+
+    const int32_t non_missing_statuses[] = {
+        OSAL_FS_ERR_NAME_TOO_LONG,
+        OSAL_FS_ERR_PATH_TOO_LONG,
+        OSAL_ERROR,
+    };
+    for (size_t i = 0U;
+         i < sizeof(non_missing_statuses) / sizeof(non_missing_statuses[0]);
+         ++i)
+    {
+        osal_file_mock_set_stat_status(non_missing_statuses[i]);
+
+        app_config_device_doc_t loaded;
+        (void)memset(&loaded, 0xA5, sizeof(loaded));
+        TEST_ASSERT_EQUAL_INT_MESSAGE(APP_CONFIG_ERR_IO,
+                                      app_config_load_device(&loaded),
+                                      "argument/transient stat failure must "
+                                      "be IO, never NOT_FOUND");
+        /* Nothing was published: the caller's document is untouched. */
+        TEST_ASSERT_EQUAL_HEX8(0xA5, ((const unsigned char *)&loaded)[0]);
+
+        /* The failed load touched neither the live file nor the backup. */
+        TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH));
+        TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH
+                                                 ".good"));
+    }
+
+    /* For contrast: with both files absent, the documented missing-file
+     * result of the initial stat still yields NOT_FOUND. */
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH,
+                                             DEVICE_V1));
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             DEVICE_V1));
+    osal_file_mock_reset();
+    app_config_register_migration_handler(NULL);
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_NOT_FOUND,
+                          app_config_load_device(&loaded));
+}
+
+/* --------------------------------------------------------------------- */
+/* 12. Preserve-rename failure keeps "<live>.good.old" (finding 2)        */
+/* --------------------------------------------------------------------- */
+
+static void test_preserve_rename_failure_keeps_good_old(void)
+{
+    /* A "<live>.good.old" left by an earlier interrupted transaction is
+     * the only still-valid recovery copy.  The commit's preserve-rename
+     * (good -> good.old) FAILS (moves nothing), so the abort must not
+     * remove_quiet() the stale ".good.old": it must survive the refused
+     * commit together with the untouched pre-commit ".good". */
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Second commit archives the first (valid) live document into
+     * "<live>.good": now a pre-commit ".good" exists. */
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+    TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".good"));
+
+    /* Stage a stale "<live>.good.old" as an earlier interrupted
+     * transaction would have left it (valid serialized document). */
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH
+                                             ".good.old",
+                                             DEVICE_V1));
+
+    /* Snapshot the pre-commit state of both backup files. */
+    char good_before[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_before,
+                                             sizeof(good_before)));
+    char good_old_before[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH
+                                             ".good.old",
+                                             good_old_before,
+                                             sizeof(good_old_before)));
+
+    /* Rename call 1 of the NEXT commit is the preserve step
+     * (good -> good.old): refuse it. */
+    osal_file_mock_fail_rename_at(osal_file_mock_rename_calls() + 1,
+                                  OSAL_ERR_FILE);
+
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_commit_device(&doc));
+
+    /* The preserve rename never moved anything: the pre-commit ".good"
+     * is still at ".good", and the stale ".good.old" still exists
+     * byte-for-byte — the abort did NOT remove it. */
+    TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".good"));
+    TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH
+                                             ".good.old"));
+    char good_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_after, sizeof(good_after)));
+    TEST_ASSERT_EQUAL_STRING(good_before, good_after);
+    char good_old_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH
+                                             ".good.old",
+                                             good_old_after,
+                                             sizeof(good_old_after)));
+    TEST_ASSERT_EQUAL_STRING(good_old_before, good_old_after);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK,
+                          app_config_validate_device_json(good_old_after,
+                                                          NULL));
+
+    /* The live document was not replaced and no temporaries survived. */
+    TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".tmp"));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH
+                                              ".good.tmp"));
+}
+
+/* --------------------------------------------------------------------- */
+/* 13. Failed live rename with no previous ".good" leaves no ".good"      */
+/*     (finding 3)                                                        */
+/* --------------------------------------------------------------------- */
+
+static void test_failed_live_rename_without_previous_good_leaves_no_good(void)
+{
+    /* The live file is valid but no previous "<live>.good" exists: step 3
+     * promotes the staged copy to "<live>.good" (good_promoted = true,
+     * good_preserved = false).  When the LIVE rename then fails, the
+     * freshly promoted ".good" must be REMOVED again (the pre-commit
+     * state had no backup) while the live document stays intact. */
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    char live_before[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH,
+                                             live_before,
+                                             sizeof(live_before)));
+    /* Pre-commit state: no backup of any kind. */
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".good"));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH
+                                              ".good.old"));
+    /* A commit with no previous ".good" performs three renames:
+     * 1. preserve (fails: nothing to archive), 2. promote the staged copy
+     * to ".good", 3. replace the live file.  Refuse only the live
+     * replacement (the first commit already consumed rename calls). */
+    const int rename_base = osal_file_mock_rename_calls();
+    osal_file_mock_fail_rename_at(rename_base + 3, OSAL_ERR_FILE);
+
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_commit_device(&doc));
+
+    /* The freshly promoted backup was rolled back: no ".good" exists
+     * after the refused commit. */
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".good"));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH
+                                              ".good.old"));
+
+    /* The live document is byte-for-byte the pre-commit state. */
+    char live_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH,
+                                             live_after,
+                                             sizeof(live_after)));
+    TEST_ASSERT_EQUAL_STRING(live_before, live_after);
+    TEST_ASSERT_NOT_NULL(strstr(live_after, "KLC-2024-000001"));
+
+    /* No staged temporary files survived the abort. */
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".tmp"));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH
+                                              ".good.tmp"));
+
+    /* Without the fault the same commit succeeds. */
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_load_device(&loaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000002", loaded.serial);
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
 
@@ -1654,6 +1849,11 @@ int main(void)
     RUN_TEST(test_rename_not_implemented_refuses_commit);
     RUN_TEST(test_good_rename_io_failure_reports_io_and_preserves_backups);
     RUN_TEST(test_live_rename_failure_after_good_promotion_preserves_both);
+
+    /* 11. Review-round regression tests */
+    RUN_TEST(test_missing_status_classification_boundaries);
+    RUN_TEST(test_preserve_rename_failure_keeps_good_old);
+    RUN_TEST(test_failed_live_rename_without_previous_good_leaves_no_good);
 
     return UNITY_END();
 }
