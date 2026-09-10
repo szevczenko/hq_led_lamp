@@ -35,10 +35,12 @@ __pycache__/
 *~
 .vscode/settings.json
 
-# Certificates and private keys — never commit
+# Certificates, CSRs, and private keys — never commit
 *.key
 *.pem
 *.p12
+*.csr
+*.srl
 /cert/
 
 # ThingsBoard development stack (server/) — generated runtime material

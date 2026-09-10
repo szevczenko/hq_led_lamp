@@ -21,7 +21,8 @@ admin browser       ------> https thingsboard.home.arpa         -> Caddy -> Thin
   volumes `tb-data` / `tb-logs` declared in `compose.yml`.
 
 Production CA custody, hardening, backup evidence, and release sign-off are
-tracked separately (`tasks-prod.md`). This stack is development-only.
+documented in `PKI.md` (procedures only — no production material is ever
+generated or stored here). This stack is development-only.
 
 ## Layout
 
@@ -31,9 +32,16 @@ tracked separately (`tasks-prod.md`). This stack is development-only.
 | `Caddyfile`             | HTTPS 443 -> ThingsBoard 9090 reverse-proxy config             |
 | `.env.example`          | Non-secret environment template (committed)                    |
 | `.env`                  | Real environment with generated secrets (**git-ignored**)      |
-| `certs/`                | Generated development CA + server certificates (**git-ignored**)|
+| `certs/`                | Generated development CA + server key/CSR/certificates (**git-ignored**) |
 | `data/`                 | Durable PostgreSQL data directory (**git-ignored**)            |
-| `scripts/gen_dev_tls.sh`| One-time TLS + secrets generation                              |
+| `PKI.md`                | Development CA + production CA custody/renewal procedures     |
+| `scripts/gen_dev_tls.sh`| One-shot TLS + secrets generation (orchestrates the phases)    |
+| `scripts/dev_pki_config.sh` | Shared PKI configuration (sourced by the phase scripts)   |
+| `scripts/gen_dev_ca.sh` | Development root CA (ca.key/ca.crt)                           |
+| `scripts/gen_server_csr.sh` | Server key + CSR (SAN enforced)                           |
+| `scripts/gen_server_cert.sh` | Issue server certificate from the CSR (SAN required)     |
+| `scripts/check_pki.py`   | Offline PKI validation (trusted/unknown CA, hostname, profile) |
+| `scripts/test_pki.py`    | End-to-end tests for the PKI scripts + validation matrix       |
 | `scripts/check_endpoints.py` | Credential-free HTTPS/MQTT-TLS endpoint validation        |
 
 ## Prerequisites
@@ -78,11 +86,19 @@ This creates (all git-ignored):
 
 - `server/.env` — environment copied from `.env.example` with a generated
   PostgreSQL password;
-- `server/certs/` — development root CA (`ca.crt`, `ca.key`), server
-  certificate (`server.crt`) with SAN `DNS:thingsboard.home.arpa`, and the
-  PEM credentials for the ThingsBoard MQTT TLS listener
-  (`server.pem`, `server_key.pem`);
+- `server/certs/` — development root CA (`ca.crt`, `ca.key`), server private
+  key + CSR (`server.key`, `server.csr`, SAN `DNS:thingsboard.home.arpa`),
+  server certificate (`server.crt`), and the PEM credentials for the
+  ThingsBoard MQTT TLS listener (`server.pem`, `server_key.pem`);
 - `server/data/postgres` — durable PostgreSQL storage directory.
+
+The generation is split into focused, individually callable phase scripts
+(`gen_dev_ca.sh`, `gen_server_csr.sh`, `gen_server_cert.sh`); see
+`PKI.md` §2 for the workflow. The signer refuses a CSR whose DNS SAN is not
+the documented endpoint, and `python3 server/scripts/check_pki.py` validates
+the result offline (trusted-CA success, unknown-CA failure, hostname
+mismatch, SAN, key usage, permissions, lifetime, and that no device artifact
+contains a private key).
 
 ThingsBoard's own data and logs are Docker named volumes (`tb-data`,
 `tb-logs`) — they persist across `docker compose down` and need no host
@@ -90,8 +106,10 @@ paths.
 
 The development CA is a throwaway root kept on this host. Devices that
 integrate against this stack trust `server/certs/ca.crt` (installed on the
-firmware as `/cert/ca.crt`). Re-generating with `--regenerate` issues a new
-CA and invalidates every previously distributed copy of `ca.crt`.
+firmware as `/cert/ca.crt` — the **only** PKI file a device ever receives;
+private keys never leave this host). Re-generating with `--regenerate`
+issues a new CA and invalidates every previously distributed copy of
+`ca.crt`.
 
 ### 1.3 Trust the development CA (admin browsers / REST tooling)
 
@@ -279,6 +297,11 @@ python3 server/scripts/check_endpoints.py --wait 600 # poll until ready
 - Compose-level health checks: `docker compose ps` shows `healthy` for
   PostgreSQL (`pg_isready`), ThingsBoard (TCP probe of the admin port), and
   Caddy (admin API probe).
+- Offline PKI validation (no server required): `scripts/check_pki.py`
+  verifies the generated material — trusted-CA success, unknown-CA failure,
+  hostname mismatch, DNS SAN, key usage, permissions, lifetime policy, and
+  that no device artifact or git-tracked file contains a private key.
+  Expected results are documented in `PKI.md` §7.
 - Credential-free endpoint validation: `scripts/check_endpoints.py` verifies
   TLS chain + hostname on both `443` and `8883`, confirms the HTTP login page
   responds, and performs an anonymous MQTT CONNECT/CONNACK exchange. It
@@ -291,8 +314,13 @@ python3 server/scripts/check_endpoints.py --wait 600 # poll until ready
 - Plaintext MQTT `1883` and the admin `9090` port are bound to loopback only.
 - Everything generated (`server/.env`, `server/certs/`, `server/data/`) is
   git-ignored; these paths never appear in a commit.
+- Devices receive **only** the public root `ca.crt` (as `/cert/ca.crt`).
+  CA/server private keys stay on this host; `check_pki.py` verifies that no
+  device artifact or tracked file contains one.
 - The development CA is not for production: firmware must never embed or
-  trust development roots in release images.
+  trust development roots in release images. Production CA custody and
+  renewal procedures are documented in `PKI.md` §8 — no production material
+  is generated by anything in this repository.
 - Optional host firewall example (`ufw`):
 
   ```bash
@@ -315,10 +343,11 @@ python3 server/scripts/check_endpoints.py --wait 600 # poll until ready
 
 ## See also
 
+- `PKI.md` — development CA profile/workflow and the production CA custody
+  and renewal procedures (no production material generated here).
 - `../KITCHEN_LED_CONTROLLER_PRODUCTION_PLAN.md` — section 9 (TLS/LAN plan),
   section 16.1 (REST functional tests).
-- `../components/mqtt_cfg/README.md` — firmware broker/TLS configuration.
+- `../components/mqtt_cfg/README.md` — firmware broker/TLS configuration
+  (`ca_path: /cert/ca.crt`, `skip_verify: false`).
 - `../scripts/thingsboard/README.md` — test-device provisioning and the
   REST functional-test harness.
-- `tasks-prod.md` — production CA custody, hardening, backups, and release
-  sign-off (out of scope here).
