@@ -3,6 +3,7 @@
 /build*/
 /tests/mqtt_cfg/build/
 /tests/tb_application/build/
+/tests/app_state/build/
 
 # Generated CMake build artifacts (host-test and review builds)
 CMakeCache.txt
