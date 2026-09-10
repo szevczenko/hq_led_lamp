@@ -1,12 +1,5 @@
-# ESP-IDF and host-test build output
-build/
-build_asan/
-build_esp/
-build_review/
-build_tsan/
-build-*/
-build-lamp-fs-tests/
-build-lamp-control-tests/
+# ESP-IDF and host-test build output — any build* name at the repo root
+/build*/
 
 # Generated CMake build artifacts (host-test and review builds)
 CMakeCache.txt
