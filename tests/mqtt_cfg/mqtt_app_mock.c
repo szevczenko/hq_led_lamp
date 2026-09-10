@@ -117,6 +117,7 @@ void mqtt_app_mock_simulate_apply_config(void)
 
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.address = mqtt_config_get_string(MQTT_CONFIG_VALUE_ADDRESS);
+    snapshot.client_id = mqtt_config_get_string(MQTT_CONFIG_VALUE_CLIENT_ID);
     if (mqtt_config_get_bool(&ssl, MQTT_CONFIG_VALUE_SSL))
     {
         snapshot.ssl_enabled = ssl;

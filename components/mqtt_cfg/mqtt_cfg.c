@@ -854,16 +854,25 @@ static bool mqtt_cfg_capture_cert(mqtt_config_value_t key,
 
 static bool mqtt_cfg_applied_transport_matches(void)
 {
-    char expected_address[MQTT_CFG_HOSTNAME_MAX_LEN + 16u];
+    char expected_address[MQTT_CONFIG_STR_SIZE];
     const char *address;
     const char *client_id;
     bool ssl = false;
     bool skip_verify = true;
+    int expected_len = -1;
 
-    if (mqtt_cfg_validate_fields(&s_applied_cfg) != MQTT_CFG_OK ||
-        snprintf(expected_address, sizeof(expected_address),
-                 MQTT_CFG_ADDRESS_FMT, s_applied_cfg.hostname,
-                 (unsigned)s_applied_cfg.port) < 0)
+    if (mqtt_cfg_validate_fields(&s_applied_cfg) != MQTT_CFG_OK)
+    {
+        return false;
+    }
+    /* The live address is stored by the platform in an MQTT_CONFIG_STR_SIZE
+     * buffer, so format the expected address into a buffer of exactly that
+     * bound; a formatted address that would not round-trip through the
+     * platform storage can never match and is treated as a mismatch. */
+    expected_len = snprintf(expected_address, sizeof(expected_address),
+                            MQTT_CFG_ADDRESS_FMT, s_applied_cfg.hostname,
+                            (unsigned)s_applied_cfg.port);
+    if (expected_len < 0 || (size_t)expected_len >= sizeof(expected_address))
     {
         return false;
     }
@@ -913,26 +922,39 @@ static bool mqtt_cfg_applied_transport_matches(void)
  * snapshot of the exact values the reconnect would use.  Only a candidate
  * identical to the module's verified applied state is approved; anything
  * else — SSL off, skip-verify on, raw or relocated certificate material, a
- * different (e.g. plaintext or IP) address — is rejected, so no caller can
- * make the transport reconnect from unverified values.  The platform fails
- * closed when no callback is registered, and on rejection it leaves the
- * transport disconnected and notifies the failure observer, which fails
- * the lamp off (see mqtt_cfg_on_connect_failure()).
+ * different (e.g. plaintext or IP) address, a different client identifier
+ * — is rejected, so no caller can make the transport reconnect from
+ * unverified values.  The platform fails closed when no callback is
+ * registered, and on rejection it leaves the transport disconnected and
+ * notifies the failure observer, which fails the lamp off (see
+ * mqtt_cfg_on_connect_failure()).
  */
 static bool mqtt_cfg_config_gate(const mqtt_config_snapshot_t *candidate)
 {
-    char expected_address[MQTT_CFG_HOSTNAME_MAX_LEN + 16u];
+    char expected_address[MQTT_CONFIG_STR_SIZE];
     bool accepted = false;
+    int expected_len = -1;
 
     mqtt_cfg_lock();
     if (candidate != NULL && s_verified_applied &&
-        mqtt_cfg_validate_fields(&s_applied_cfg) == MQTT_CFG_OK &&
-        snprintf(expected_address, sizeof(expected_address),
-                 MQTT_CFG_ADDRESS_FMT, s_applied_cfg.hostname,
-                 (unsigned)s_applied_cfg.port) >= 0)
+        mqtt_cfg_validate_fields(&s_applied_cfg) == MQTT_CFG_OK)
     {
-        if (candidate->address != NULL &&
+        /* The candidate address is an owned copy of the platform's own
+         * MQTT_CONFIG_STR_SIZE storage, so the expected address is formatted
+         * into a buffer of exactly that bound.  A formatted address that
+         * would not round-trip through the platform storage (snprintf return
+         * >= buffer size) can never match a candidate and is rejected
+         * explicitly instead of silently truncating the local copy. */
+        expected_len = snprintf(expected_address, sizeof(expected_address),
+                                MQTT_CFG_ADDRESS_FMT, s_applied_cfg.hostname,
+                                (unsigned)s_applied_cfg.port);
+
+        if (expected_len >= 0 &&
+            (size_t)expected_len < sizeof(expected_address) &&
+            candidate->address != NULL &&
             strcmp(candidate->address, expected_address) == 0 &&
+            candidate->client_id != NULL &&
+            strcmp(candidate->client_id, s_applied_cfg.client_id) == 0 &&
             candidate->ssl_enabled && !candidate->skip_verify &&
             candidate->cert_source == MQTT_CERT_SOURCE_FILE_PATH &&
             candidate->cert_value != NULL &&
@@ -1358,6 +1380,11 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
     mqtt_cfg_lock();
     if (!s_verified_applied)
     {
+        /* No apply requested a wait: clear any leftover wait state so a
+         * stale generation can never be published for this connect (the
+         * timeout path below mirrors this). */
+        atomic_store_explicit(&s_waiting_for_connection, false,
+                              memory_order_release);
         mqtt_cfg_unlock();
         mqtt_app_deinit();
         mqtt_cfg_fail_off();
@@ -1369,6 +1396,8 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
          * configuration.  Close the gate so the changed state cannot be
          * retried without another validated apply. */
         s_verified_applied = false;
+        atomic_store_explicit(&s_waiting_for_connection, false,
+                              memory_order_release);
         mqtt_cfg_unlock();
         mqtt_app_deinit();
         mqtt_cfg_fail_off();
@@ -1421,15 +1450,24 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
         {
             atomic_store_explicit(&s_waiting_for_connection, false,
                                   memory_order_release);
-            mqtt_cfg_unlock();
-            osal_log_info("mqtt_cfg: verified TLS connection established (%s)",
-                          address);
             /* Re-enable contract (TASK-110): the lamp fail-off barrier is
              * released only here — after a valid configuration was applied
              * AND the verified TLS connection succeeded.  A Wi-Fi
              * connection alone, a rejected configuration or any failed
-             * connect keeps the output latched off. */
+             * connect keeps the output latched off.
+             *
+             * The release is performed while still under the module lock so
+             * the verified check, the transport-match re-check and the
+             * barrier release form one atomic critical section: a concurrent
+             * mqtt_config mutation cannot squeeze into that window and leave
+             * the transport authorized against state that is no longer in
+             * effect.  The release is a fast, non-blocking call, and the
+             * transport callbacks never take this lock, so no deadlock can
+             * form. */
             lamp_status_t ls = lamp_control_release_fail_off();
+            mqtt_cfg_unlock();
+            osal_log_info("mqtt_cfg: verified TLS connection established (%s)",
+                          address);
             if (ls != LAMP_OK)
             {
                 osal_log_error("mqtt_cfg: fail-off release failed: %d",

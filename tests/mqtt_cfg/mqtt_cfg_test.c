@@ -1071,6 +1071,40 @@ static void test_generic_save_path_cannot_bypass_verified_gate(void)
     TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_NOT_APPLIED, mqtt_cfg_connect(0u));
 }
 
+static void test_generic_save_rejects_mutated_client_id(void)
+{
+    /* Review round 4 (gate completeness): mutating ONLY the client id —
+     * everything the reconnect would otherwise consume (address, SSL,
+     * skip-verify, CA path) still matches the verified snapshot — and
+     * triggering the generic save/apply path must NOT reconnect with the
+     * changed identifier: the verified-owner gate compares the candidate's
+     * client_id (the exact value the transport would use) against the
+     * applied snapshot and fails off. */
+    unsigned init_before;
+
+    TEST_ASSERT_TRUE(provision_pem(host_pem_path("ca.crt"), "/cert/ca.crt"));
+    TEST_ASSERT_TRUE(write_doc(DEV_MQTT_V1));
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load_and_apply());
+
+    mqtt_app_mock_simulate_connect();
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_connect(0u));
+    init_before = mqtt_app_mock_init_calls();
+    (void)lamp_mock_reset();
+
+    TEST_ASSERT_TRUE(mqtt_config_set_string(
+        "mutated-client", MQTT_CONFIG_VALUE_CLIENT_ID));
+    mqtt_app_mock_simulate_apply_config();
+
+    TEST_ASSERT_FALSE(mqtt_app_mock_is_connected());
+    TEST_ASSERT_EQUAL_UINT(init_before, mqtt_app_mock_init_calls());
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() > 0u);
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_release_calls());
+
+    /* The verified gate is closed: no further connect without a fresh
+     * validated apply. */
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_NOT_APPLIED, mqtt_cfg_connect(0u));
+}
+
 /* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
@@ -1115,6 +1149,7 @@ int main(void)
     RUN_TEST(test_connect_failure_during_poll_fails_off);
     RUN_TEST(test_generic_save_accepts_verified_values);
     RUN_TEST(test_generic_save_path_cannot_bypass_verified_gate);
+    RUN_TEST(test_generic_save_rejects_mutated_client_id);
 
     return UNITY_END();
 }
