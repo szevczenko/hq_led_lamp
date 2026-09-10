@@ -58,6 +58,9 @@ static pthread_cond_t  s_wait_block_cond  = PTHREAD_COND_INITIALIZER;
 static bool            s_wait_block       = false;
 static bool            s_wait_blocked     = false;
 static bool            s_wait_release     = false;
+static bool            s_connect_block    = false;
+static bool            s_connect_blocked  = false;
+static bool            s_connect_release  = false;
 
 /* --------------------------------------------------------------------- */
 /* Test control API                                                       */
@@ -68,9 +71,12 @@ void wifi_mgmt_mock_reset(void)
   memset(&s_mock, 0, sizeof(s_mock));
 
   pthread_mutex_lock(&s_wait_block_lock);
-  s_wait_block   = false;
-  s_wait_blocked = false;
-  s_wait_release = false;
+  s_wait_block       = false;
+  s_wait_blocked     = false;
+  s_wait_release     = false;
+  s_connect_block    = false;
+  s_connect_blocked  = false;
+  s_connect_release  = false;
   pthread_mutex_unlock(&s_wait_block_lock);
 }
 
@@ -285,6 +291,30 @@ bool wifi_mgmt_wait_ready(uint32_t timeout_ms)
 
 bool wifi_mgmt_connect(void)
 {
+  /* Connect-window park point (remaining open finding regression): with
+   * wifi_mgmt_mock_block_connect() armed, this call blocks until the test
+   * releases it, so a start() is parked AFTER the post-wait_ready re-check
+   * and BEFORE its final return — the exact window a completed stop() must
+   * make it roll back.  Holds s_wait_block_lock (never s_mock_lock) while
+   * waiting, so the test thread's concurrent stop(), which takes
+   * s_mock_lock, cannot deadlock against the park. */
+  pthread_mutex_lock(&s_wait_block_lock);
+  const bool block_requested = s_connect_block;
+  if (block_requested)
+  {
+    s_connect_blocked = true;
+    pthread_cond_broadcast(&s_wait_block_cond);
+
+    while (!s_connect_release)
+    {
+      pthread_cond_wait(&s_wait_block_cond, &s_wait_block_lock);
+    }
+    s_connect_release = false;
+    s_connect_block   = false;
+    s_connect_blocked = false;
+  }
+  pthread_mutex_unlock(&s_wait_block_lock);
+
   pthread_mutex_lock(&s_mock_lock);
   ++s_mock.counters.connect_calls;
   s_mock.counters.start_before_connect = (s_mock.counters.start_calls > 0U);
@@ -401,6 +431,34 @@ void wifi_mgmt_mock_release_wait_ready(void)
   pthread_mutex_lock(&s_wait_block_lock);
   s_wait_release = true;
   s_wait_block   = false;
+  pthread_cond_broadcast(&s_wait_block_cond);
+  pthread_mutex_unlock(&s_wait_block_lock);
+}
+
+void wifi_mgmt_mock_block_connect(void)
+{
+  pthread_mutex_lock(&s_wait_block_lock);
+  s_connect_block   = true;
+  s_connect_blocked = false;
+  s_connect_release = false;
+  pthread_mutex_unlock(&s_wait_block_lock);
+}
+
+void wifi_mgmt_mock_wait_blocked_in_connect(void)
+{
+  pthread_mutex_lock(&s_wait_block_lock);
+  while (!s_connect_blocked)
+  {
+    pthread_cond_wait(&s_wait_block_cond, &s_wait_block_lock);
+  }
+  pthread_mutex_unlock(&s_wait_block_lock);
+}
+
+void wifi_mgmt_mock_release_connect(void)
+{
+  pthread_mutex_lock(&s_wait_block_lock);
+  s_connect_release = true;
+  s_connect_block   = false;
   pthread_cond_broadcast(&s_wait_block_cond);
   pthread_mutex_unlock(&s_wait_block_lock);
 }

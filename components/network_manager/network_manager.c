@@ -459,6 +459,44 @@ int network_manager_start(const network_callbacks_t *callbacks)
         return NETWORK_ERR_START_FAILED;
     }
 
+    /* (review finding: start/stop transaction race) The post-wait_ready
+     * re-check above covers only the registration/wait_ready window: a
+     * concurrent stop() can also complete AFTER it, exactly between the
+     * connect request and this final return.  Re-validate under the lock: a
+     * changed stop_count means a completed stop() disarmed this session and
+     * already owns the stopped state, so this start must roll back (same
+     * startup-failure path: disarm, unsubscribe with this session's token,
+     * wifi_mgmt_stop()) instead of returning NETWORK_OK with subscriptions
+     * still published for a stopped adapter. */
+    bool stopped_in_connect_window = false;
+    if (network_lock())
+    {
+        if (s_ctx.stop_count != stop_count_before)
+        {
+            stopped_in_connect_window = true;
+            network_disarm_locked();
+        }
+        network_unlock();
+    }
+
+    if (stopped_in_connect_window)
+    {
+        osal_log_error("[net] Wi-Fi startup aborted by concurrent stop");
+
+        (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECTED,
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
+        (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_DISCONNECTED,
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
+        (void)wifi_mgmt_unsubscribe(WIFI_MGMT_EVENT_CONNECT_FAILED,
+                                    network_wifi_event_cb,
+                                    (void *)(uintptr_t)token);
+        (void)wifi_mgmt_stop();
+
+        return NETWORK_ERR_START_FAILED;
+    }
+
     osal_log_info("[net] network manager started");
     return NETWORK_OK;
 }

@@ -148,6 +148,27 @@ void wifi_mgmt_mock_wait_blocked_in_wait_ready(void);
 void wifi_mgmt_mock_release_wait_ready(void);
 
 /**
+ * @brief Arm the connect-window park point: the NEXT wifi_mgmt_connect()
+ *        call blocks until wifi_mgmt_mock_release_connect() runs.
+ *
+ * Used by the start/stop CONNECT-window race regression (the remaining open
+ * finding) to park a start() AFTER the post-wait_ready re-check and BEFORE
+ * its final return.  Must be reset with wifi_mgmt_mock_reset() after use.
+ */
+void wifi_mgmt_mock_block_connect(void);
+
+/**
+ * @brief Block until a wifi_mgmt_connect() call is parked
+ *        (i.e. the armed connect-window park point was reached).
+ */
+void wifi_mgmt_mock_wait_blocked_in_connect(void);
+
+/**
+ * @brief Release a connect() call parked by wifi_mgmt_mock_block_connect().
+ */
+void wifi_mgmt_mock_release_connect(void);
+
+/**
  * @brief Test-only handle on the adapter's internal mutex (finding 4
  *        regression support).
  *

@@ -651,6 +651,63 @@ static void test_start_interrupted_by_stop_rolls_back_completely(void)
     TEST_ASSERT_TRUE(network_manager_wait_connected(0));
 }
 
+/* Start/stop CONNECT-window race regression (the remaining open finding): a
+ * stop() that completes AFTER the post-wait_ready re-check and BEFORE the
+ * start()'s final return — i.e. while the start() is inside its
+ * wifi_mgmt_connect() request — must make that start() roll back (disarm,
+ * unsubscribe with its own token, wifi_mgmt_stop()) and return
+ * NETWORK_ERR_START_FAILED.  A completed stop() owns the stopped state, so
+ * the racing start() must neither return NETWORK_OK nor leave this session's
+ * subscriptions published. */
+static void test_stop_in_connect_window_rolls_back_start(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    wifi_mock_counters_t counters;
+
+    /* The mock parks wifi_mgmt_connect(): the in-flight start() has already
+     * passed the post-wait_ready re-check and is now inside the connect
+     * window, before its final return. */
+    wifi_mgmt_mock_block_connect();
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&s_tx_thread, NULL,
+                                            tx_start_worker, NULL));
+    wifi_mgmt_mock_wait_blocked_in_connect();
+
+    /* The stop() completes exactly in that window: it disarms the session
+     * and owns the stopped state while the start() is still in flight. */
+    network_manager_stop();
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+
+    /* Let the start() continue: its final stop_count re-check must observe
+     * the completed stop() and roll everything back instead of returning
+     * NETWORK_OK for an adapter that is already stopped. */
+    wifi_mgmt_mock_release_connect();
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(s_tx_thread, NULL));
+
+    TEST_ASSERT_EQUAL_INT(NETWORK_ERR_START_FAILED,
+                          atomic_load(&s_tx_result));
+
+    /* Nothing survives the completed stop(): no subscription for any product
+     * event and no armed callback; a fresh start works normally from the
+     * not-started state. */
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_DISCONNECTED));
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECT_FAILED));
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.connected_calls);
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.disconnected_calls);
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+    (void)counters;
+
+    wifi_mock_config_t config = { .connected_state = true };
+    wifi_mgmt_mock_set_config(&config);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    TEST_ASSERT_TRUE(network_manager_wait_connected(0));
+}
+
 /* --------------------------------------------------------------------- */
 /* 7. Secrecy: no credential content in adapter logs                      */
 /* --------------------------------------------------------------------- */
@@ -941,6 +998,7 @@ int main(void)
     RUN_TEST(test_synchronous_connect_rejection_is_startup_failure);
     RUN_TEST(test_restart_with_new_context);
     RUN_TEST(test_start_interrupted_by_stop_rolls_back_completely);
+    RUN_TEST(test_stop_in_connect_window_rolls_back_start);
     RUN_TEST(test_is_connected_false_before_start);
 
     /* 7. secrecy */
