@@ -47,7 +47,16 @@ static int32_t s_write_fail_after;   /* -1 = disabled */
 static int32_t s_write_total;        /* cumulative successful bytes   */
 static int32_t s_rename_status;      /* one-shot, OSAL_SUCCESS = off  */
 static int32_t s_remove_status;      /* one-shot, OSAL_SUCCESS = off  */
+static int32_t s_stat_status;        /* one-shot, OSAL_SUCCESS = off  */
 static bool    s_fail_next_cp;
+static int     s_rename_fail_at;    /* 0 = disabled (1-based call no.) */
+static int32_t s_rename_fail_at_status;
+
+/* Persistent open-failure injection: osal_open_create() for the given path
+ * fails with this status until cleared (OSAL_SUCCESS = disabled).  Models
+ * "the file exists but cannot be opened right now". */
+static char    s_open_fail_path[OSAL_MAX_PATH_LEN];
+static int32_t s_open_fail_status;   /* OSAL_SUCCESS = disabled       */
 
 static int s_rename_calls;
 static int s_cp_calls;
@@ -75,7 +84,12 @@ void osal_file_mock_reset_failures(void)
     s_write_total = 0;
     s_rename_status = OSAL_SUCCESS;
     s_remove_status = OSAL_SUCCESS;
+    s_stat_status = OSAL_SUCCESS;
     s_fail_next_cp = false;
+    s_rename_fail_at = 0;
+    s_rename_fail_at_status = OSAL_SUCCESS;
+    s_open_fail_path[0] = '\0';
+    s_open_fail_status = OSAL_SUCCESS;
     s_rename_calls = 0;
     s_cp_calls = 0;
     s_remove_calls = 0;
@@ -178,6 +192,82 @@ void osal_file_mock_set_rename_status(int32_t status)
     s_rename_status = status; /* consumed by the next osal_rename() call */
 }
 
+void osal_file_mock_fail_rename_at(int call_number, int32_t status)
+{
+    if (call_number <= 0)
+    {
+        s_rename_fail_at = 0;
+        s_rename_fail_at_status = OSAL_SUCCESS;
+        return;
+    }
+    /* The injection fires when the 1-based rename call counter reaches
+     * @p call_number; 0-based target = call_number - 1. */
+    s_rename_fail_at        = call_number - 1;
+    s_rename_fail_at_status = status;
+}
+
+void osal_file_mock_set_open_status(const char *path, int32_t status)
+{
+    if (path == NULL)
+    {
+        s_open_fail_path[0] = '\0';
+        s_open_fail_status = OSAL_SUCCESS;
+        return;
+    }
+
+    const size_t len = strlen(path);
+    if (len >= sizeof(s_open_fail_path))
+    {
+        return; /* Path longer than the double's storage: cannot inject. */
+    }
+
+    memcpy(s_open_fail_path, path, len + 1U);
+    s_open_fail_status = status;
+}
+
+void osal_file_mock_set_stat_status(int32_t status)
+{
+    s_stat_status = status; /* consumed by the next osal_stat() call */
+}
+
+bool osal_file_mock_add_file_raw(const char *path, const void *data,
+                                 size_t len)
+{
+    if ((path == NULL) || (data == NULL) || (len == 0U))
+    {
+        return false;
+    }
+    if (len > (size_t)OSAL_FILE_MOCK_MAX_FILE_SIZE)
+    {
+        return false;
+    }
+
+    mock_file_t *f = find_file(path);
+    if (f == NULL)
+    {
+        for (int i = 0; i < OSAL_FILE_MOCK_MAX_FILES; ++i)
+        {
+            if (!s_files[i].in_use)
+            {
+                f = &s_files[i];
+                break;
+            }
+        }
+        if (f == NULL)
+        {
+            return false;
+        }
+        f->in_use = true;
+        strncpy(f->path, path, sizeof(f->path) - 1U);
+        f->path[sizeof(f->path) - 1U] = '\0';
+        f->size = 0U;
+    }
+
+    memcpy(f->data, data, len);
+    f->size = len;
+    return true;
+}
+
 void osal_file_mock_fail_next_cp(bool fail)
 {
     s_fail_next_cp = fail;
@@ -217,6 +307,13 @@ osal_file_id_t osal_open_create(const char *path, osal_file_flag_t flags,
     if (s_open_count >= OSAL_FILE_MOCK_MAX_FILES)
     {
         return (osal_file_id_t)OSAL_ERR_NO_FREE_IDS;
+    }
+
+    /* Persistent open-failure injection (transient unreadable file). */
+    if ((s_open_fail_status != OSAL_SUCCESS) &&
+        (strcmp(path, s_open_fail_path) == 0))
+    {
+        return (osal_file_id_t)s_open_fail_status;
     }
 
     mock_file_t *f = find_file(path);
@@ -403,6 +500,14 @@ int32_t osal_stat(const char *path, osal_fstat_t *filestats)
         return OSAL_INVALID_POINTER;
     }
 
+    /* One-shot stat-failure injection (transient storage error). */
+    const int32_t injected = s_stat_status;
+    s_stat_status = OSAL_SUCCESS;
+    if (injected != OSAL_SUCCESS)
+    {
+        return injected;
+    }
+
     const mock_file_t *f = find_file(path);
     if (f == NULL)
     {
@@ -459,6 +564,18 @@ int32_t osal_rename(const char *old_filename, const char *new_filename)
     if (injected != OSAL_SUCCESS)
     {
         return injected;
+    }
+
+    /* Call-number injection: fires exactly once, on the configured call. */
+    if ((s_rename_fail_at != 0) && (s_rename_calls == s_rename_fail_at + 1))
+    {
+        s_rename_fail_at        = 0;
+        const int32_t at_status = s_rename_fail_at_status;
+        s_rename_fail_at_status = OSAL_SUCCESS;
+        if (at_status != OSAL_SUCCESS)
+        {
+            return at_status;
+        }
     }
 
     mock_file_t *f = find_file(old_filename);

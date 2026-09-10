@@ -90,6 +90,46 @@ void osal_file_mock_fail_write_after(int32_t total_bytes_written);
 void osal_file_mock_set_rename_status(int32_t status);
 
 /**
+ * @brief Make the @p call_number-th osal_rename() call (1-based, counted
+ *        since the last reset) return @p status (one-shot).
+ *
+ * A commit performs up to three renames in a fixed order:
+ *   1. preserve the previous "<live>.good" at "<live>.good.old",
+ *   2. promote the staged copy to "<live>.good",
+ *   3. atomically replace the live file.
+ * The injection is consumed by the call whose number matches, so tests can
+ * target a specific promotion step (e.g. call 3 = the live replacement)
+ * while earlier steps proceed normally.
+ */
+void osal_file_mock_fail_rename_at(int call_number, int32_t status);
+
+/**
+ * @brief Make every osal_open_create() for @p path fail with @p status
+ *        until cleared (status == OSAL_SUCCESS disables the injection).
+ *
+ * This models "the file exists (osal_stat() succeeds) but cannot be opened
+ * right now" — a transient storage failure underneath a present document.
+ */
+void osal_file_mock_set_open_status(const char *path, int32_t status);
+
+/**
+ * @brief Make the next osal_stat() call return @p status (one-shot;
+ *        OSAL_SUCCESS disables).  Models a transient stat failure.
+ */
+void osal_file_mock_set_stat_status(int32_t status);
+
+/**
+ * @brief Create or overwrite @p path with exactly @p len bytes of @p data.
+ *
+ * Unlike osal_file_mock_add_file() this does NOT stop at a NUL byte, so a
+ * test can store a file with embedded-NUL / binary trailing content.
+ *
+ * @return true on success.
+ */
+bool osal_file_mock_add_file_raw(const char *path, const void *data,
+                                 size_t len);
+
+/**
  * @brief Make the next osal_cp() call fail after the copy started
  *        (one-shot): the destination is left truncated/partial.
  */

@@ -24,9 +24,21 @@
  *      through the registered hook; unknown/newer schemas are rejected,
  *   6. redaction — secret-bearing keys never reach diagnostics output,
  *   7. no lamp state — the service exposes no write path for runtime state;
- *      invalid document kinds are rejected.
+ *      invalid document kinds are rejected,
+ *   8. strict parsing — valid JSON followed by trailing garbage or a
+ *      second concatenated object is rejected as malformed (the parser
+ *      must consume the ENTIRE input); trailing whitespace is fine,
+ *   9. error classification — APP_CONFIG_ERR_NOT_FOUND only comes from a
+ *      missing-file osal_stat() result; once stat succeeds, an open/read
+ *      failure is APP_CONFIG_ERR_IO, aborting the commit before the live
+ *      rename and never silently falling back to the backup on load,
+ *  10. rename classification — OSAL_ERR_OPERATION_NOT_SUPPORTED /
+ *      OSAL_ERR_NOT_IMPLEMENTED yield APP_CONFIG_ERR_UNSUPPORTED; every
+ *      other rename failure yields APP_CONFIG_ERR_IO, on the live
+ *      replacement AND on the last-known-good promotion alike.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "app_config.h"
@@ -1015,6 +1027,27 @@ static void test_redact_masks_secret_values(void)
     TEST_ASSERT_NOT_NULL(strstr(out, "visible"));
 }
 
+static void test_redact_duplicate_secret_keys(void)
+{
+    /* Diagnostics accepts (and must redact) duplicate secret-bearing keys:
+     * replacement acts on the exact child node, so EVERY duplicate value —
+     * not only the first key lookup match — is masked (review issue 6). */
+    const char *doc =
+        "{\"token\":\"first\",\"token\":\"second\","
+        "\"psk\":\"a\",\"psk\":\"b\",\"note\":\"visible\"}";
+
+    char out[512];
+    const size_t n = app_config_redact(doc, out, sizeof(out));
+
+    TEST_ASSERT_TRUE(n > 0U);
+    TEST_ASSERT_NULL(strstr(out, "first"));
+    TEST_ASSERT_NULL(strstr(out, "second"));
+    TEST_ASSERT_NULL(strstr(out, "\"a\""));
+    TEST_ASSERT_NULL(strstr(out, "\"b\""));
+    TEST_ASSERT_EQUAL_INT(4, count_occurrences(out, "[redacted]"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "visible"));
+}
+
 static void test_redact_handles_unparsable_input(void)
 {
     char out[64];
@@ -1077,6 +1110,469 @@ static void test_only_product_documents_are_managed(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* 8. Strict parsing: trailing garbage and concatenated documents         */
+/* --------------------------------------------------------------------- */
+
+static void test_trailing_garbage_json_is_rejected(void)
+{
+    /* Valid JSON followed by ANY trailing bytes is malformed: the parser
+     * must consume the entire input. */
+    static const char *const SUFFIXES[] = {
+        " garbage", " {}", "1", "\"str\"", "null", "}",
+    };
+
+    for (size_t i = 0U; i < (sizeof(SUFFIXES) / sizeof(SUFFIXES[0])); ++i)
+    {
+        char doc[512];
+        const int n = snprintf(doc, sizeof(doc), "%s%s", DEVICE_V1,
+                               SUFFIXES[i]);
+        TEST_ASSERT_TRUE((n > 0) && ((size_t)n < sizeof(doc)));
+
+        TEST_ASSERT_EQUAL_INT_MESSAGE(APP_CONFIG_ERR_MALFORMED,
+                                      app_config_validate_device_json(doc,
+                                                                      NULL),
+                                      SUFFIXES[i]);
+    }
+
+    char mfg_garbage[128];
+    (void)snprintf(mfg_garbage, sizeof(mfg_garbage), "%s x",
+                   MANUFACTURING_V1);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_validate_manufacturing_json(mfg_garbage,
+                                                                 NULL));
+
+    /* Through the storage path as well: a stored document with trailing
+     * garbage is rejected and never reported as loaded. */
+    char stored[512];
+    (void)snprintf(stored, sizeof(stored), "%s trailing", DEVICE_V1);
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH, stored));
+
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_load_device(&loaded));
+}
+
+static void test_concatenated_json_objects_are_rejected(void)
+{
+    /* A second concatenated object after a valid document is trailing
+     * garbage, not a parseable document. */
+    char doc[512];
+    (void)snprintf(doc, sizeof(doc), "%s%s", DEVICE_V1, DEVICE_V1);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_validate_device_json(doc, NULL));
+
+    (void)snprintf(doc, sizeof(doc), "%s%s", MANUFACTURING_V1,
+                   MANUFACTURING_V1);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_validate_manufacturing_json(doc, NULL));
+
+    /* Also rejected through the load path. */
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH, doc));
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_load_device(&loaded));
+}
+
+static void test_trailing_whitespace_is_still_accepted(void)
+{
+    /* Strict parsing requires the input to be fully consumed; trailing
+     * JSON whitespace is consumed too, so it is NOT garbage. */
+    char doc[512];
+    (void)snprintf(doc, sizeof(doc), "%s\n  \t", DEVICE_V1);
+    app_config_device_doc_t parsed;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK,
+                          app_config_validate_device_json(doc, &parsed));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000001", parsed.serial);
+
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH, doc));
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_load_device(&loaded));
+}
+
+static void test_trailing_garbage_live_document_is_recovered_from_good(void)
+{
+    /* A live document with trailing garbage is invalid content (like any
+     * other corruption): the validated last-known-good copy restores it. */
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Second commit creates the validated ".good" backup. */
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    char good[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good, sizeof(good)));
+    TEST_ASSERT_NOT_NULL(strstr(good, "KLC-2024-000001"));
+
+    char garbage[512];
+    (void)snprintf(garbage, sizeof(garbage), "%s GOTCHA", DEVICE_V1);
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH, garbage));
+
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK_RECOVERED,
+                          app_config_load_device(&loaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000001", loaded.serial);
+
+    /* The live file was repaired with the validated backup bytes. */
+    char live[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH, live,
+                                             sizeof(live)));
+    TEST_ASSERT_EQUAL_STRING(good, live);
+}
+
+/* --------------------------------------------------------------------- */
+/* 9. Error classification: missing vs. transiently unreadable            */
+/* --------------------------------------------------------------------- */
+
+static void test_json_nul_escape_is_rejected(void)
+{
+    /* An escaped NUL (\u0000) decodes to an embedded 0 byte inside the
+     * parsed string; strlen()-based validation would silently truncate
+     * there and accept "HQ\0suffix" as "HQ".  Such a document can never
+     * satisfy the printable-charset schemas, so it is malformed. */
+    char doc[512];
+    (void)snprintf(doc, sizeof(doc),
+                   "{\"schema_version\":1,"
+                   "\"product\":\"HQ\\u0000suffix\","
+                   "\"hardware_revision\":\"A\","
+                   "\"serial\":\"KLC-2024-000009\","
+                   "\"thingsboard_name\":\"klc-kitchen-09\"}");
+
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_validate_device_json(doc, NULL));
+
+    /* Also rejected through the storage/load path. */
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH, doc));
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_load_device(&loaded));
+
+    /* An escaped NUL inside a MEMBER NAME is rejected too. */
+    (void)snprintf(doc, sizeof(doc),
+                   "{\"schema_version\":1,\"product\\u0000x\":\"HQ\","
+                   "\"hardware_revision\":\"A\","
+                   "\"serial\":\"KLC-2024-000009\","
+                   "\"thingsboard_name\":\"klc-kitchen-09\"}");
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_validate_device_json(doc, NULL));
+}
+
+static void test_stored_embedded_nul_with_trailing_bytes_is_rejected(void)
+{
+    /* The round-5 HIGH storage defect: a stored file containing valid
+     * JSON, an embedded NUL, and further bytes must be rejected as a
+     * WHOLE.  The string-based validators would otherwise validate only
+     * the prefix before the NUL and silently accept the trailing bytes. */
+    char stored[600];
+    const int base = snprintf(stored, sizeof(stored), "%s", DEVICE_V1);
+    TEST_ASSERT_TRUE(base > 0);
+
+    /* Same document, then a NUL, then trailing garbage — as a raw file. */
+    const size_t nul_pos = (size_t)base;
+    stored[nul_pos] = '\0';
+    memcpy(&stored[nul_pos + 1U], "EVIL TRAILING BYTES", 19U);
+    const size_t stored_len = nul_pos + 1U + 19U;
+
+    TEST_ASSERT_TRUE(osal_file_mock_add_file_raw(APP_CONFIG_DEVICE_PATH,
+                                                 stored, stored_len));
+
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_load_device(&loaded));
+
+    /* The live file was never replaced and the recovery produced nothing
+     * (no valid backup exists in this scenario). */
+    TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".good"));
+}
+
+static void test_stat_success_then_open_failure_aborts_commit(void)
+{
+    /* The round-4 HIGH defect regression test: a stat-confirmed live file
+     * whose open fails is a TRANSIENT I/O error.  The commit must abort
+     * BEFORE the live rename — the live document is never skipped, never
+     * treated as absent, and never replaced while unreadable. */
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Produce a validated backup with a second commit. */
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Capture the live document and the backup AFTER the second commit. */
+    char live[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH, live,
+                                             sizeof(live)));
+    char good_before[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_before,
+                                             sizeof(good_before)));
+
+    /* Live file exists (stat succeeds) but cannot be opened right now. */
+    osal_file_mock_set_open_status(APP_CONFIG_DEVICE_PATH, OSAL_ERROR);
+
+    strncpy(doc.serial, "KLC-2024-000003", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_commit_device(&doc));
+
+    /* The live file and the last-known-good copy are exactly as before. */
+    char live_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH,
+                                             live_after,
+                                             sizeof(live_after)));
+    TEST_ASSERT_EQUAL_STRING(live, live_after);
+    TEST_ASSERT_NOT_NULL(strstr(live_after, "KLC-2024-000002"));
+
+    char good_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_after,
+                                             sizeof(good_after)));
+    TEST_ASSERT_EQUAL_STRING(good_before, good_after);
+
+    /* No staged temporary files survived the aborted commit. */
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".tmp"));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(
+        APP_CONFIG_DEVICE_PATH ".good.tmp"));
+
+    /* Clearing the transient fault makes the same commit succeed. */
+    osal_file_mock_set_open_status(APP_CONFIG_DEVICE_PATH, OSAL_SUCCESS);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_load_device(&loaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000003", loaded.serial);
+}
+
+static void test_unreadable_live_document_loads_as_io_not_recovered(void)
+{
+    /* An existing-but-unreadable live document surfaces APP_CONFIG_ERR_IO
+     * even when a valid backup exists: the load path must not silently
+     * proceed as if the live document were absent. */
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    osal_file_mock_set_open_status(APP_CONFIG_DEVICE_PATH, OSAL_ERROR);
+
+    app_config_device_doc_t loaded;
+    (void)memset(&loaded, 0xA5, sizeof(loaded));
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_load_device(&loaded));
+
+    /* Nothing was published: the caller's document is untouched. */
+    TEST_ASSERT_EQUAL_HEX8(0xA5, ((const unsigned char *)&loaded)[0]);
+
+    osal_file_mock_set_open_status(APP_CONFIG_DEVICE_PATH, OSAL_SUCCESS);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_load_device(&loaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000002", loaded.serial);
+}
+
+static void test_transient_stat_failure_is_io_not_not_found(void)
+{
+    /* The generic OSAL_ERROR is not a missing-file status: a transient
+     * stat failure on the live document is APP_CONFIG_ERR_IO, both with
+     * and without a backup present, and never an absence. */
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH,
+                                             DEVICE_V1));
+    TEST_ASSERT_TRUE(osal_file_mock_add_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             DEVICE_V1));
+
+    osal_file_mock_set_stat_status(OSAL_ERROR);
+
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_load_device(&loaded));
+
+    /* Both files are untouched. */
+    TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH));
+    TEST_ASSERT_TRUE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".good"));
+
+    /* Without any file present, a transient stat failure is still an I/O
+     * error, never a fabricated "recovered" state. */
+    osal_file_mock_set_stat_status(OSAL_ERROR);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO,
+                          app_config_load_device(&loaded));
+}
+
+static void test_missing_document_without_backup_is_not_found(void)
+{
+    /* Only the documented missing-file statuses classify as NOT_FOUND. */
+    app_config_device_doc_t doc;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_NOT_FOUND,
+                          app_config_load_device(&doc));
+
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_NOT_FOUND,
+                          app_config_migrate_stored(
+                              APP_CONFIG_DOC_DEVICE));
+}
+
+/* --------------------------------------------------------------------- */
+/* 10. Rename failure classification (live and last-known-good steps)     */
+/* --------------------------------------------------------------------- */
+
+static void test_rename_not_implemented_refuses_commit(void)
+{
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    char live[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH, live,
+                                             sizeof(live)));
+
+    /* The other "no rename support" OSAL status: same refusal. */
+    osal_file_mock_set_rename_status(OSAL_ERR_NOT_IMPLEMENTED);
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_UNSUPPORTED,
+                          app_config_commit_device(&doc));
+
+    char after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH, after,
+                                             sizeof(after)));
+    TEST_ASSERT_EQUAL_STRING(live, after);
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".tmp"));
+
+    /* A generic rename failure is IO, never UNSUPPORTED. */
+    osal_file_mock_set_rename_status(OSAL_ERR_FILE);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_commit_device(&doc));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".tmp"));
+}
+
+static void test_good_rename_io_failure_reports_io_and_preserves_backups(void)
+{
+    /* A generic (non-unsupported) rename failure during the LAST-KNOWN-GOOD
+     * promotion is APP_CONFIG_ERR_IO — not UNSUPPORTED — and leaves both
+     * the live file and the previous last-known-good copy intact. */
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    char live[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH, live,
+                                             sizeof(live)));
+
+    /* Second commit creates the validated ".good" copy (the 000001 doc),
+     * and moves the live document to 000002. */
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Capture BOTH files after the second commit: the live document now
+     * holds 000002, the last-known-good copy holds 000001. */
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH, live,
+                                             sizeof(live)));
+    char good_before[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_before,
+                                             sizeof(good_before)));
+    TEST_ASSERT_NOT_NULL(strstr(good_before, "KLC-2024-000001"));
+
+    /* Third commit: the LKG promotion rename fails with a transient
+     * storage error (one-shot, consumed by the first rename — which is the
+     * ".good" promotion). */
+    osal_file_mock_set_rename_status(OSAL_ERR_FILE);
+    strncpy(doc.serial, "KLC-2024-000003", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_commit_device(&doc));
+
+    /* Both backup copies preserved: the live document (000002) and the
+     * previous last-known-good copy (000001). */
+    char live_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH,
+                                             live_after, sizeof(live_after)));
+    TEST_ASSERT_EQUAL_STRING(live, live_after);
+    TEST_ASSERT_NOT_NULL(strstr(live_after, "KLC-2024-000002"));
+
+    char good_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_after, sizeof(good_after)));
+    TEST_ASSERT_EQUAL_STRING(good_before, good_after);
+
+    /* Staged temporary files were removed. */
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".tmp"));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(
+        APP_CONFIG_DEVICE_PATH ".good.tmp"));
+
+    /* Without the fault the commit succeeds normally. */
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_load_device(&loaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000003", loaded.serial);
+}
+
+static void test_live_rename_failure_after_good_promotion_preserves_both(void)
+{
+    /* Regression test for the round-5 HIGH defect: the commit sequence is
+     * transactional — the previous last-known-good copy is preserved at
+     * "<live>.good.old" until the LIVE promotion is known to have
+     * succeeded.  A live-rename failure after the .good promotion must
+     * atomically restore the previous ".good" so that BOTH the live file
+     * and the previous last-known-good copy remain byte-for-byte intact. */
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Second commit creates the validated ".good" copy (000001) and moves
+     * the live document to 000002. */
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Capture BOTH files after the second commit: live = 000002,
+     * .good = 000001. */
+    char live_before[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH,
+                                             live_before,
+                                             sizeof(live_before)));
+    char good_before[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_before,
+                                             sizeof(good_before)));
+    TEST_ASSERT_NOT_NULL(strstr(good_before, "KLC-2024-000001"));
+    TEST_ASSERT_NOT_NULL(strstr(live_before, "KLC-2024-000002"));
+
+    /* Third commit: the LIVE promotion rename fails with a transient
+     * storage error.  The ".good" promotion has already succeeded at that
+     * point, so the previous backup lives at ".good.old" and must be
+     * restored before the commit reports APP_CONFIG_ERR_IO. */
+    osal_file_mock_set_rename_status(OSAL_ERR_FILE);
+    strncpy(doc.serial, "KLC-2024-000003", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_IO, app_config_commit_device(&doc));
+
+    /* The live file is byte-for-byte the pre-commit document. */
+    char live_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH,
+                                             live_after, sizeof(live_after)));
+    TEST_ASSERT_EQUAL_STRING(live_before, live_after);
+
+    /* The previous last-known-good copy was restored byte-for-byte: the
+     * failed commit did NOT lose it when the promotion succeeded. */
+    char good_after[512];
+    TEST_ASSERT_TRUE(osal_file_mock_get_file(APP_CONFIG_DEVICE_PATH ".good",
+                                             good_after, sizeof(good_after)));
+    TEST_ASSERT_EQUAL_STRING(good_before, good_after);
+    TEST_ASSERT_NOT_NULL(strstr(good_after, "KLC-2024-000001"));
+
+    /* Staged temporary files were removed (the ".good.old" restore is
+     * best-effort; a leftover there is a valid — if stale — recovery
+     * source the load path still accepts). */
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(APP_CONFIG_DEVICE_PATH ".tmp"));
+    TEST_ASSERT_FALSE(osal_file_mock_has_file(
+        APP_CONFIG_DEVICE_PATH ".good.tmp"));
+
+    /* Both surviving files still validate. */
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK,
+                          app_config_validate_device_json(live_after, NULL));
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK,
+                          app_config_validate_device_json(good_after, NULL));
+
+    /* Without the fault the same commit succeeds. */
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_load_device(&loaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000003", loaded.serial);
+}
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
 
@@ -1133,11 +1629,31 @@ int main(void)
 
     /* 6. Redaction */
     RUN_TEST(test_redact_masks_secret_values);
+    RUN_TEST(test_redact_duplicate_secret_keys);
     RUN_TEST(test_redact_replaces_whole_secret_values);
     RUN_TEST(test_redact_handles_unparsable_input);
 
     /* 7. No lamp state */
     RUN_TEST(test_only_product_documents_are_managed);
+
+    /* 8. Strict parsing (trailing garbage / concatenated documents) */
+    RUN_TEST(test_trailing_garbage_json_is_rejected);
+    RUN_TEST(test_concatenated_json_objects_are_rejected);
+    RUN_TEST(test_trailing_whitespace_is_still_accepted);
+    RUN_TEST(test_trailing_garbage_live_document_is_recovered_from_good);
+    RUN_TEST(test_json_nul_escape_is_rejected);
+    RUN_TEST(test_stored_embedded_nul_with_trailing_bytes_is_rejected);
+
+    /* 9. Missing vs. transiently unreadable classification */
+    RUN_TEST(test_stat_success_then_open_failure_aborts_commit);
+    RUN_TEST(test_unreadable_live_document_loads_as_io_not_recovered);
+    RUN_TEST(test_transient_stat_failure_is_io_not_not_found);
+    RUN_TEST(test_missing_document_without_backup_is_not_found);
+
+    /* 10. Rename failure classification */
+    RUN_TEST(test_rename_not_implemented_refuses_commit);
+    RUN_TEST(test_good_rename_io_failure_reports_io_and_preserves_backups);
+    RUN_TEST(test_live_rename_failure_after_good_promotion_preserves_both);
 
     return UNITY_END();
 }

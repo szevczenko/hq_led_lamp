@@ -365,6 +365,40 @@ static void test_lfs_oversized_field_is_rejected(void)
                           app_config_load_device(&loaded));
 }
 
+static void test_lfs_trailing_garbage_is_rejected(void)
+{
+    app_config_device_doc_t doc;
+    fill_device_doc(&doc);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* Produce a validated backup with a second commit. */
+    strncpy(doc.serial, "KLC-2024-000002", sizeof(doc.serial) - 1U);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_commit_device(&doc));
+
+    /* A valid JSON object followed by trailing garbage must be rejected:
+     * the parser has to consume the ENTIRE stored document. */
+    char garbage[512];
+    (void)snprintf(garbage, sizeof(garbage), "%s trailing-garbage",
+                   DEVICE_V1);
+    TEST_ASSERT_TRUE(write_raw(APP_CONFIG_DEVICE_PATH, garbage,
+                               strlen(garbage)));
+
+    app_config_device_doc_t loaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK_RECOVERED,
+                          app_config_load_device(&loaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000001", loaded.serial);
+
+    /* The live file was repaired and loads cleanly. */
+    app_config_device_doc_t reloaded;
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_OK, app_config_load_device(&reloaded));
+    TEST_ASSERT_EQUAL_STRING("KLC-2024-000001", reloaded.serial);
+
+    /* Concatenated documents are trailing garbage too. */
+    (void)snprintf(garbage, sizeof(garbage), "%s%s", DEVICE_V1, DEVICE_V1);
+    TEST_ASSERT_EQUAL_INT(APP_CONFIG_ERR_MALFORMED,
+                          app_config_validate_device_json(garbage, NULL));
+}
+
 /* --------------------------------------------------------------------- */
 /* Entry point                                                            */
 /* --------------------------------------------------------------------- */
@@ -377,6 +411,7 @@ int main(void)
     RUN_TEST(test_lfs_second_commit_refreshes_last_known_good);
     RUN_TEST(test_lfs_truncated_live_document_is_rejected);
     RUN_TEST(test_lfs_stale_interrupted_temporary_file_is_ignored);
+    RUN_TEST(test_lfs_trailing_garbage_is_rejected);
     RUN_TEST(test_lfs_recovery_from_last_known_good);
     RUN_TEST(test_lfs_failed_recovery_leaves_doc_untouched);
     RUN_TEST(test_lfs_corrupt_backup_is_never_promoted);

@@ -33,27 +33,50 @@
  *   1. validate the document against the bounded schema,
  *   2. serialize it and write it to `<live>.tmp` (temporary data),
  *   3. flush/close the temporary file (osal_close is the durability point),
- *   4. read the temporary file back and re-validate it; any mismatch or
- *      parse failure aborts and removes the temporary file — the live file
- *      is never touched by an aborted commit,
- *   5. if a live file exists and validates, stage the last-known-good copy
- *      safely: copy it to `<live>.good.tmp`, read the staging copy back and
- *      validate it, then atomically replace `<live>.good` with it.  Any
- *      staging, validation or replacement failure leaves the previous
- *      `<live>.good` untouched (last-known-good),
- *   6. atomically replace the live file with the temporary file
- *      (osal_rename).  When the OSAL backend does not support rename
- *      (OSAL_ERR_OPERATION_NOT_SUPPORTED / OSAL_ERR_NOT_IMPLEMENTED), the
- *      commit is refused with APP_CONFIG_ERR_UNSUPPORTED and the live file
- *      (and its last-known-good copy) remain unchanged: a copy-then-remove
- *      fallback could truncate a valid document if interrupted, so a
- *      non-atomic replacement path is never used.
+ *   4. read the temporary file back and re-validate it (length-aware: a
+ *      stored buffer containing an embedded NUL byte or any other trailing
+ *      content is rejected, so exactly one JSON document per file is
+ *      enforced); any mismatch or parse failure aborts and removes the
+ *      temporary file — the live file is never touched by an aborted
+ *      commit,
+ *   5. if a live file exists and validates, refresh the last-known-good
+ *      copy with a transactional two-promotion sequence:
+ *        a. copy `<live>` to `<live>.good.tmp`, read the staging copy back
+ *           and validate it,
+ *        b. atomically move the previous `<live>.good` to
+ *           `<live>.good.old` (preserving it until the live promotion is
+ *           known to succeed),
+ *        c. atomically replace `<live>.good` with the staged copy,
+ *        d. atomically replace the live file with `<live>.tmp`.
+ *      If step (d) fails, the previous `<live>.good` is atomically
+ *      restored from `<live>.good.old`: a failed commit leaves BOTH the
+ *      previous live document and its previous last-known-good copy
+ *      intact.  A staging or validation failure aborts before the previous
+ *      `<live>.good` is ever touched.
+ *   6. on success remove `<live>.good.old`.  When the OSAL backend does
+ *      not support rename (OSAL_ERR_OPERATION_NOT_SUPPORTED /
+ *      OSAL_ERR_NOT_IMPLEMENTED), EVERY promotion step — the live file and
+ *      the last-known-good copy alike — is refused with
+ *      APP_CONFIG_ERR_UNSUPPORTED and nothing is modified: a
+ *      copy-then-remove fallback could truncate a valid document if
+ *      interrupted, so a non-atomic replacement path is never used.
+ *      Rename failures other than "not supported / not implemented" are
+ *      reported as APP_CONFIG_ERR_IO.
  *
  * On load (app_config_load_*), a missing or invalid live document is
- * recovered from `<live>.good`; recovery uses only a validated backup, and
+ * recovered from `<live>.good` (or from a `<live>.good.old` preserved by
+ * an interrupted commit when the former is unusable); recovery uses only a
+ * validated backup, and
  * the recovered content is re-committed through the safe path before
  * APP_CONFIG_OK_RECOVERED is reported.  If both copies are unusable the
- * error is reported and no fabricated data is ever returned.
+ * error is reported and no fabricated data is ever returned.  Error
+ * classification is phased: APP_CONFIG_ERR_NOT_FOUND is reported ONLY when
+ * the initial osal_stat() reports the document missing.  Once stat()
+ * succeeds the document exists — a subsequent open/read failure is a
+ * transient condition and surfaces APP_CONFIG_ERR_IO, both on load (which
+ * then does NOT silently fall back to the backup) and in the commit path
+ * (which aborts BEFORE the live rename instead of replacing a document it
+ * could not read).
  *
  * Schema versioning
  * -----------------
