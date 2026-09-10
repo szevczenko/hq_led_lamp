@@ -1,8 +1,8 @@
 /**
  * @file tb_application_test.c
  * @brief Host mock tests for the ThingsBoard application logic: desired-
- *        state synchronizer (TASK-112) and server-side RPC control
- *        (TASK-113)
+ *        state synchronizer (TASK-112), server-side RPC control (TASK-113)
+ *        and telemetry / health reporting (TASK-114)
  *
  * Runs the production components/tb_application code against the REAL
  * platform ThingsBoard client/attributes/RPC sources (tb_client.c,
@@ -66,6 +66,22 @@
  *     error response — never a success response — and leaves the applied
  *     state unchanged,
  *   - getState reports the desired and applied state.
+ *
+ * Coverage per the TASK-114 definition of done (telemetry & health):
+ *   - one full documented seven-field record is published on connect, on
+ *     every successful state change (sync response, shared update, RPC set)
+ *     and periodically while connected,
+ *   - `pwm_duty` reports the APPLIED duty derived from the applied state
+ *     (e.g. 55 % -> 5500/10000, off -> 0), not the requested brightness
+ *     alone,
+ *   - periodic telemetry is rate-limited to telemetry_period_ms: fast polls
+ *     and polls before the boundary never publish, exactly one publish
+ *     happens at the boundary and the next one needs another full period,
+ *   - telemetry is fully suppressed while disconnected (no queue, no retry,
+ *     reconnect publishes exactly the connect record),
+ *   - secrets never leak: hostile config values (paths, JSON quotes,
+ *     certificates, tokens) are sanitized to the safe charset, the payload
+ *     carries exactly the seven documented fields and the JSON stays valid.
  */
 
 #include <stdio.h>
@@ -145,6 +161,13 @@ static tb_application_config_t make_app_config(uint32_t sync_timeout_ms,
     cfg.retry_max_delay_ms = 4000u;
     cfg.max_retries = max_retries;
     cfg.now_ms = test_now_ms;
+
+    /* TASK-114 telemetry & health reporting configuration: a short, fixed
+     * periodic interval for deterministic rate-limit tests and the
+     * documented identity strings carried in every record. */
+    cfg.telemetry_period_ms = 30000u;
+    cfg.fw_version = "0.0.0-test";
+    cfg.hardware = "esp32-wroom-32d";
     return cfg;
 }
 
@@ -275,6 +298,16 @@ static int request_publish_count(void)
 #define RPC_REQUEST_TOPIC_PREFIX  "v1/devices/me/rpc/request/"
 #define RPC_RESPONSE_TOPIC_PREFIX "v1/devices/me/rpc/response/"
 #define TELEMETRY_TOPIC           "v1/devices/me/telemetry"
+
+/**
+ * @brief Telemetry publishes produced by rpc_sync_state() (TASK-114).
+ *
+ * The shared helper connects (connect trigger -> 1 publish) and applies a
+ * complete valid state (successful change -> 1 publish), so exactly two
+ * telemetry records exist after it returns.  The RPC-specific assertions
+ * below use this constant for "no ADDITIONAL telemetry from the RPC".
+ */
+#define TELEMETRY_AFTER_SYNC 2
 
 /** @brief Deliver a server RPC request for @p request_id. */
 static void deliver_rpc(uint32_t request_id, const char *method,
@@ -1100,7 +1133,7 @@ static void test_rpc_set_brightness_valid(void)
     TEST_ASSERT_TRUE(lamp_mock_applied_power());
     TEST_ASSERT_EQUAL_UINT(42u, lamp_mock_applied_brightness());
     TEST_ASSERT_EQUAL_INT(1, rpc_response_count(2u));
-    TEST_ASSERT_EQUAL_INT(1, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC + 1, telemetry_publish_count());
 
     response = rpc_assert_success(2u);
     desired = cJSON_GetObjectItemCaseSensitive(response, "desired");
@@ -1137,7 +1170,7 @@ static void test_rpc_set_state_valid(void)
     TEST_ASSERT_FALSE(lamp_mock_applied_power());
     TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_applied_brightness());
     TEST_ASSERT_EQUAL_INT(1, rpc_response_count(3u));
-    TEST_ASSERT_EQUAL_INT(1, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC + 1, telemetry_publish_count());
 
     response = rpc_assert_success(3u);
     desired = cJSON_GetObjectItemCaseSensitive(response, "desired");
@@ -1170,7 +1203,7 @@ static void test_rpc_get_state_valid(void)
 
     TEST_ASSERT_EQUAL_INT(1, rpc_response_count(4u));
     TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
 
     response = rpc_assert_success(4u);
     desired = cJSON_GetObjectItemCaseSensitive(response, "desired");
@@ -1204,7 +1237,7 @@ static void test_rpc_malformed_payload_dropped(void)
     TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
     TEST_ASSERT_TRUE(lamp_mock_applied_power());
     TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
 }
 
 /**
@@ -1230,7 +1263,7 @@ static void test_rpc_missing_field_rejected(void)
     TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
     TEST_ASSERT_TRUE(lamp_mock_applied_power());
     TEST_ASSERT_EQUAL_UINT(77u, lamp_mock_applied_brightness());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
 }
 
 /**
@@ -1260,7 +1293,7 @@ static void test_rpc_wrong_type_rejected(void)
     TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
     TEST_ASSERT_TRUE(lamp_mock_applied_power());
     TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
 }
 
 /**
@@ -1290,7 +1323,7 @@ static void test_rpc_brightness_out_of_range_rejected(void)
     TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
     TEST_ASSERT_TRUE(lamp_mock_applied_power());
     TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
 }
 
 /**
@@ -1310,7 +1343,7 @@ static void test_rpc_unknown_method_rejected(void)
 
     TEST_ASSERT_EQUAL_INT(1, rpc_response_count(17u));
     TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
 
     response = rpc_parse_response(17u);
     TEST_ASSERT_NOT_NULL(response);
@@ -1358,7 +1391,7 @@ static void test_rpc_method_and_payload_bounds_rejected(void)
     TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
     TEST_ASSERT_TRUE(lamp_mock_applied_power());
     TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
 }
 
 /**
@@ -1382,7 +1415,7 @@ static void test_rpc_hardware_failure_rejected(void)
     deliver_rpc(20u, "setPower", "{\"power\":false}");
     TEST_ASSERT_EQUAL_INT(1, rpc_response_count(20u));
     TEST_ASSERT_EQUAL_UINT(2u, lamp_mock_apply_calls());
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
     rpc_assert_error(20u, "hardware failure", NULL);
 
     /* Hardware applied state unchanged (sync state preserved). */
@@ -1398,7 +1431,7 @@ static void test_rpc_hardware_failure_rejected(void)
     /* A second method class fails the same way. */
     deliver_rpc(21u, "setBrightness", "{\"brightness\":0}");
     TEST_ASSERT_EQUAL_INT(1, rpc_response_count(21u));
-    TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
     rpc_assert_error(21u, "hardware failure", NULL);
     TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
 }
@@ -1421,7 +1454,277 @@ static void test_rpc_disconnected_dropped(void)
     deliver_rpc(22u, "setPower", "{\"power\":false}");
     TEST_ASSERT_EQUAL_INT(0, rpc_response_count(22u));
     TEST_ASSERT_EQUAL_UINT(apply_before, lamp_mock_apply_calls());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
+}
+
+/* --------------------------------------------------------------------- */
+/* Telemetry and health reporting (TASK-114)                               */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Assert a telemetry record carries the documented fields with their
+ *        documented JSON types and values.
+ */
+static void telemetry_assert_shape(const cJSON *telemetry)
+{
+    cJSON *power_item =
+        cJSON_GetObjectItemCaseSensitive(telemetry, "power");
+    cJSON *brightness_item =
+        cJSON_GetObjectItemCaseSensitive(telemetry, "brightness");
+    cJSON *duty_item =
+        cJSON_GetObjectItemCaseSensitive(telemetry, "pwm_duty");
+    cJSON *state_item =
+        cJSON_GetObjectItemCaseSensitive(telemetry, "connection_state");
+    cJSON *fw_item =
+        cJSON_GetObjectItemCaseSensitive(telemetry, "fw_version");
+    cJSON *hw_item =
+        cJSON_GetObjectItemCaseSensitive(telemetry, "hardware");
+    cJSON *uptime_item =
+        cJSON_GetObjectItemCaseSensitive(telemetry, "uptime_ms");
+
+    TEST_ASSERT_TRUE(cJSON_IsBool(power_item));
+    TEST_ASSERT_TRUE(cJSON_IsNumber(brightness_item));
+    TEST_ASSERT_TRUE(cJSON_IsNumber(duty_item));
+    TEST_ASSERT_TRUE(cJSON_IsString(state_item));
+    TEST_ASSERT_EQUAL_STRING(TB_APPLICATION_CONNECTION_STATE_ONLINE,
+                             state_item->valuestring);
+    TEST_ASSERT_TRUE(cJSON_IsString(fw_item));
+    TEST_ASSERT_TRUE(cJSON_IsString(hw_item));
+    TEST_ASSERT_TRUE(cJSON_IsNumber(uptime_item));
+    TEST_ASSERT_TRUE(uptime_item->valueint >= 0);
+}
+
+/**
+ * @brief Assert a telemetry record contains EXACTLY the seven documented
+ *        fields — no extra members, so no secret/credential/diagnostic dump
+ *        can ever be smuggled into the payload.
+ */
+static void telemetry_assert_only_documented_fields(const cJSON *telemetry)
+{
+    static const char *keys[] = {
+        "power", "brightness", "pwm_duty", "connection_state",
+        "fw_version", "hardware", "uptime_ms",
+    };
+    const cJSON *child;
+    int count = 0;
+
+    TEST_ASSERT_TRUE(cJSON_IsObject(telemetry));
+    for (child = telemetry->child; child != NULL; child = child->next)
+    {
+        count++;
+    }
+    TEST_ASSERT_EQUAL_INT(7, count);
+    for (int i = 0; i < 7; i++)
+    {
+        TEST_ASSERT_NOT_NULL(
+            cJSON_GetObjectItemCaseSensitive(telemetry, keys[i]));
+    }
+}
+
+/**
+ * Connect trigger: a fresh connection publishes exactly one health record
+ * carrying the full documented shape.  Nothing was applied yet, so the
+ * record reports the safe electrical-off state and the configured
+ * firmware/hardware identity.
+ */
+static void test_telemetry_published_on_connect(void)
+{
+    cJSON *telemetry;
+    cJSON *uptime;
+
+    app_init(10000u);
     TEST_ASSERT_EQUAL_INT(0, telemetry_publish_count());
+
+    connect_client();
+
+    TEST_ASSERT_EQUAL_INT(1, telemetry_publish_count());
+    TEST_ASSERT_NOT_NULL(latest_telemetry_message());
+    telemetry = cJSON_Parse(latest_telemetry_message());
+    TEST_ASSERT_NOT_NULL(telemetry);
+    telemetry_assert_shape(telemetry);
+    telemetry_assert_only_documented_fields(telemetry);
+
+    TEST_ASSERT_FALSE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(telemetry, "power")));
+    TEST_ASSERT_EQUAL_INT(0, cJSON_GetObjectItemCaseSensitive(
+                                  telemetry, "brightness")->valueint);
+    TEST_ASSERT_EQUAL_INT(0, cJSON_GetObjectItemCaseSensitive(
+                                  telemetry, "pwm_duty")->valueint);
+    TEST_ASSERT_EQUAL_STRING("0.0.0-test",
+        cJSON_GetObjectItemCaseSensitive(telemetry, "fw_version")->valuestring);
+    TEST_ASSERT_EQUAL_STRING("esp32-wroom-32d",
+        cJSON_GetObjectItemCaseSensitive(telemetry, "hardware")->valuestring);
+    uptime = cJSON_GetObjectItemCaseSensitive(telemetry, "uptime_ms");
+    TEST_ASSERT_TRUE(cJSON_IsNumber(uptime));
+    cJSON_Delete(telemetry);
+}
+
+/**
+ * Successful state-change trigger: synchronization (attribute response and
+ * shared update paths) publishes the record again with the APPLIED state,
+ * including the applied PWM duty derived from the applied brightness — not
+ * the requested value alone.  `power=true, brightness=55` -> duty 5500;
+ * `power=false, brightness=0` -> duty 0 (electrical off).
+ */
+static void test_telemetry_published_on_sync_change(void)
+{
+    cJSON *telemetry;
+
+    app_init(10000u);
+    connect_client();
+    TEST_ASSERT_EQUAL_INT(1, telemetry_publish_count());
+
+    deliver_response(last_request_id(),
+                     "{\"shared\":{\"power\":true,\"brightness\":55}}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_INT(2, telemetry_publish_count());
+
+    telemetry = cJSON_Parse(latest_telemetry_message());
+    TEST_ASSERT_NOT_NULL(telemetry);
+    telemetry_assert_shape(telemetry);
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(telemetry, "power")));
+    TEST_ASSERT_EQUAL_INT(55, cJSON_GetObjectItemCaseSensitive(
+                                  telemetry, "brightness")->valueint);
+    TEST_ASSERT_EQUAL_INT(5500, cJSON_GetObjectItemCaseSensitive(
+                                    telemetry, "pwm_duty")->valueint);
+    cJSON_Delete(telemetry);
+
+    /* A shared-attribute update is also a successful change: applied off
+     * state publishes pwm_duty 0 while power=false. */
+    deliver_update("{\"power\":false,\"brightness\":0}");
+    TEST_ASSERT_EQUAL_INT(3, telemetry_publish_count());
+    telemetry = cJSON_Parse(latest_telemetry_message());
+    TEST_ASSERT_NOT_NULL(telemetry);
+    telemetry_assert_shape(telemetry);
+    TEST_ASSERT_FALSE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(telemetry, "power")));
+    TEST_ASSERT_EQUAL_INT(0, cJSON_GetObjectItemCaseSensitive(
+                                  telemetry, "brightness")->valueint);
+    TEST_ASSERT_EQUAL_INT(0, cJSON_GetObjectItemCaseSensitive(
+                                  telemetry, "pwm_duty")->valueint);
+    cJSON_Delete(telemetry);
+}
+
+/**
+ * Periodic trigger + rate limit: while connected, poll() only publishes one
+ * record per telemetry_period_ms.  Fast polling and polls just before the
+ * boundary never add publishes; exactly one periodic publish happens at the
+ * boundary and the next one needs another full period.
+ */
+static void test_telemetry_periodic_rate_limit(void)
+{
+    app_init(10000u);
+    connect_client();
+    deliver_response(last_request_id(),
+                     "{\"shared\":{\"power\":true,\"brightness\":30}}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_INT(2, telemetry_publish_count()); /* connect + change */
+
+    /* Fast polling well inside the period: still rate limited. */
+    for (int i = 0; i < 50; i++)
+    {
+        tb_application_poll(s_client);
+    }
+    TEST_ASSERT_EQUAL_INT(2, telemetry_publish_count());
+
+    /* One ms before the boundary: still suppressed. */
+    advance_ms(29999u);
+    tb_application_poll(s_client);
+    TEST_ASSERT_EQUAL_INT(2, telemetry_publish_count());
+
+    /* At the boundary exactly one periodic publish fires. */
+    advance_ms(1u);
+    tb_application_poll(s_client);
+    TEST_ASSERT_EQUAL_INT(3, telemetry_publish_count());
+    TEST_ASSERT_NOT_NULL(latest_telemetry_message());
+
+    /* The next publish requires another full period. */
+    tb_application_poll(s_client);
+    TEST_ASSERT_EQUAL_INT(3, telemetry_publish_count());
+    advance_ms(30000u);
+    tb_application_poll(s_client);
+    TEST_ASSERT_EQUAL_INT(4, telemetry_publish_count());
+}
+
+/**
+ * Disconnection suppression: while the transport is down no telemetry is
+ * published at all — even after the periodic interval elapses and the
+ * application loop polls repeatedly.  Nothing is queued or retried.
+ * Reconnecting publishes exactly the connect-time record.
+ */
+static void test_telemetry_suppressed_while_disconnected(void)
+{
+    app_init(10000u);
+    connect_client();
+    deliver_response(last_request_id(),
+                     "{\"shared\":{\"power\":true,\"brightness\":30}}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_INT(2, telemetry_publish_count());
+
+    mqtt_app_mock_simulate_remote_disconnect();
+    TEST_ASSERT_FALSE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_TRUE(lamp_mock_force_inactive_calls() >= 1u);
+
+    /* Far past the period + repeated polling: fully suppressed. */
+    advance_ms(30000u);
+    for (int i = 0; i < 10; i++)
+    {
+        tb_application_poll(s_client);
+    }
+    TEST_ASSERT_EQUAL_INT(2, telemetry_publish_count());
+
+    /* Reconnect publishes the connect-time record again. */
+    mqtt_app_mock_simulate_connect();
+    TEST_ASSERT_EQUAL_INT(3, telemetry_publish_count());
+}
+
+/**
+ * Secrecy: hostile configuration values (path fragments, JSON quotes,
+ * certificate text and token-like strings) never reach a published record
+ * and never break the JSON framing.  The module keeps only the safe-charset
+ * prefix of each value, and the payload carries exactly the seven documented
+ * fields.
+ */
+static void test_telemetry_excludes_secrets_and_unsafe_strings(void)
+{
+    tb_application_config_t cfg;
+    cJSON *telemetry;
+    cJSON *fw_item;
+    cJSON *hw_item;
+    const char *raw;
+
+    cfg = make_app_config(10000u, 5u);
+    cfg.fw_version = "1.2.3\"/config/identity.json";
+    cfg.hardware = "esp32-wroom-32d BEGIN CERTIFICATE";
+    app_init_cfg(&cfg);
+    connect_client();
+
+    TEST_ASSERT_EQUAL_INT(1, telemetry_publish_count());
+    raw = latest_telemetry_message();
+    TEST_ASSERT_NOT_NULL(raw);
+
+    /* No secret fragments, no paths, no certificate payloads, no tokens. */
+    TEST_ASSERT_NULL(strstr(raw, "/config"));
+    TEST_ASSERT_NULL(strstr(raw, "identity"));
+    TEST_ASSERT_NULL(strstr(raw, "BEGIN"));
+    TEST_ASSERT_NULL(strstr(raw, "test_token"));
+    TEST_ASSERT_NULL(strstr(raw, "password"));
+
+    /* The payload still parses as one clean object with exactly the seven
+     * documented fields and only the safe-charset prefixes of the values. */
+    telemetry = cJSON_Parse(raw);
+    TEST_ASSERT_NOT_NULL(telemetry);
+    telemetry_assert_shape(telemetry);
+    telemetry_assert_only_documented_fields(telemetry);
+
+    fw_item = cJSON_GetObjectItemCaseSensitive(telemetry, "fw_version");
+    TEST_ASSERT_TRUE(cJSON_IsString(fw_item));
+    TEST_ASSERT_EQUAL_STRING("1.2.3", fw_item->valuestring);
+    hw_item = cJSON_GetObjectItemCaseSensitive(telemetry, "hardware");
+    TEST_ASSERT_TRUE(cJSON_IsString(hw_item));
+    TEST_ASSERT_EQUAL_STRING("esp32-wroom-32d", hw_item->valuestring);
+    cJSON_Delete(telemetry);
 }
 
 /* --------------------------------------------------------------------- */
@@ -1460,5 +1763,10 @@ int main(void)
     RUN_TEST(test_rpc_method_and_payload_bounds_rejected);
     RUN_TEST(test_rpc_hardware_failure_rejected);
     RUN_TEST(test_rpc_disconnected_dropped);
+    RUN_TEST(test_telemetry_published_on_connect);
+    RUN_TEST(test_telemetry_published_on_sync_change);
+    RUN_TEST(test_telemetry_periodic_rate_limit);
+    RUN_TEST(test_telemetry_suppressed_while_disconnected);
+    RUN_TEST(test_telemetry_excludes_secrets_and_unsafe_strings);
     return UNITY_END();
 }

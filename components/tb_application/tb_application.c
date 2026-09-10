@@ -1,7 +1,8 @@
 /**
  * @file tb_application.c
  * @brief ThingsBoard application logic: desired-state synchronization
- *        (TASK-112) and server-side RPC control (TASK-113)
+ *        (TASK-112), server-side RPC control (TASK-113) and telemetry /
+ *        health reporting (TASK-114)
  *
  * See tb_application.h for the normative contract.  Implementation notes:
  *
@@ -34,6 +35,15 @@
  *     response, publishes telemetry only after a successful change and
  *     returns structured success/error JSON.  RPC never writes shared
  *     attributes (transient control channel),
+ *   - telemetry and health reporting (TASK-114): the documented seven-field
+ *     record is published on connect, on every successful state change
+ *     (synchronization apply, shared update apply, valid RPC set) and
+ *     periodically while connected.  Records are serialized into a bounded
+ *     stack buffer (TB_APPLICATION_TELEMETRY_MAX_BYTES) with a conservative
+ *     safe charset for the two config strings and the PWM duty read from
+ *     the applied lamp state.  Every publish is suppressed at the source
+ *     while disconnected (no queue, no retry) and the periodic publish is
+ *     rate-limited to telemetry_period_ms by a last-publish timestamp,
  *   - lock discipline: all module state is guarded by one OSAL mutex.
  *     Transport calls (subscribe/request) are always issued with the lock
  *     released, because the platform can invoke the response callback
@@ -49,6 +59,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -124,6 +135,12 @@ typedef struct tb_app_module {
     /* Last applied complete valid state (for telemetry/reporting). */
     lamp_state_t       applied;
     bool               has_applied;
+
+    /* Telemetry / health reporting (TASK-114). */
+    uint32_t           telemetry_period_ms; /**< Bounded periodic interval (0 = default). */
+    char               fw_version[TB_APPLICATION_FW_VERSION_MAX_LEN + 1u]; /**< Safe-charset copy. */
+    char               hardware[TB_APPLICATION_HARDWARE_MAX_LEN + 1u];     /**< Safe-charset copy. */
+    uint32_t           last_telemetry_ms;  /**< Last telemetry publish time (rate limit). */
 } tb_app_module_t;
 
 static tb_app_module_t s_tb;
@@ -170,6 +187,144 @@ static uint32_t tb_app_clamp(uint32_t value, uint32_t min_value,
 }
 
 /**
+ * @brief Is @p c a telemetry-safe character?
+ *
+ * The conservative `[A-Za-z0-9._+-]` charset is the only text ever allowed
+ * into a telemetry publish: it structurally excludes JSON framing characters
+ * (`"`, `\`), whitespace/control bytes and path separators (`/`, `:`), so a
+ * misconfigured config string can never smuggle a secret path, a quote or a
+ * whole token into the JSON payload.
+ */
+static bool tb_app_telemetry_safe_char(char c)
+{
+    if (((c >= 'a') && (c <= 'z')) || ((c >= 'A') && (c <= 'Z')) ||
+        ((c >= '0') && (c <= '9')) || (c == '.') || (c == '-') ||
+        (c == '_') || (c == '+'))
+    {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Copy a configuration string into module storage, bounded and
+ *        filtered to the telemetry-safe charset.
+ *
+ * The copy stops at the first unsafe byte and never exceeds
+ * @p dst_size - 1 characters, so the destination is always NUL-terminated
+ * and the stored value can be emitted into JSON verbatim.
+ *
+ * @param[in]  src      Source string (may be NULL = empty).
+ * @param[out] dst      Destination buffer (must be non-NULL).
+ * @param[in]  dst_size Destination size in bytes (must be > 0).
+ */
+static void tb_app_copy_telemetry_string(const char *src, char *dst,
+                                         size_t dst_size)
+{
+    size_t i = 0u;
+
+    if ((dst == NULL) || (dst_size == 0u))
+    {
+        return;
+    }
+    if (src != NULL)
+    {
+        while (((i + 1u) < dst_size) && (src[i] != '\0'))
+        {
+            if (!tb_app_telemetry_safe_char(src[i]))
+            {
+                break; /* Unsafe byte: drop the rest of the value. */
+            }
+            dst[i] = src[i];
+            i++;
+        }
+    }
+    dst[i] = '\0';
+}
+
+/**
+ * @brief Publish the documented health telemetry record (TASK-114).
+ *
+ * Called with the module lock held.  Serializes the seven documented fields
+ * into a bounded stack buffer and hands the payload to the platform
+ * telemetry transport:
+ *
+ *   - `power` / `brightness` / `pwm_duty` are read from the state actually
+ *     applied to the PWM output (lamp_control_get_applied_state()); the duty
+ *     is the applied fixed-point duty in #LAMP_DUTY_SCALE units, never the
+ *     requested brightness alone,
+ *   - `connection_state` is the documented "online" literal — publication is
+ *     suppressed entirely while disconnected, so this record can only ever
+ *     be published online,
+ *   - `fw_version` / `hardware` are the safe-charset, bounded config copies,
+ *   - `uptime_ms` is the OSAL monotonic clock (ms since boot).
+ *
+ * Suppression contract: while the transport is disconnected (or before
+ * init/deinit) the publish returns immediately and nothing is queued,
+ * buffered or retried, so a disconnect can never grow an unbounded queue.
+ * A serialization overflow (impossible for the documented bounds unless
+ * the module state is corrupted) is logged and the publish is suppressed
+ * rather than emitting truncated JSON.  On every publish attempt the
+ * last-publish timestamp is advanced so the poll()-driven periodic publish
+ * stays rate-limited to `telemetry_period_ms`.
+ */
+static void tb_app_publish_telemetry(void)
+{
+    lamp_applied_state_t applied;
+    lamp_duty_t duty = LAMP_DUTY_MIN;
+    char buf[TB_APPLICATION_TELEMETRY_MAX_BYTES];
+    int n;
+    const uint32_t now = tb_app_now_ms();
+
+    /* Suppress while disconnected: never queue, never publish. */
+    if (!s_tb.initialized || !tb_app_is_connected())
+    {
+        return;
+    }
+
+    memset(&applied, 0, sizeof(applied));
+    if (lamp_control_get_applied_state(&applied) != LAMP_OK)
+    {
+        /* No applied state (e.g. lamp not initialized): report the safe
+         * electrical-off record (zeros). */
+        memset(&applied, 0, sizeof(applied));
+        applied.power = false;
+        applied.brightness_percent = 0u;
+        applied.output_active = false;
+    }
+    if (applied.output_active)
+    {
+        (void)lamp_duty_from_brightness(applied.brightness_percent, &duty);
+    }
+
+    n = snprintf(buf, sizeof(buf),
+                 "{\"power\":%s,\"brightness\":%u,\"pwm_duty\":%u,"
+                 "\"connection_state\":\"%s\",\"fw_version\":\"%s\","
+                 "\"hardware\":\"%s\",\"uptime_ms\":%u}",
+                 applied.power ? "true" : "false",
+                 (unsigned)applied.brightness_percent,
+                 (unsigned)duty,
+                 TB_APPLICATION_CONNECTION_STATE_ONLINE,
+                 s_tb.fw_version,
+                 s_tb.hardware,
+                 (unsigned)osal_task_get_time_ms());
+    if ((n < 0) || ((size_t)n >= sizeof(buf)))
+    {
+        osal_log_error("[tb_app] telemetry serialization overflow; "
+                       "publish suppressed");
+        s_tb.last_telemetry_ms = now;
+        return;
+    }
+
+    if (tb_telemetry_send_json(s_tb.client, buf) != 0)
+    {
+        /* Best-effort: report and keep the periodic cadence. */
+        osal_log_warning("[tb_app] telemetry publish failed");
+    }
+    s_tb.last_telemetry_ms = now;
+}
+
+/**
  * @brief Force the lamp output inactive (fail-off).
  *
  * Idempotent and safe on every rejection path.  The lamp-control fail-off
@@ -210,6 +365,9 @@ static lamp_status_t tb_app_apply_state(const lamp_state_t *desired)
                       "power=%s brightness=%u",
                       desired->power ? "on" : "off",
                       (unsigned)desired->brightness_percent);
+        /* Successful state change: publish the applied-state telemetry.  The
+         * lock is held here (both sync callbacks call us under the lock). */
+        tb_app_publish_telemetry();
     }
     else
     {
@@ -759,41 +917,6 @@ static void tb_app_rpc_respond_error(uint32_t request_id, const char *error,
 }
 
 /**
- * @brief Publish `power`/`brightness` telemetry after a successful change.
- *
- * Called only on the success path of a set* RPC: telemetry is published
- * exclusively after a hardware change succeeded, never for invalid
- * requests, hardware failures or getState.  Best-effort: a publish failure
- * only logs a warning (the RPC itself already succeeded).
- */
-static void tb_app_rpc_publish_telemetry(const lamp_state_t *desired)
-{
-    cJSON *root;
-    char *json;
-
-    root = cJSON_CreateObject();
-    if (root == NULL)
-    {
-        return;
-    }
-    cJSON_AddBoolToObject(root, "power", desired->power);
-    cJSON_AddNumberToObject(root, "brightness",
-                            (double)desired->brightness_percent);
-
-    json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (json == NULL)
-    {
-        return;
-    }
-    if (tb_telemetry_send_json(s_tb.client, json) != 0)
-    {
-        osal_log_warning("[tb_app] RPC change telemetry publish failed");
-    }
-    cJSON_free(json);
-}
-
-/**
  * @brief Apply a validated RPC desired state and report the outcome.
  *
  * The hardware is applied BEFORE any response: a success response is only
@@ -807,6 +930,13 @@ static void tb_app_rpc_publish_telemetry(const lamp_state_t *desired)
  * and must never re-enable the output behind the synchronizer's fail-off
  * — while the barrier is latched the apply is rejected with
  * #LAMP_ERR_BLOCKED_BY_FAIL_OFF and reported as a hardware failure.
+ *
+ * Telemetry (TASK-114): a successful RPC set is a successful state change,
+ * so the full documented health record is published after the success
+ * response — never for invalid requests, hardware failures or getState.
+ * The record is built by tb_app_publish_telemetry() from the applied lamp
+ * state and carries `pwm_duty`, identity and uptime like every other
+ * publish.
  */
 static void tb_app_rpc_apply_and_respond(uint32_t request_id,
                                          const lamp_state_t *desired)
@@ -828,7 +958,7 @@ static void tb_app_rpc_apply_and_respond(uint32_t request_id,
     s_tb.has_applied = true;
 
     tb_app_rpc_respond_success(request_id, desired, &applied);
-    tb_app_rpc_publish_telemetry(desired);
+    tb_app_publish_telemetry();
 }
 
 /**
@@ -1250,6 +1380,16 @@ tb_application_status_t tb_application_init(
                            ? TB_APPLICATION_MAX_RETRIES_DEFAULT
                            : config->max_retries;
     s_tb.now_fn = config->now_ms;
+    s_tb.telemetry_period_ms =
+        tb_app_clamp((config->telemetry_period_ms == 0u)
+                         ? TB_APPLICATION_TELEMETRY_PERIOD_DEFAULT_MS
+                         : config->telemetry_period_ms,
+                     TB_APPLICATION_TELEMETRY_PERIOD_MIN_MS,
+                     TB_APPLICATION_TELEMETRY_PERIOD_MAX_MS);
+    tb_app_copy_telemetry_string(config->fw_version, s_tb.fw_version,
+                                 sizeof(s_tb.fw_version));
+    tb_app_copy_telemetry_string(config->hardware, s_tb.hardware,
+                                 sizeof(s_tb.hardware));
 
     s_tb.connected = false;
     s_tb.state = TB_APP_STATE_INACTIVE;
@@ -1263,6 +1403,7 @@ tb_application_status_t tb_application_init(
     memset(&s_tb.request_token, 0, sizeof(s_tb.request_token));
     memset(&s_tb.applied, 0, sizeof(s_tb.applied));
     s_tb.has_applied = false;
+    s_tb.last_telemetry_ms = 0u;
 
     s_tb.initialized = true;
     osal_mutex_give(s_tb.lock);
@@ -1315,6 +1456,12 @@ void tb_application_on_connected(tb_client_t *client)
     s_tb.backoff_delay_ms = 0u;
     s_tb.connected = true;
     tb_app_start_attempt();
+
+    /* Connect trigger (TASK-114): publish the health telemetry record right
+     * away.  The lamp output is still off (fresh fail-off until a complete
+     * valid state arrives), which is exactly what the record reports.  This
+     * runs with the lock held like every other telemetry publish. */
+    tb_app_publish_telemetry();
     osal_mutex_give(s_tb.lock);
 
     tb_app_run_transport();
@@ -1388,6 +1535,17 @@ void tb_application_poll(tb_client_t *client)
     {
         tb_app_start_attempt();
         run_attempt = true;
+    }
+
+    /* Periodic health telemetry (TASK-114): while connected, publish at most
+     * once per telemetry_period_ms.  Every successful publish (connect and
+     * change triggers included) advances the last-publish timestamp, so a
+     * burst of changes or a fast poll loop can never produce more than one
+     * periodic publish per period.  Disconnected suppression is enforced by
+     * the early return above (state == INACTIVE or transport down). */
+    if ((uint32_t)(now - s_tb.last_telemetry_ms) >= s_tb.telemetry_period_ms)
+    {
+        tb_app_publish_telemetry();
     }
     osal_mutex_give(s_tb.lock);
 

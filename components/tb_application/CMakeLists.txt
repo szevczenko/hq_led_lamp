@@ -1,5 +1,6 @@
 # tb_application — ThingsBoard desired-state synchronization application
-# logic (TASK-112)
+# logic (TASK-112), server-side RPC control (TASK-113) and telemetry/health
+# reporting (TASK-114)
 #
 # ESP-IDF component registration.  The component owns the product policy
 # "shared attributes power/brightness are authoritative": on every
@@ -10,7 +11,10 @@
 # complete valid states, rejects partial/duplicate/stale/late data and
 # re-synchronizes with bounded retry/backoff after reconnect.  Every
 # rejection path and every disconnect forces the lamp output inactive
-# (fail-off).
+# (fail-off).  It also arms the server-side RPC control surface and
+# publishes the documented health telemetry record on connect, on every
+# successful state change and periodically (rate-limited and suppressed
+# while disconnected, serialized with a bounded buffer and secret-free).
 #
 # Dependency policy:
 #   - `thingsboard` (the platform ThingsBoard client/attributes primitives)

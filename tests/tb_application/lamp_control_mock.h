@@ -1,7 +1,7 @@
 /**
  * @file lamp_control_mock.h
  * @brief Test-only lamp-control double for tb_application host tests
- *        (TASK-112 / TASK-113)
+ *        (TASK-112 / TASK-113 / TASK-114)
  *
  * The application module's lamp surface is:
  *
@@ -12,8 +12,10 @@
  *   - lamp_control_release_fail_off()— the module clears its own latched
  *     barrier immediately before applying,
  *   - lamp_control_get_applied_state()— read back the applied hardware
- *     state (used by the server-RPC getState handler and as the unchanged
- *     base for single-field set methods).
+ *     state (used by the server-RPC getState handler, as the unchanged
+ *     base for single-field set methods, and by TASK-114 telemetry),
+ *   - lamp_duty_from_brightness()    — applied PWM duty conversion for the
+ *     `pwm_duty` telemetry field (TASK-114).
  *
  * The double records every call in that order and exposes the last applied
  * state so tests can assert "no output is enabled before valid complete

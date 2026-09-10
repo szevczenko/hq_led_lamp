@@ -1,12 +1,13 @@
-# tb_application host mock tests (TASK-112)
+# tb_application host mock tests (TASK-112 / TASK-113 / TASK-114)
 #
 # Standalone POSIX host test project for the ThingsBoard desired-state
 # synchronizer (components/tb_application).  It compiles the production
 # component together with the REAL platform ThingsBoard client/attributes
-# sources (tb_client.c, tb_attributes.c, ...) against the platform's own
-# mqtt_app test double (platform/hq_platform/tests/thingsboard/mqtt_app_mock.c)
-# — exactly the harness the platform's own tb_tests use — plus a lamp-control
-# double (lamp_control_mock.c) and the Unity framework.
+# RPC/telemetry sources (tb_client.c, tb_attributes.c, tb_rpc.c,
+# tb_telemetry.c, ...) against the platform's own mqtt_app test double
+# (platform/hq_platform/tests/thingsboard/mqtt_app_mock.c) — exactly the
+# harness the platform's own tb_tests use — plus a lamp-control double
+# (lamp_control_mock.c) and the Unity framework.
 #
 # The mqtt_app double supports deterministic message delivery and lifecycle
 # simulation:
@@ -33,6 +34,18 @@
 #     fresh session and ThingsBoard stays authoritative after reconnect,
 #   - bounded retry budget exhaustion parks the module (output off) until the
 #     next reconnect.
+#
+# Coverage per the TASK-113 definition of done: the four documented RPC
+# methods apply in order (hardware first, then success response, then
+# telemetry), invalid/malformed/unknown/oversized requests are rejected with
+# structured errors, and hardware failures never report success.
+#
+# Coverage per the TASK-114 definition of done: the documented seven-field
+# telemetry record is published on connect, on every successful state change
+# and periodically with rate limiting; `pwm_duty` reflects the applied PWM
+# duty; publication is suppressed while disconnected; and the serialized
+# payload never carries secrets (hostile config strings are sanitized to the
+# safe charset, exactly seven fields, valid JSON framing).
 #
 # Usage:
 #   cmake -S tests/tb_application -B <build-dir> -DCMAKE_BUILD_TYPE=Debug   (see top-level scripts)

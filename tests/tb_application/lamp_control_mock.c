@@ -1,12 +1,12 @@
 /**
  * @file lamp_control_mock.c
  * @brief Test-only lamp-control double for tb_application host tests
- *        (TASK-112 / TASK-113) — see lamp_control_mock.h.
+ *        (TASK-112 / TASK-113 / TASK-114) — see lamp_control_mock.h.
  *
- * Only the four functions the application module uses are implemented; they
- * are the exact extern symbols the production component references, so
- * linking this double INSTEAD of the real lamp_control component satisfies
- * every reference in tb_application.c without pulling in the HAL.
+ * Only the functions the application module uses are implemented; they are
+ * the exact extern symbols the production component references, so linking
+ * this double INSTEAD of the real lamp_control component satisfies every
+ * reference in tb_application.c without pulling in the HAL.
  */
 
 #include "lamp_control_mock.h"
@@ -125,5 +125,30 @@ lamp_status_t lamp_control_get_applied_state(lamp_applied_state_t *applied_out)
 lamp_status_t lamp_control_release_fail_off(void)
 {
     ++s_release_calls;
+    return LAMP_OK;
+}
+
+lamp_status_t lamp_duty_from_brightness(uint8_t brightness_percent,
+                                        lamp_duty_t *duty_out)
+{
+    uint64_t scaled;
+
+    if (duty_out == NULL)
+    {
+        return LAMP_ERR_INVALID_ARGUMENT;
+    }
+    if (brightness_percent > LAMP_BRIGHTNESS_MAX)
+    {
+        return LAMP_ERR_OUT_OF_RANGE;
+    }
+
+    /* Mirrors the real lamp-control duty conversion (overflow-safe, scaled
+     * in units of 1/100 %): 0..100 % -> 0..LAMP_DUTY_MAX. */
+    scaled = (uint64_t)brightness_percent * (uint64_t)LAMP_DUTY_SCALE;
+    if (scaled > (uint64_t)LAMP_DUTY_MAX)
+    {
+        return LAMP_ERR_OUT_OF_RANGE;
+    }
+    *duty_out = (lamp_duty_t)scaled;
     return LAMP_OK;
 }

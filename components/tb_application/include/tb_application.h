@@ -1,7 +1,8 @@
 /**
  * @file tb_application.h
  * @brief ThingsBoard application logic: desired-state synchronization
- *        (TASK-112) and server-side RPC control (TASK-113)
+ *        (TASK-112), server-side RPC control (TASK-113) and telemetry /
+ *        health reporting (TASK-114)
  *
  * Normative public API of the product-owned ThingsBoard application
  * component.  Shared attributes `power` and `brightness` are authoritative
@@ -132,6 +133,51 @@
  * duplicate detection) stays consistent across both control channels; the
  * next shared-attribute update remains authoritative afterwards.
  *
+ * Telemetry and health reporting (TASK-114)
+ * ------------------------------------------
+ * The module publishes the documented health telemetry record
+ * (production plan section 8.3) on three triggers:
+ *
+ *   1. every successful connection (immediately from on_connected()),
+ *   2. every successful state change (synchronization apply, shared-attribute
+ *      update apply, or a valid server-RPC set that changed the hardware),
+ *   3. periodically while connected, rate-limited to at most one publish per
+ *      #TB_APPLICATION_TELEMETRY_PERIOD_DEFAULT_MS-like interval
+ *      (`telemetry_period_ms`; CONFIG_KLC_TELEMETRY_PERIOD_MS).
+ *
+ * Every record carries exactly the documented fields:
+ *
+ *     {
+ *       "power": <bool>,              // applied power
+ *       "brightness": <0..100>,       // applied brightness percent
+ *       "pwm_duty": <0..10000>,       // applied PWM duty (LAMP_DUTY_SCALE units)
+ *       "connection_state": "online",
+ *       "fw_version": "<bounded>",    // config::fw_version (safe charset)
+ *       "hardware": "<bounded>",      // config::hardware (safe charset)
+ *       "uptime_ms": <uint32>         // OSAL monotonic uptime at publish
+ *     }
+ *
+ * `pwm_duty` is derived from the state actually applied to the PWM output
+ * (lamp_control_get_applied_state()), never from the requested brightness
+ * alone.  All records are serialized with a bounded stack buffer
+ * (#TB_APPLICATION_TELEMETRY_MAX_BYTES); a serialization overflow suppresses
+ * the publish instead of emitting truncated JSON.
+ *
+ * Secrecy and disconnection:
+ *   - telemetry NEVER carries tokens, passwords, provisioning secrets,
+ *     certificates, keys, or file paths.  The module only publishes the
+ *     seven fields above; the two config strings are truncated to their
+ *     documented bounds and filtered to a conservative `[A-Za-z0-9._+-]`
+ *     charset before being copied into module storage, so a misconfigured
+ *     value containing `/`, quotes, whitespace or control characters cannot
+ *     leak a path or break the JSON framing,
+ *   - while the transport is disconnected every publication is suppressed
+ *     at the source: no telemetry is queued, buffered or retried, so a
+ *     disconnect can never build an unbounded publish queue,
+ *   - periodic telemetry is additionally rate-limited by
+ *     `telemetry_period_ms`: repeated poll() calls (and change/connect
+ *     events) cannot cause more than one publish per period.
+ *
  * Host testability
  * ----------------
  * The module speaks only the portable OSAL clock/mutex/log surface, cJSON,
@@ -206,6 +252,39 @@ typedef struct tb_client tb_client_t;
  */
 #define TB_APPLICATION_RPC_PARAMS_MAX_LEN TB_APPLICATION_MAX_PAYLOAD_BYTES
 
+/** @brief Default periodic health telemetry interval (ms); matches the
+ *         product Kconfig default (CONFIG_KLC_TELEMETRY_PERIOD_MS). */
+#define TB_APPLICATION_TELEMETRY_PERIOD_DEFAULT_MS 30000u
+
+/** @brief Bounded periodic telemetry interval limits (ms). */
+#define TB_APPLICATION_TELEMETRY_PERIOD_MIN_MS     1000u
+#define TB_APPLICATION_TELEMETRY_PERIOD_MAX_MS     3600000u
+
+/**
+ * @brief Maximum firmware/build version string length (excluding the NUL
+ *        terminator) accepted in configuration and reported in telemetry.
+ */
+#define TB_APPLICATION_FW_VERSION_MAX_LEN 32u
+
+/**
+ * @brief Maximum hardware-target string length (excluding the NUL
+ *        terminator) accepted in configuration and reported in telemetry.
+ */
+#define TB_APPLICATION_HARDWARE_MAX_LEN 32u
+
+/**
+ * @brief Bounded telemetry serialization buffer size (bytes).
+ *
+ * Every telemetry publish is serialized into a fixed stack buffer of this
+ * size (never an unbounded heap print) and truncated-safe: an overflow is
+ * reported and the publish is suppressed instead of emitting malformed JSON.
+ */
+#define TB_APPLICATION_TELEMETRY_MAX_BYTES 512u
+
+/** @brief Documented `connection_state` value of every published telemetry
+ *         record (publication is suppressed while disconnected). */
+#define TB_APPLICATION_CONNECTION_STATE_ONLINE "online"
+
 /* --------------------------------------------------------------------- */
 /* Status type                                                            */
 /* --------------------------------------------------------------------- */
@@ -249,6 +328,30 @@ typedef struct tb_application_config {
     uint32_t     retry_max_delay_ms;              /**< Backoff cap; 0 = default. */
     uint32_t     max_retries;                     /**< Consecutive failed attempts per session; 0 = default. */
     tb_application_now_fn_t now_ms;               /**< Clock provider; NULL = OSAL monotonic clock. */
+
+    /**
+     * @brief Periodic health telemetry interval (ms); 0 = default
+     *        (#TB_APPLICATION_TELEMETRY_PERIOD_DEFAULT_MS, matching
+     *        CONFIG_KLC_TELEMETRY_PERIOD_MS).  Bounded to
+     *        #TB_APPLICATION_TELEMETRY_PERIOD_MIN_MS ..
+     *        #TB_APPLICATION_TELEMETRY_PERIOD_MAX_MS.
+     */
+    uint32_t     telemetry_period_ms;
+    /**
+     * @brief Firmware/build version reported in telemetry as `fw_version`
+     *        (may be NULL/empty).  Copied bounded to
+     *        #TB_APPLICATION_FW_VERSION_MAX_LEN characters and filtered to
+     *        the safe telemetry charset, so it can never smuggle JSON,
+     *        paths or secrets into a publish.
+     */
+    const char  *fw_version;
+    /**
+     * @brief Hardware target reported in telemetry as `hardware` (may be
+     *        NULL/empty).  Copied bounded to
+     *        #TB_APPLICATION_HARDWARE_MAX_LEN characters and filtered to the
+     *        safe telemetry charset, exactly like @p fw_version.
+     */
+    const char  *hardware;
 } tb_application_config_t;
 
 /* --------------------------------------------------------------------- */
