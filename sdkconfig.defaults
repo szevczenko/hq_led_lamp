@@ -12,3 +12,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Wi-Fi HTTP provisioning (TASK-126): the product-owned provisioning adapter
+# (components/wifi_provisioning_manager) builds the platform provisioning
+# portal (HTTP portal + captive DNS on the shared Mongoose process) into the
+# image.  The platform's automatic fallback controller is deliberately NOT
+# enabled: the product owns the "start provisioning when no saved credential
+# exists" decision through the adapter's has-saved-credentials query.
+CONFIG_WIFI_HTTP_PROVISIONING=y
+# CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK is not set

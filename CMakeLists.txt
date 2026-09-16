@@ -10,6 +10,7 @@ set(EXTRA_COMPONENT_DIRS
     ${HQ_REPO_ROOT}/src/thingsboard
     ${HQ_REPO_ROOT}/src/mongoose
     ${HQ_REPO_ROOT}/src/wifi
+    ${HQ_REPO_ROOT}/src/wifi_provisioning
     ${CMAKE_CURRENT_LIST_DIR}/components
 )
 
