@@ -660,6 +660,75 @@ static void test_provisioning_legal_entry_and_exit(void)
     TEST_ASSERT_EQUAL(session_network, app_state_session());
 }
 
+static void test_supervisor_sequence_fresh_device_provisions_then_tls(void)
+{
+    /* Supervisor-side event sequence for the fresh-device boot path (TASK-127):
+     * NETWORK -> PROVISIONING -> NETWORK -> TLS.  This is exactly the event
+     * stream app_main's NETWORK/PROVISIONING gates deliver: no saved
+     * credential, so NETWORK enters PROVISIONING on PROVISIONING_STARTED; the
+     * portal captures a credential and PROVISIONING_SUCCEEDED returns to
+     * NETWORK, which now sees the saved credential and passes the station to
+     * TLS. */
+    boot_to_filesystem();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+
+    /* Fresh device: no saved station credential -> NETWORK -> PROVISIONING. */
+    uint32_t session_before = app_state_session();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+    TEST_ASSERT_FALSE(app_state_is_online());
+
+    /* Portal succeeded -> PROVISIONING -> NETWORK (credential saved). */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                          APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+
+    /* The now-credentialed station connects -> NETWORK -> TLS.  Provisioning
+     * is NOT re-entered. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_CONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_TLS, app_state_current());
+    TEST_ASSERT_FALSE(app_state_is_online());
+
+    /* The provisioning round-trip does not bump the session (same episode). */
+    TEST_ASSERT_EQUAL(session_before, app_state_session());
+}
+
+static void test_supervisor_sequence_credentialed_device_connects_directly(void)
+{
+    /* Supervisor-side event sequence for the credentialed boot path (TASK-127):
+     * a device with a saved station credential must boot exactly as before —
+     * NETWORK goes DIRECTLY to TLS on NETWORK_CONNECTED, with no provisioning
+     * round-trip at all. */
+    boot_to_filesystem();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+
+    uint32_t session_before = app_state_session();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_CONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_TLS, app_state_current());
+    TEST_ASSERT_FALSE(app_state_is_online());
+    TEST_ASSERT_EQUAL(session_before, app_state_session());
+
+    /* From TLS the credentialed device proceeds through the remaining gates
+     * to ONLINE without any provisioning involvement. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_TLS_CONNECTED, APP_OWNER_MQTT));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_SYNC_COMPLETE, APP_OWNER_THINGSBOARD));
+    TEST_ASSERT_TRUE(app_state_is_online());
+}
+
 static void test_provisioning_failure_degrades_and_retries_network(void)
 {
     boot_to_filesystem();
@@ -1504,8 +1573,10 @@ int main(void)
     RUN_TEST(test_fatal_from_any_state);
     RUN_TEST(test_lamp_failoff_failure_does_not_wedge);
 
-    /* 3b. Provisioning gate (TASK-125) */
+    /* 3b. Provisioning gate (TASK-125/127) */
     RUN_TEST(test_provisioning_legal_entry_and_exit);
+    RUN_TEST(test_supervisor_sequence_fresh_device_provisions_then_tls);
+    RUN_TEST(test_supervisor_sequence_credentialed_device_connects_directly);
     RUN_TEST(test_provisioning_failure_degrades_and_retries_network);
     RUN_TEST(test_provisioning_started_illegal_from_every_other_state);
     RUN_TEST(test_provisioning_retry_exhaustion_parks_in_safe_off);

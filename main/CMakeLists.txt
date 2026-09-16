@@ -10,10 +10,23 @@
 #      any ThingsBoard initialization,
 #   6. Wi-Fi onboarding and the ThingsBoard gates (TASK-109/110/111) behind
 #      the machine's NETWORK/TLS states (the consumed
-#      network_manager_is_connected() gate loop).
+#      network_manager_is_connected() gate loop),
+#   6b. Wi-Fi provisioning (TASK-127) sits between the Wi-Fi gate and TLS,
+#      entered ONLY when no saved station credential exists: the machine
+#      delivers PROVISIONING_STARTED, the supervisor runs the provisioning
+#      portal (wifi_provisioning_manager, HTTP + captive DNS on the shared
+#      Mongoose process) until the station connects, keeps the AP up for a
+#      bounded success-grace interval (CONFIG_KLC_PROVISIONING_GRACE_MS),
+#      stops the portal and delivers PROVISIONING_SUCCEEDED back to the
+#      NETWORK gate.  A credentialed device never enters provisioning — it
+#      passes the NETWORK gate straight to TLS.  ThingsBoard STILL never
+#      starts before a verified network connection: provisioning only ever
+#      hands control back to the NETWORK gate, never past it.
 #
-# `app_state` supplies the state machine and `osal` the supervisor's
-# sleep cadence (osal_task_delay_ms).  Kconfig-derived values
+# `app_state` supplies the state machine, `osal` the supervisor's
+# sleep cadence (osal_task_delay_ms), and `wifi_provisioning_manager` +
+# `mongoose` the provisioning portal and the shared Mongoose process that
+# hosts its listeners (and later MQTT/TLS).  Kconfig-derived values
 # (CONFIG_KLC_LED_PWM_GPIO etc.) come from the IDF-generated sdkconfig.h,
 # which is on every component's include path.
 
@@ -21,5 +34,5 @@ idf_component_register(
     SRCS "app_main.c"
     INCLUDE_DIRS "."
     REQUIRES lamp_control lamp_fs app_config network_manager mqtt_cfg
-             device_identity app_state osal
+             device_identity app_state osal wifi_provisioning_manager mongoose
 )

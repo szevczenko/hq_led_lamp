@@ -91,4 +91,21 @@ menu "Kitchen LED Controller"
             is also published on connect and on every state change. This value
             is not a credential or token.
 
+    config KLC_PROVISIONING_GRACE_MS
+        int "Wi-Fi provisioning success grace interval (ms)"
+        range 0 30000
+        default 2000
+        help
+            Bounded interval the temporary provisioning access point (AP) and
+            its HTTP/DNS listeners are kept up after the station obtains a
+            connection, before the portal is stopped automatically and the
+            boot chain continues to the TLS gate.  Mirrors the platform
+            controller's grace/retire pattern: keep the AP up briefly so the
+            freshly provisioned station settles, then retire the portal
+            (listeners closed; the shared Mongoose process and MQTT/TLS stay
+            untouched).  A value of 0 stops the portal immediately on station
+            connect.  Provisioning failures never retry within this window:
+            a failure always parks the machine degraded with the existing
+            bounded backoff.
+
 endmenu
