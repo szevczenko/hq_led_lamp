@@ -8,7 +8,8 @@ One explicit owner for the application lifecycle.  The component turns the
 required boot sequence
 
     boot -> safe-off -> filesystem -> configuration -> Wi-Fi
-         -> verified MQTT/TLS -> state sync -> online
+         -> provisioning (only when no saved credential) -> verified MQTT/TLS
+         -> state sync -> online
 
 and every error path into a single state machine with:
 
@@ -27,16 +28,19 @@ and every error path into a single state machine with:
 
 ## States
 
-`BOOT`, `FILESYSTEM`, `CONFIGURATION`, `NETWORK`, `TLS`, `SYNC`, `ONLINE`,
-`SAFE_OFF` (degraded), `FATAL`, `OTA`.  The only path into `ONLINE` requires
-successful filesystem + configuration + Wi-Fi + verified TLS +
-synchronization.  OTA completion returns to `BOOT`; every error path
-converges on `SAFE_OFF`/`FATAL` with the output off.
+`BOOT`, `FILESYSTEM`, `CONFIGURATION`, `NETWORK`, `PROVISIONING`, `TLS`,
+`SYNC`, `ONLINE`, `SAFE_OFF` (degraded), `FATAL`, `OTA`.  The only path into
+`ONLINE` requires successful filesystem + configuration + Wi-Fi (+ Wi-Fi
+provisioning when no saved station credential exists — a device with saved
+credentials passes straight through) + verified TLS + synchronization.  OTA
+completion returns to `BOOT`; every error path converges on
+`SAFE_OFF`/`FATAL` with the output off.
 
 ## Events and owners
 
 FS results (`APP_EVENT_FS_OK/FAIL`), config results, network
-connected/disconnected, verified-TLS connected/failed, sync
+connected/disconnected, provisioning started/succeeded/failed (when no
+saved credential exists), verified-TLS connected/failed, sync
 complete/failed/invalid-state, transport disconnect, OTA begin/end/failed,
 external reset and fatal reports.  See `include/app_state.h` for the full
 transition table and per-transition owners; the module validates the owner
@@ -45,12 +49,13 @@ of every delivery and drops (and counts) mismatches.
 ## Retry / backoff
 
 Recoverable failures park in `SAFE_OFF` and schedule a retry back to the
-exact failed stage (network, TLS or sync).  Default schedule: 2 s first
-delay, exponential 2x growth, 30 s cap, at most 5 retries per recovery
-episode; the budget resets when `ONLINE` is reached again.  Exhaustion parks
-the machine silently — no retry storm is possible.  Non-retryable failures
-(filesystem, configuration, OTA) park degraded until an explicit
-reset/provisioning/OTA action.
+exact failed stage — network (also after a provisioning failure, since the
+provisioning adapter is owned by the network stage), TLS or sync.  Default
+schedule: 2 s first delay, exponential 2x growth, 30 s cap, at most 5
+retries per recovery episode; the budget resets when `ONLINE` is reached
+again.  Exhaustion parks the machine silently — no retry storm is possible.
+Non-retryable failures (filesystem, configuration, OTA) park degraded until
+an explicit reset/provisioning/OTA action.
 
 ## Watchdog
 

@@ -11,11 +11,15 @@
  *
  * Coverage per the TASK-115 definition of done:
  *   - every failure transition (filesystem, configuration, Wi-Fi/timeout,
- *     TLS, sync, invalid state, disconnect, OTA) forces the lamp output
- *     inactive — the fail-off invariant is asserted by exact
+ *     provisioning, TLS, sync, invalid state, disconnect, OTA) forces the
+ *     lamp output inactive — the fail-off invariant is asserted by exact
  *     force-inactive call counts on every non-online entry,
  *   - online is reachable ONLY through all five gates (filesystem,
- *     configuration, Wi-Fi, verified TLS, synchronization),
+ *     configuration, Wi-Fi, verified TLS, synchronization), with the
+ *     optional provisioning gate (TASK-125) between Wi-Fi and TLS: entered
+ *     only from NETWORK on PROVISIONING_STARTED when no saved credential
+ *     exists, returning to NETWORK on SUCCEEDED or degrading to SAFE_OFF on
+ *     FAILED (same bounded retry budget as NETWORK failures),
  *   - the reconnect loop (disconnect -> bounded backoff -> re-gate ->
  *     online) converges and resets the retry budget on each online entry,
  *   - retry is bounded and cannot produce connection storms: exponential
@@ -609,6 +613,347 @@ static void test_lamp_failoff_failure_does_not_wedge(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* 3b. Provisioning gate (TASK-125)                                       */
+/* --------------------------------------------------------------------- */
+
+static void test_provisioning_legal_entry_and_exit(void)
+{
+    /* NETWORK -> PROVISIONING on PROVISIONING_STARTED (no saved station
+     * credential); PROVISIONING is a non-online state so the entry forces
+     * the output inactive and does not bump the session. */
+    boot_to_filesystem();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+
+    uint32_t session_network = app_state_session();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+    TEST_ASSERT_FALSE(app_state_is_online());
+    TEST_ASSERT_EQUAL(4u, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL(session_network, app_state_session());
+
+    /* PROVISIONING -> NETWORK on PROVISIONING_SUCCEEDED (credential
+     * saved; the station may now connect).  Re-entering NETWORK fails off
+     * again (non-online entry), still no session bump. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                          APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_EQUAL(5u, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL(session_network, app_state_session());
+
+    /* The device now connects with the saved credential and passes
+     * straight through the remaining gates to ONLINE — provisioning is
+     * NOT re-entered. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_CONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_TLS, app_state_current());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_TLS_CONNECTED, APP_OWNER_MQTT));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_SYNC_COMPLETE, APP_OWNER_THINGSBOARD));
+    TEST_ASSERT_TRUE(app_state_is_online());
+    TEST_ASSERT_EQUAL(session_network, app_state_session());
+}
+
+static void test_provisioning_failure_degrades_and_retries_network(void)
+{
+    boot_to_filesystem();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_FAILED, APP_OWNER_NETWORK));
+
+    /* Same fail-off + budget semantics as NETWORK failures. */
+    TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
+    TEST_ASSERT_FALSE(app_state_is_online());
+    TEST_ASSERT_EQUAL(5u, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_TRUE(app_state_retry_pending());
+    TEST_ASSERT_EQUAL(APP_STATE_RETRY_INITIAL_DELAY_DEFAULT_MS,
+                      app_state_retry_delay_ms());
+    TEST_ASSERT_EQUAL(0u, app_state_retry_attempts_used());
+
+    /* The bounded retry re-enters NETWORK (the stage that owns the
+     * provisioning adapter), never PROVISIONING directly. */
+    s_now_ms = APP_STATE_RETRY_INITIAL_DELAY_DEFAULT_MS;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_EQUAL(1u, app_state_retry_attempts_used());
+
+    /* A later attempt may save a credential: the device can then connect
+     * straight through to TLS without provisioning again. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_CONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_TLS, app_state_current());
+}
+
+static void test_provisioning_started_illegal_from_every_other_state(void)
+{
+    /* PROVISIONING may ONLY be entered from NETWORK on
+     * PROVISIONING_STARTED (owner NETWORK).  Walk the machine through
+     * every other state and assert the event is rejected (dropped and
+     * counted) with no transition. */
+    s_now_ms = 0u;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, init_with_wdt(30000u));
+
+    /* BOOT (before start). */
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_BOOT, app_state_current());
+
+    /* FILESYSTEM. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_start());
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_FILESYSTEM, app_state_current());
+
+    /* CONFIGURATION. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_CONFIGURATION, app_state_current());
+
+    /* NETWORK is the ONLY legal source: enter provisioning (legal), then
+     * a redundant STARTED while already provisioning is illegal. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                          APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+
+    /* TLS (saved-credential path). */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_CONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_TLS, app_state_current());
+
+    /* SYNC. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_TLS_CONNECTED, APP_OWNER_MQTT));
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_SYNC, app_state_current());
+
+    /* ONLINE. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_SYNC_COMPLETE, APP_OWNER_THINGSBOARD));
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_ONLINE, app_state_current());
+
+    /* SAFE_OFF (via disconnect). */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_DISCONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
+
+    /* OTA (from SAFE_OFF). */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_OTA_BEGIN, APP_OWNER_OTA));
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_OTA, app_state_current());
+
+    /* FATAL. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FATAL, APP_OWNER_BOOTSTRAP));
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_FATAL, app_state_current());
+
+    /* Ten probes, ten drops: BOOT, FILESYSTEM, CONFIGURATION, PROVISIONING
+     * (redundant STARTED), TLS, SYNC, ONLINE, SAFE_OFF, OTA, FATAL. */
+    TEST_ASSERT_EQUAL(10u, app_state_invalid_dropped());
+}
+
+static void test_provisioning_retry_exhaustion_parks_in_safe_off(void)
+{
+    /* Custom tight schedule: 1s initial, 4s cap, 3 retries max, 2x — the
+     * same anti-storm budget semantics as NETWORK failures. */
+    s_now_ms = 0u;
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        init_with_retry_cfg(1000u, 4000u, 3u, 2u));
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_start());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+
+    /* Provisioning attempt 1 fails: 1s backoff, re-enters NETWORK. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_FAILED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
+    TEST_ASSERT_TRUE(app_state_retry_pending());
+    TEST_ASSERT_EQUAL(1000u, app_state_retry_delay_ms());
+    TEST_ASSERT_EQUAL(0u, app_state_retry_attempts_used());
+
+    s_now_ms = 1000u;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_EQUAL(1u, app_state_retry_attempts_used());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_FAILED, APP_OWNER_NETWORK));
+    TEST_ASSERT_TRUE(app_state_retry_pending());
+    TEST_ASSERT_EQUAL(2000u, app_state_retry_delay_ms());
+
+    /* Retry 2 at 3000 ms; fail again -> capped 4s backoff. */
+    s_now_ms = 3000u;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+    TEST_ASSERT_EQUAL(2u, app_state_retry_attempts_used());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_FAILED, APP_OWNER_NETWORK));
+    TEST_ASSERT_TRUE(app_state_retry_pending());
+    TEST_ASSERT_EQUAL(4000u, app_state_retry_delay_ms());
+
+    /* Retry 3 at 7000 ms; the following failure exhausts the budget. */
+    s_now_ms = 7000u;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+    TEST_ASSERT_EQUAL(3u, app_state_retry_attempts_used());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_FAILED, APP_OWNER_NETWORK));
+
+    /* Exhausted: parked in SAFE_OFF, nothing scheduled, no retry storm. */
+    TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
+    TEST_ASSERT_TRUE(app_state_retry_exhausted());
+    TEST_ASSERT_FALSE(app_state_retry_pending());
+    TEST_ASSERT_EQUAL(0u, app_state_retry_delay_ms());
+    int retries_fired = obs_count_where_event(APP_EVENT_RETRY_DUE);
+
+    /* Continued polling must NOT produce another retry. */
+    int iteration;
+    for (iteration = 0; iteration < 5; ++iteration)
+    {
+        s_now_ms += 4000u;
+        TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+        TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
+        TEST_ASSERT_EQUAL(3u, app_state_retry_attempts_used());
+    }
+    TEST_ASSERT_EQUAL(retries_fired, obs_count_where_event(APP_EVENT_RETRY_DUE));
+
+    /* The budget still resets only on reaching ONLINE: an explicit reset
+     * recovers, a fresh boot re-enters all gates and ONLINE resets the
+     * budget for the next recovery episode. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_RESET, APP_OWNER_EXTERNAL));
+    TEST_ASSERT_EQUAL(APP_STATE_BOOT, app_state_current());
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_start());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_CONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_TLS_CONNECTED, APP_OWNER_MQTT));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_SYNC_COMPLETE, APP_OWNER_THINGSBOARD));
+    TEST_ASSERT_TRUE(app_state_is_online());
+    TEST_ASSERT_EQUAL(0u, app_state_retry_attempts_used());
+    TEST_ASSERT_FALSE(app_state_retry_exhausted());
+}
+
+static void test_provisioning_stale_session_delivery_rejected(void)
+{
+    boot_to_filesystem();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+
+    /* The provisioning adapter arms under THIS session... */
+    uint32_t armed_session = app_state_session();
+
+    /* ...then the network fails and the machine retries (new session). */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_FAILED, APP_OWNER_NETWORK));
+    s_now_ms = APP_STATE_RETRY_INITIAL_DELAY_DEFAULT_MS;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_NOT_EQUAL(armed_session, app_state_session());
+
+    /* Late PROVISIONING_STARTED from the previous session: dropped and
+     * counted (non-safety event: no fail-off), no transition. */
+    int transitions_before = s_obs_count;
+    unsigned forces_before = lamp_mock_force_inactive_calls();
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_STALE,
+        app_state_deliver_session(APP_EVENT_PROVISIONING_STARTED,
+                                  APP_OWNER_NETWORK, armed_session));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_EQUAL(transitions_before, s_obs_count);
+    TEST_ASSERT_EQUAL(forces_before, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL(1u, app_state_stale_dropped());
+
+    /* SUCCEEDED/FAILED are only legal from PROVISIONING: delivered from
+     * NETWORK they are illegal.  FAILED is disconnect-class, so the
+     * illegal drop still fails off first. */
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                          APP_OWNER_NETWORK));
+    forces_before = lamp_mock_force_inactive_calls();
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_FAILED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(forces_before + 1u, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL(2u, app_state_invalid_dropped());
+
+    /* Enter provisioning (current session): stale SUCCEEDED and stale
+     * FAILED from the old session are both dropped and counted without a
+     * transition.  The stale FAILED (disconnect-class) fails off first. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+    transitions_before = s_obs_count;
+    forces_before = lamp_mock_force_inactive_calls();
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_STALE,
+        app_state_deliver_session(APP_EVENT_PROVISIONING_SUCCEEDED,
+                                  APP_OWNER_NETWORK, armed_session));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+    TEST_ASSERT_EQUAL(transitions_before, s_obs_count);
+    TEST_ASSERT_EQUAL(forces_before, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL(2u, app_state_stale_dropped());
+
+    forces_before = lamp_mock_force_inactive_calls();
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_STALE,
+        app_state_deliver_session(APP_EVENT_PROVISIONING_FAILED,
+                                  APP_OWNER_NETWORK, armed_session));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+    TEST_ASSERT_EQUAL(transitions_before, s_obs_count);
+    TEST_ASSERT_EQUAL(forces_before + 1u, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL(3u, app_state_stale_dropped());
+
+    /* The current-session callback is still honored afterwards. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                          APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+}
+
+/* --------------------------------------------------------------------- */
 /* 4. Reconnect loop and bounded retry (anti-storm)                        */
 /* --------------------------------------------------------------------- */
 
@@ -1158,6 +1503,13 @@ int main(void)
     RUN_TEST(test_invalid_state_while_online_fails_off);
     RUN_TEST(test_fatal_from_any_state);
     RUN_TEST(test_lamp_failoff_failure_does_not_wedge);
+
+    /* 3b. Provisioning gate (TASK-125) */
+    RUN_TEST(test_provisioning_legal_entry_and_exit);
+    RUN_TEST(test_provisioning_failure_degrades_and_retries_network);
+    RUN_TEST(test_provisioning_started_illegal_from_every_other_state);
+    RUN_TEST(test_provisioning_retry_exhaustion_parks_in_safe_off);
+    RUN_TEST(test_provisioning_stale_session_delivery_rejected);
 
     /* 4. Reconnect loop and bounded retry (anti-storm) */
     RUN_TEST(test_reconnect_loop_reaches_online_and_resets_budget);

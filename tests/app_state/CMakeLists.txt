@@ -15,6 +15,9 @@
 #
 #   - every failure transition forces the lamp output inactive,
 #   - online is reachable only through all five gates,
+#   - the provisioning gate (entry only from NETWORK, return to NETWORK on
+#     SUCCEEDED, degraded SAFE_OFF on FAILED with the bounded retry budget,
+#     illegal from every other state, stale-session rejection),
 #   - the reconnect loop (disconnect -> bounded backoff -> re-gate ->
 #     online) with an anti-storm budget,
 #   - timeouts (connect/sync/wait) and watchdog expiry,

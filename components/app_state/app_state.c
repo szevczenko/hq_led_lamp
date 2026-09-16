@@ -41,7 +41,7 @@
 /* --------------------------------------------------------------------- */
 
 /* Sentinel used for "no retry target" table slots; must not match a
- * real state (real states are 0..9, so -1 is safe). */
+ * real state (real states are 0..10, so -1 is safe). */
 #define APP_STATE_NONE_SAFE ((app_state_t)-1)
 
 /** @brief One legal transition of the machine. */
@@ -68,6 +68,13 @@ typedef struct app_state_transition {
  * app_owner_ok() deliberately widens DISCONNECT-class rows to ALSO accept
  * APP_OWNER_NETWORK (both transports may report "transport down" — see the
  * header table, which documents those rows as owned by NETWORK/MQTT).
+ *
+ * The PROVISIONING rows are owned by APP_OWNER_NETWORK: the provisioning
+ * adapter belongs to the network stage, so NETWORK may enter PROVISIONING
+ * on PROVISIONING_STARTED (no saved credential) and PROVISIONING returns
+ * to NETWORK on PROVISIONING_SUCCEEDED (credential saved) or degrades to
+ * SAFE_OFF on PROVISIONING_FAILED with the bounded retry target NETWORK
+ * (the retry re-enters the network stage, never PROVISIONING directly).
  */
 static const app_state_transition_t APP_STATE_TRANSITIONS[] = {
     { APP_STATE_FILESYSTEM,    APP_EVENT_FS_OK,             APP_STATE_CONFIGURATION, APP_OWNER_FILESYSTEM,    APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          false },
@@ -78,6 +85,9 @@ static const app_state_transition_t APP_STATE_TRANSITIONS[] = {
     { APP_STATE_CONFIGURATION, APP_EVENT_DISCONNECTED,      APP_STATE_SAFE_OFF,      APP_OWNER_MQTT,          APP_FAILURE_RETRYABLE, APP_STATE_NETWORK,           false },
     { APP_STATE_NETWORK,       APP_EVENT_NETWORK_CONNECTED, APP_STATE_TLS,           APP_OWNER_NETWORK,       APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          false },
     { APP_STATE_NETWORK,       APP_EVENT_NETWORK_FAILED,    APP_STATE_SAFE_OFF,      APP_OWNER_NETWORK,       APP_FAILURE_RETRYABLE, APP_STATE_NETWORK,           false },
+    { APP_STATE_NETWORK,       APP_EVENT_PROVISIONING_STARTED,   APP_STATE_PROVISIONING, APP_OWNER_NETWORK,  APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          false },
+    { APP_STATE_PROVISIONING,  APP_EVENT_PROVISIONING_SUCCEEDED, APP_STATE_NETWORK,      APP_OWNER_NETWORK,  APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          false },
+    { APP_STATE_PROVISIONING,  APP_EVENT_PROVISIONING_FAILED,    APP_STATE_SAFE_OFF,     APP_OWNER_NETWORK,  APP_FAILURE_RETRYABLE, APP_STATE_NETWORK,           false },
     { APP_STATE_NETWORK,       APP_EVENT_DISCONNECTED,      APP_STATE_SAFE_OFF,      APP_OWNER_MQTT,          APP_FAILURE_RETRYABLE, APP_STATE_NETWORK,           false },
     { APP_STATE_TLS,           APP_EVENT_TLS_CONNECTED,     APP_STATE_SYNC,          APP_OWNER_MQTT,          APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          false },
     { APP_STATE_TLS,           APP_EVENT_TLS_FAILED,        APP_STATE_SAFE_OFF,      APP_OWNER_MQTT,          APP_FAILURE_RETRYABLE, APP_STATE_TLS,               false },
@@ -164,6 +174,7 @@ static bool app_state_is_disconnect_class(app_state_event_t event)
     case APP_EVENT_FS_FAIL:
     case APP_EVENT_CONFIG_FAIL:
     case APP_EVENT_NETWORK_FAILED:
+    case APP_EVENT_PROVISIONING_FAILED:
     case APP_EVENT_TLS_FAILED:
     case APP_EVENT_SYNC_FAILED:
     case APP_EVENT_DISCONNECTED:
@@ -183,6 +194,7 @@ static const char *app_state_name(app_state_t state)
     case APP_STATE_FILESYSTEM:    return "filesystem";
     case APP_STATE_CONFIGURATION: return "configuration";
     case APP_STATE_NETWORK:       return "network";
+    case APP_STATE_PROVISIONING:  return "provisioning";
     case APP_STATE_TLS:           return "tls";
     case APP_STATE_SYNC:          return "sync";
     case APP_STATE_ONLINE:        return "online";
@@ -204,6 +216,9 @@ static const char *app_event_name(app_state_event_t event)
     case APP_EVENT_CONFIG_FAIL:       return "config-fail";
     case APP_EVENT_NETWORK_CONNECTED: return "network-connected";
     case APP_EVENT_NETWORK_FAILED:    return "network-failed";
+    case APP_EVENT_PROVISIONING_STARTED:   return "provisioning-started";
+    case APP_EVENT_PROVISIONING_SUCCEEDED: return "provisioning-succeeded";
+    case APP_EVENT_PROVISIONING_FAILED:    return "provisioning-failed";
     case APP_EVENT_TLS_CONNECTED:     return "tls-connected";
     case APP_EVENT_TLS_FAILED:        return "tls-failed";
     case APP_EVENT_SYNC_COMPLETE:     return "sync-complete";

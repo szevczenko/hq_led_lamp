@@ -5,7 +5,8 @@
  * Normative public API of the product-owned application state owner.
  *
  * This component turns the boot sequence "boot -> safe-off -> filesystem ->
- * configuration -> Wi-Fi -> verified MQTT/TLS -> state sync -> online" and
+ * configuration -> Wi-Fi -> provisioning (only when no saved station
+ * credential exists) -> verified MQTT/TLS -> state sync -> online" and
  * every error path into ONE explicit state machine, and attaches the
  * application watchdog policy to it.  Events cross the Wi-Fi, MQTT,
  * ThingsBoard, timer, OTA and application contexts; this module is the
@@ -19,7 +20,12 @@
  *   - #APP_STATE_BOOT           — entry state after init/start; output off.
  *   - #APP_STATE_FILESYSTEM     — waiting for the LittleFS bootstrap result.
  *   - #APP_STATE_CONFIGURATION  — waiting for product config validation.
- *   - #APP_STATE_NETWORK        — waiting for the Wi-Fi connection gate.
+ *   - #APP_STATE_NETWORK        — waiting for the Wi-Fi connection gate;
+ *                                 may enter #APP_STATE_PROVISIONING when no
+ *                                 saved station credential exists.
+ *   - #APP_STATE_PROVISIONING   — Wi-Fi provisioning active (bounded retry
+ *                                 on failure); output off; a device with
+ *                                 saved credentials never enters it.
  *   - #APP_STATE_TLS            — waiting for verified MQTT/TLS.
  *   - #APP_STATE_SYNC           — waiting for ThingsBoard desired-state sync.
  *   - #APP_STATE_ONLINE         — all gates passed; output may be active.
@@ -31,8 +37,11 @@
  *                                 returns to boot; failure degrades.
  *
  * The only legal path into #APP_STATE_ONLINE requires a successful
- * filesystem, configuration, Wi-Fi, verified TLS AND synchronization —
- * nothing shorter can reach online.  The lamp output is forced inactive on
+ * filesystem, configuration, Wi-Fi (including Wi-Fi provisioning when no
+ * saved station credential exists — a device with saved credentials may
+ * pass straight through without entering PROVISIONING), verified TLS AND
+ * synchronization — nothing shorter can reach online.  The lamp output is
+ * forced inactive on
  * EVERY entry into a non-online state (the module calls
  * lamp_control_force_inactive() itself, see "Fail-off contract"), so the
  * DoD "every failure path forces the output inactive" is an invariant of
@@ -54,6 +63,9 @@
  *   CONFIGURATION-- DISCONNECTED (NETWORK/MQTT) --> SAFE_OFF      (retry NETWORK)
  *   NETWORK     -- NETWORK_CONNECTED (NETWORK) --> TLS
  *   NETWORK     -- NETWORK_FAILED (NETWORK) ------> SAFE_OFF      (retry NETWORK)
+ *   NETWORK     -- PROVISIONING_STARTED (NETWORK) -> PROVISIONING (no saved credential)
+ *   PROVISIONING-- PROVISIONING_SUCCEEDED (NETWORK) -> NETWORK    (credential saved)
+ *   PROVISIONING-- PROVISIONING_FAILED (NETWORK) ----> SAFE_OFF   (retry NETWORK)
  *   NETWORK     -- DISCONNECTED (NETWORK/MQTT) ---> SAFE_OFF      (retry NETWORK)
  *   TLS         -- TLS_CONNECTED (MQTT) ----------> SYNC
  *   TLS         -- TLS_FAILED (MQTT) -------------> SAFE_OFF      (retry TLS)
@@ -88,13 +100,15 @@
  *
  * Retry and bounded backoff
  * -------------------------
- * Recoverable failures (NETWORK_FAILED, TLS_FAILED, SYNC_FAILED,
- * INVALID_STATE, DISCONNECTED) park the machine in #APP_STATE_SAFE_OFF and
- * schedule ONE retry after a bounded, exponentially-growing delay
- * (2 ^ attempt, capped): default 2000 ms first, 30000 ms cap, at most
- * #APP_STATE_RETRY_MAX_ATTEMPTS_DEFAULT (5) retry transitions per recovery
- * episode.  The retry returns to the exact stage that failed (network,
- * TLS or sync) so a stage that already passed is never repeated
+ * Recoverable failures (PROVISIONING_FAILED, NETWORK_FAILED, TLS_FAILED,
+ * SYNC_FAILED, INVALID_STATE, DISCONNECTED) park the machine in
+ * #APP_STATE_SAFE_OFF and schedule ONE retry after a bounded,
+ * exponentially-growing delay (2 ^ attempt, capped): default 2000 ms
+ * first, 30000 ms cap, at most #APP_STATE_RETRY_MAX_ATTEMPTS_DEFAULT (5)
+ * retry transitions per recovery episode.  The retry returns to the exact
+ * stage that failed (network — including after a provisioning failure,
+ * because the provisioning adapter is owned by the network stage — TLS or
+ * sync) so a stage that already passed is never repeated
  * (no filesystem re-mount storms, no Wi-Fi re-scan storms).  Non-retryable
  * failures (FS_FAIL, CONFIG_FAIL, OTA_FAILED) park degraded WITHOUT an
  * automatic retry: recovery is an explicit RESET/provisioning/OTA action.
@@ -121,8 +135,9 @@
  *     owner).  They are dropped and counted (app_state_invalid_dropped()).
  *
  * Safety-first exception: DISCONNECT-class events (DISCONNECTED,
- * *_FAILED, INVALID_STATE, FS_FAIL, CONFIG_FAIL, OTA_FAILED) ALWAYS force
- * the lamp output inactive BEFORE the drop, mirroring the network
+ * *_FAILED, PROVISIONING_FAILED, INVALID_STATE, FS_FAIL, CONFIG_FAIL,
+ * OTA_FAILED) ALWAYS force the lamp output inactive BEFORE the drop,
+ * mirroring the network
  * adapter's stale-disconnect contract: a late disconnect must never leave
  * the output enabled.  #APP_EVENT_FATAL is always honored (any session,
  * any owner): a fatal failure report is never treated as stale.
@@ -255,6 +270,8 @@ typedef enum app_state {
     APP_STATE_FILESYSTEM,        /**< Waiting for filesystem bootstrap result. */
     APP_STATE_CONFIGURATION,     /**< Waiting for product configuration validation. */
     APP_STATE_NETWORK,           /**< Waiting for the Wi-Fi connection gate. */
+    APP_STATE_PROVISIONING,      /**< Wi-Fi provisioning active (no saved
+                                      station credential); output off. */
     APP_STATE_TLS,               /**< Waiting for verified MQTT/TLS. */
     APP_STATE_SYNC,              /**< Waiting for ThingsBoard desired-state sync. */
     APP_STATE_ONLINE,            /**< All gates passed; output may be active. */
@@ -276,9 +293,12 @@ typedef enum app_state_event {
     APP_EVENT_FS_FAIL,           /**< Filesystem bootstrap failed (degraded). */
     APP_EVENT_CONFIG_OK,         /**< Product configuration validated. */
     APP_EVENT_CONFIG_FAIL,       /**< Product configuration rejected (degraded). */
-    APP_EVENT_NETWORK_CONNECTED, /**< Wi-Fi connection established. */
-    APP_EVENT_NETWORK_FAILED,    /**< Wi-Fi connect failed or timed out (retryable). */
-    APP_EVENT_TLS_CONNECTED,     /**< Verified MQTT/TLS connection established. */
+    APP_EVENT_NETWORK_CONNECTED,     /**< Wi-Fi connection established. */
+    APP_EVENT_NETWORK_FAILED,        /**< Wi-Fi connect failed or timed out (retryable). */
+    APP_EVENT_PROVISIONING_STARTED,  /**< Wi-Fi provisioning starts (no saved station credential). */
+    APP_EVENT_PROVISIONING_SUCCEEDED,/**< Provisioning credential saved; station may now connect. */
+    APP_EVENT_PROVISIONING_FAILED,   /**< Provisioning failed/timed out (retryable). */
+    APP_EVENT_TLS_CONNECTED,         /**< Verified MQTT/TLS connection established. */
     APP_EVENT_TLS_FAILED,        /**< Verified TLS connect failed (retryable). */
     APP_EVENT_SYNC_COMPLETE,     /**< Complete valid desired state synchronized. */
     APP_EVENT_SYNC_FAILED,       /**< Synchronization attempt failed (retryable). */
@@ -307,7 +327,7 @@ typedef enum app_transition_owner {
     APP_OWNER_BOOTSTRAP = 0,     /**< The boot sequence / app entry. */
     APP_OWNER_FILESYSTEM,        /**< Filesystem bootstrap context. */
     APP_OWNER_CONFIGURATION,     /**< Configuration loading context. */
-    APP_OWNER_NETWORK,           /**< Wi-Fi adapter callbacks. */
+    APP_OWNER_NETWORK,           /**< Wi-Fi adapter / provisioning adapter callbacks. */
     APP_OWNER_MQTT,              /**< MQTT/TLS connect/verified-TLS context. */
     APP_OWNER_THINGSBOARD,       /**< ThingsBoard attribute/sync callbacks. */
     APP_OWNER_TIMER,             /**< The machine's own retry timer. */
@@ -494,7 +514,9 @@ app_state_status_t app_state_deliver_session(app_state_event_t event,
  *   2. deadline refresh (feed);
  *   3. retry schedule — if a retry is due, consumes one retry attempt,
  *      starts a fresh session and returns to the failed stage
- *      (#APP_STATE_NETWORK / #APP_STATE_TLS / #APP_STATE_SYNC).
+ *      (#APP_STATE_NETWORK — also after a provisioning failure, since the
+ *      provisioning adapter is owned by the network stage — / #APP_STATE_TLS
+ *      / #APP_STATE_SYNC).
  *
  * @return #APP_STATE_OK on a normal poll (including a fired retry),
  *         #APP_STATE_ERR_WATCHDOG when this poll detected a watchdog

@@ -2,11 +2,12 @@
 #
 # ESP-IDF component registration.  The component owns the explicit
 # application state machine (boot -> safe-off -> filesystem -> configuration
-# -> Wi-Fi -> verified MQTT/TLS -> state sync -> online, with safe-off/fatal/
-# OTA error states), the legal-transition/owner table, stale-callback
-# (generation/session) rejection, the bounded retry/backoff schedule and the
-# application watchdog policy (single polling owner, deadline refreshed by
-# poll() and by every successful transition).
+# -> Wi-Fi -> provisioning (only when no saved credential) -> verified
+# MQTT/TLS -> state sync -> online, with safe-off/fatal/OTA error states),
+# the legal-transition/owner table, stale-callback (generation/session)
+# rejection, the bounded retry/backoff schedule and the application watchdog
+# policy (single polling owner, deadline refreshed by poll() and by every
+# successful transition).
 #
 # Dependency policy:
 #   - `lamp_control` supplies the fail-off invariant (the output is forced
