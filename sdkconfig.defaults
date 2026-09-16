@@ -13,6 +13,22 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
+# Main task stack (on-target finding, TASK-128): the boot supervisor on the
+# main task loads and applies the broker/TLS configuration
+# (mqtt_cfg_load_and_apply) BEFORE the Wi-Fi/provisioning stages, so the
+# main task also runs the mbedTLS/heap-heavy configuration path.  The
+# ESP-IDF default (3584 B) overflows "task main" during that apply on a
+# fresh configured device, so the standard flash/monitor loop would fail
+# the no-backtrace assertion at the very first configured boot.  The
+# dominant consumer is mqtt_cfg_apply(): it captures the applied CA / mTLS
+# material as three mqtt_cfg_cert_snapshot_t stack locals (~5 KiB each,
+# MQTT_CERT_MAX_SIZE 5120 + header), i.e. ~15.4 KiB in one frame before
+# the caller stack is counted — a 16 KiB stack still overflows.  32768 B
+# keeps the full filesystem -> configuration -> Wi-Fi -> provisioning ->
+# TLS gate on the main task with comfortable headroom for the verified-TLS
+# handshake.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
 # Wi-Fi HTTP provisioning (TASK-126): the product-owned provisioning adapter
 # (components/wifi_provisioning_manager) builds the platform provisioning
 # portal (HTTP portal + captive DNS on the shared Mongoose process) into the
