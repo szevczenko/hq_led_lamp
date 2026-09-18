@@ -38,6 +38,20 @@
  *      via MongooseProcess_Invoke() and block this CALLER until the poll
  *      thread completes it (the poll thread itself never blocks on the
  *      adapter).
+ *
+ *   5. Controller notification translation (TASK-132): init() registers a
+ *      product notification handler with the platform automatic fallback
+ *      controller (wifi_provisioning_controller_init_with_config(), the
+ *      platform fallback-budget default from TASK-131 is left untouched).
+ *      The handler honors the controller's session/generation token (a
+ *      notification captured in a superseded lifecycle - after adapter
+ *      deinit/re-init - is discarded) and translates transitions with a
+ *      small adapter-private table into pending product events
+ *      (STARTED/SUCCEEDED/FAILED) stored under the SAME adapter mutex; the
+ *      supervisor consumes them via wifi_provisioning_manager_poll_event()
+ *      (TASK-133).  The notification handler never calls back into the
+ *      controller, never blocks on anything but the short adapter lock and
+ *      never logs a credential, SSID, token or URL - only state codes.
  */
 
 #include "wifi_provisioning_manager.h"
@@ -51,6 +65,7 @@
 #include "osal_mutex.h"
 #include "wifi_http_provisioning.h"
 #include "wifi_managment.h"
+#include "wifi_provisioning_controller.h"
 
 /* --------------------------------------------------------------------- */
 /* Configuration                                                          */
@@ -58,6 +73,9 @@
 
 /** @brief Maximum length (incl. terminator) of a test-only URL override. */
 #define WIFI_PROVISIONING_MANAGER_URL_MAX_LEN 128u
+
+/** @brief Bounded FIFO capacity for pending product provisioning events. */
+#define WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN 8u
 
 /* --------------------------------------------------------------------- */
 /* Internal state                                                          */
@@ -67,6 +85,25 @@ typedef struct wifi_provisioning_manager_ctx
 {
   _Atomic(osal_mutex_id_t) lock;   /**< Published atomically (CAS-adopted). */
   atomic_bool initialized;         /**< init() completed, deinit() cleared. */
+
+  /* Controller notification translation (TASK-132).  Everything below is
+   * protected by @c lock. */
+  uint32_t controller_session;     /**< Session/generation token of the
+                                        current controller lifecycle,
+                                        adopted from the first notification
+                                        seen after init(). */
+  bool     controller_session_set; /**< true once @c controller_session has
+                                        been adopted. */
+  bool     success_pending;        /**< true between a GRACE entry and the
+                                        ONLINE retire: guards SUCCEEDED so a
+                                        saved-credential connect
+                                        (AWAITING_CONNECT -> RETIRING_AP ->
+                                        ONLINE) is never mis-reported as a
+                                        provisioning success. */
+  wifi_provisioning_manager_event_t pending[WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN];
+                                   /**< Pending product events, FIFO. */
+  unsigned pending_head;           /**< Index of the oldest pending event. */
+  unsigned pending_count;          /**< Number of pending events. */
 #ifdef WIFI_PROVISIONING_MANAGER_TEST_OBSERVABILITY
   /* Test/host-build-only listen-URL overrides, applied at the next start().
    * Protected by @c lock; never logged. */
@@ -182,11 +219,175 @@ wifi_provisioning_manager_map_state(wifi_http_provisioning_state_t state)
 }
 
 /* --------------------------------------------------------------------- */
+/* Controller notification translation (TASK-132)                          */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Enqueue a pending product provisioning event (FIFO).
+ *
+ * The caller must hold the adapter lock.  Bounded queue: on overflow the
+ * oldest event is dropped (FIFO discipline) so the ordering of the
+ * remaining stream - STARTED before SUCCEEDED - is preserved.
+ */
+static void wifi_provisioning_manager_enqueue_event(
+    wifi_provisioning_manager_event_t event)
+{
+    unsigned tail;
+
+    if (s_ctx.pending_count >= WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN)
+    {
+        s_ctx.pending_head = (s_ctx.pending_head + 1u) %
+                             WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN;
+        --s_ctx.pending_count;
+        osal_log_warning("[prov_mgr] pending provisioning event queue "
+                         "overflow: oldest event dropped");
+    }
+    tail = (s_ctx.pending_head + s_ctx.pending_count) %
+           WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN;
+    s_ctx.pending[tail] = event;
+    ++s_ctx.pending_count;
+}
+
+/**
+ * @brief Adapter-private translation table: controller state transitions to
+ *        product provisioning events.
+ *
+ *   - entry into WIFI_PROVISIONING_CONTROLLER_PROVISIONING (fresh device or
+ *     exhausted-credential fallback) -> STARTED,
+ *   - WIFI_PROVISIONING_CONTROLLER_ONLINE reached after the retirement
+ *     sequence (GRACE/RETIRING_AP) -> SUCCEEDED; the notification handler
+ *     additionally guards SUCCEEDED with @c success_pending (set on the
+ *     GRACE entry) so a saved-credential connect (which also retires the
+ *     startup SoftAP through RETIRING_AP) is never reported as a
+ *     provisioning success.
+ *
+ * Every other transition maps to NONE.  No platform type leaves this
+ * function.
+ */
+static wifi_provisioning_manager_event_t
+wifi_provisioning_manager_translate_transition(
+    wifi_provisioning_controller_state_t previous,
+    wifi_provisioning_controller_state_t current)
+{
+    switch (current)
+    {
+        case WIFI_PROVISIONING_CONTROLLER_PROVISIONING:
+            return WIFI_PROVISIONING_MANAGER_EVENT_STARTED;
+
+        case WIFI_PROVISIONING_CONTROLLER_ONLINE:
+            if (previous == WIFI_PROVISIONING_CONTROLLER_GRACE ||
+                previous == WIFI_PROVISIONING_CONTROLLER_RETIRING_AP)
+            {
+                return WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED;
+            }
+            break;
+
+        default:
+            break;
+    }
+    return WIFI_PROVISIONING_MANAGER_EVENT_NONE;
+}
+
+/**
+ * @brief Platform fallback-controller state-change notification handler
+ *        (TASK-132).
+ *
+ * Platform contract: must not block and must not call back into the
+ * controller.  It only takes the short adapter lock, discards notifications
+ * from a stale controller lifecycle (a session/generation token that does
+ * not match the current lifecycle, including anything delivered after
+ * adapter deinit()), translates the transition with the adapter-private
+ * table and stores the pending product event under the lock.  The
+ * supervisor consumes the stored outcome with
+ * #wifi_provisioning_manager_poll_event() (TASK-133); the adapter itself
+ * never touches app_state.  Only non-sensitive state codes are logged.
+ */
+static void wifi_provisioning_manager_on_controller_state_changed(
+    wifi_provisioning_controller_state_t previous,
+    wifi_provisioning_controller_state_t current,
+    uint32_t session,
+    void *user_ctx)
+{
+    wifi_provisioning_manager_event_t event;
+    (void)user_ctx;
+
+    /* The adapter lock is the single store point; if it is unavailable (or
+     * was never created) nothing can be stored, so the notification is
+     * dropped. */
+    if (!wifi_provisioning_manager_lock())
+    {
+        return;
+    }
+
+    if (!atomic_load_explicit(&s_ctx.initialized, memory_order_acquire))
+    {
+        /* Notification delivered after adapter deinit(): drop it. */
+        wifi_provisioning_manager_unlock();
+        return;
+    }
+
+    if (!s_ctx.controller_session_set)
+    {
+        /* First notification of the current lifecycle: adopt its token. */
+        s_ctx.controller_session     = session;
+        s_ctx.controller_session_set = true;
+    }
+    else if (s_ctx.controller_session != session)
+    {
+        /* Stale controller lifecycle (deinit/re-init superseded it). */
+        wifi_provisioning_manager_unlock();
+        return;
+    }
+
+    /* Track the provisioning success guard: a GRACE entry means the station
+     * connected while the portal was up; leaving the flow (abort, connect
+     * loss, explicit stop) clears it. */
+    if (current == WIFI_PROVISIONING_CONTROLLER_GRACE)
+    {
+        s_ctx.success_pending = true;
+    }
+    else if (current == WIFI_PROVISIONING_CONTROLLER_PROVISIONING ||
+             current == WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT ||
+             current == WIFI_PROVISIONING_CONTROLLER_DISABLED)
+    {
+        s_ctx.success_pending = false;
+    }
+
+    event = wifi_provisioning_manager_translate_transition(previous, current);
+    if ((event == WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED) &&
+        !s_ctx.success_pending)
+    {
+        /* ONLINE reached without the success grace window (saved-credential
+         * connect): not a provisioning outcome. */
+        event = WIFI_PROVISIONING_MANAGER_EVENT_NONE;
+    }
+
+    if (event != WIFI_PROVISIONING_MANAGER_EVENT_NONE)
+    {
+        wifi_provisioning_manager_enqueue_event(event);
+        /* State codes only - never an SSID, password, token or URL. */
+        osal_log_info("[prov_mgr] controller transition %d -> %d "
+                      "(product event %d)",
+                      (int)previous, (int)current, (int)event);
+    }
+
+    if (current == WIFI_PROVISIONING_CONTROLLER_ONLINE ||
+        current == WIFI_PROVISIONING_CONTROLLER_DISABLED)
+    {
+        s_ctx.success_pending = false;
+    }
+
+    wifi_provisioning_manager_unlock();
+}
+
+/* --------------------------------------------------------------------- */
 /* Adapter lifecycle                                                      */
 /* --------------------------------------------------------------------- */
 
 wifi_provisioning_manager_status_t wifi_provisioning_manager_init(void)
 {
+    bool first_init = false;
+
     if (!wifi_provisioning_manager_ensure_lock())
     {
         osal_log_error("[prov_mgr] adapter lock unavailable");
@@ -201,16 +402,50 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_init(void)
 
     if (!atomic_load_explicit(&s_ctx.initialized, memory_order_acquire))
     {
+        first_init = true;
         atomic_store_explicit(&s_ctx.initialized, true, memory_order_release);
+        /* Fresh lifecycle: no trusted controller session yet, empty queue. */
+        s_ctx.controller_session     = 0u;
+        s_ctx.controller_session_set = false;
+        s_ctx.success_pending        = false;
+        s_ctx.pending_head           = 0u;
+        s_ctx.pending_count          = 0u;
         osal_log_info("[prov_mgr] wifi provisioning adapter initialized");
     }
-
     wifi_provisioning_manager_unlock();
+
+    if (first_init)
+    {
+        /* Register the product notification handler (TASK-132).  The
+         * controller commits DISABLED -> AWAITING_CONNECT (and, on a fresh
+         * device, -> PROVISIONING) synchronously inside this call, so the
+         * handler stores those transitions under the adapter lock while the
+         * lock is free - do not hold it across the controller call.  The
+         * platform fallback-budget default (TASK-131 Kconfig value) is
+         * deliberately left untouched: only the callback and its context are
+         * set.  The registration is best-effort: if the controller's
+         * deferred worker cannot be created, the adapter still operates via
+         * start()/stop() but translates no notifications. */
+        wifi_provisioning_controller_config_t controller_config;
+
+        memset(&controller_config, 0, sizeof(controller_config));
+        controller_config.on_state_changed =
+            wifi_provisioning_manager_on_controller_state_changed;
+        controller_config.user_ctx = &s_ctx;
+        if (!wifi_provisioning_controller_init_with_config(&controller_config))
+        {
+            osal_log_error("[prov_mgr] controller notification hook "
+                           "registration failed");
+        }
+    }
+
     return WIFI_PROVISIONING_MANAGER_OK;
 }
 
 wifi_provisioning_manager_status_t wifi_provisioning_manager_deinit(void)
 {
+    bool was_initialized;
+
     if (!wifi_provisioning_manager_ensure_lock())
     {
         osal_log_error("[prov_mgr] adapter lock unavailable");
@@ -222,6 +457,9 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_deinit(void)
         osal_log_error("[prov_mgr] adapter lock unavailable");
         return WIFI_PROVISIONING_MANAGER_ERR_STOP_FAILED;
     }
+
+    was_initialized =
+        atomic_load_explicit(&s_ctx.initialized, memory_order_acquire);
 
     /* Best-effort teardown: if the provisioning portal is (or was) active,
      * close only its own listeners.  The shared Mongoose process is never
@@ -244,12 +482,32 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_deinit(void)
 
     atomic_store_explicit(&s_ctx.initialized, false, memory_order_release);
 
+    /* Invalidate the trusted controller session and drop any pending product
+     * events: a late notification from the ended lifecycle is discarded and
+     * no stale event survives into the next adapter lifecycle. */
+    s_ctx.controller_session_set = false;
+    s_ctx.success_pending        = false;
+    s_ctx.pending_head           = 0u;
+    s_ctx.pending_count          = 0u;
+
 #ifdef WIFI_PROVISIONING_MANAGER_TEST_OBSERVABILITY
     s_ctx.http_url_set = false;
     s_ctx.dns_url_set  = false;
 #endif
 
     wifi_provisioning_manager_unlock();
+
+    if (was_initialized)
+    {
+        /* End the platform controller lifecycle OUTSIDE the adapter lock:
+         * controller_deinit() commits -> DISABLED and delivers its final
+         * notification synchronously, and the handler takes the adapter
+         * lock (it sees initialized==false and discards the notification).
+         * Holding the adapter lock across that call would deadlock the
+         * notification path. */
+        wifi_provisioning_controller_deinit();
+    }
+
     osal_log_info("[prov_mgr] wifi provisioning adapter deinitialized");
     return WIFI_PROVISIONING_MANAGER_OK;
 }
@@ -314,6 +572,11 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void)
     {
         const wifi_http_provisioning_state_t platform_state =
             wifi_http_provisioning_get_state();
+        /* A portal start failure observed by the adapter is a
+         * provisioning-failed outcome for the supervisor (TASK-133); the
+         * adapter stores it, it never acts on it directly. */
+        wifi_provisioning_manager_enqueue_event(
+            WIFI_PROVISIONING_MANAGER_EVENT_FAILED);
         wifi_provisioning_manager_unlock();
         /* Error code only — never the listen URLs. */
         osal_log_error("[prov_mgr] provisioning portal start failed "
@@ -401,6 +664,32 @@ bool wifi_provisioning_manager_has_saved_credentials(void)
         return false;
     }
     return wifi_mgmt_is_read_data();
+}
+
+wifi_provisioning_manager_event_t wifi_provisioning_manager_poll_event(void)
+{
+    wifi_provisioning_manager_event_t event =
+        WIFI_PROVISIONING_MANAGER_EVENT_NONE;
+
+    if (!atomic_load_explicit(&s_ctx.initialized, memory_order_acquire))
+    {
+        /* Safe default after deinit(). */
+        return WIFI_PROVISIONING_MANAGER_EVENT_NONE;
+    }
+    if (!wifi_provisioning_manager_ensure_lock() ||
+        !wifi_provisioning_manager_lock())
+    {
+        return WIFI_PROVISIONING_MANAGER_EVENT_NONE;
+    }
+    if (s_ctx.pending_count > 0u)
+    {
+        event = s_ctx.pending[s_ctx.pending_head];
+        s_ctx.pending_head = (s_ctx.pending_head + 1u) %
+                             WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN;
+        --s_ctx.pending_count;
+    }
+    wifi_provisioning_manager_unlock();
+    return event;
 }
 
 /* --------------------------------------------------------------------- */

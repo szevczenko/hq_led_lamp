@@ -35,11 +35,15 @@
  * Since TASK-131 the platform's automatic fallback controller
  * (CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y with a bounded
  * CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS budget, see
- * sdkconfig.defaults) is COMPILED IN but not yet wired into the product
- * (wiring is TASK-132/133); while half-wired it is inert.  The adapter still
- * exposes wifi_provisioning_manager_has_saved_credentials() so app_main owns
- * the "start provisioning when no saved credential exists" decision
- * explicitly.
+ * sdkconfig.defaults) is COMPILED IN.  Since TASK-132 the adapter registers
+ * its product notification handler with the controller
+ * (wifi_provisioning_controller_init_with_config()) and translates the
+ * controller's state-change notifications into product provisioning events
+ * (STARTED/SUCCEEDED/FAILED) consumed through
+ * wifi_provisioning_manager_poll_event(); the supervisor wiring that acts on
+ * those events is TASK-133.  The adapter still exposes
+ * wifi_provisioning_manager_has_saved_credentials() so the start-provisioning
+ * decision remains explicit at the product level.
  *
  * Mongoose process ownership
  * --------------------------
@@ -115,6 +119,39 @@ typedef enum wifi_provisioning_manager_state
     WIFI_PROVISIONING_MANAGER_STOPPING = 3, /**< Listeners being closed.   */
     WIFI_PROVISIONING_MANAGER_ERROR    = 4  /**< Lifecycle error.          */
 } wifi_provisioning_manager_state_t;
+
+/* --------------------------------------------------------------------- */
+/* Provisioning outcome events (product-owned mirror, TASK-132)            */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Provisioning outcome reported by #wifi_provisioning_manager_poll_event.
+ *
+ * Product-owned mirror of the platform fallback controller's state-change
+ * notifications (TASK-132); no controller or platform type is exposed.  The
+ * product events are produced by the adapter's private translation table:
+ *
+ *   - #WIFI_PROVISIONING_MANAGER_EVENT_STARTED — the controller entered the
+ *     provisioning flow (fresh device, or the fallback budget was
+ *     exhausted by failing saved credentials),
+ *   - #WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED — the controller reached
+ *     ONLINE through the success grace/retire path (the station connected
+ *     while the portal was up and the temporary AP was retired),
+ *   - #WIFI_PROVISIONING_MANAGER_EVENT_FAILED — a portal start failure
+ *     observed by the adapter (the platform provisioning application
+ *     refused to open its listeners).
+ *
+ * Events are consumed one at a time, in the order they were recorded, with
+ * #wifi_provisioning_manager_poll_event(); #WIFI_PROVISIONING_MANAGER_EVENT_NONE
+ * means "no pending event".
+ */
+typedef enum wifi_provisioning_manager_event
+{
+    WIFI_PROVISIONING_MANAGER_EVENT_NONE      = 0, /**< No pending event. */
+    WIFI_PROVISIONING_MANAGER_EVENT_STARTED   = 1, /**< Provisioning flow started. */
+    WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED = 2, /**< Provisioning succeeded. */
+    WIFI_PROVISIONING_MANAGER_EVENT_FAILED    = 3  /**< Provisioning failed. */
+} wifi_provisioning_manager_event_t;
 
 /* --------------------------------------------------------------------- */
 /* Adapter lifecycle                                                      */
@@ -230,6 +267,25 @@ bool wifi_provisioning_manager_is_active(void);
  * @note    Lock-free; safe to call from any context.
  */
 bool wifi_provisioning_manager_has_saved_credentials(void);
+
+/**
+ * @brief   Poll the next pending provisioning outcome event.
+ *
+ * @details Consumes the product events produced from the platform fallback
+ *          controller notifications (TASK-132) one at a time, in the order
+ *          they were recorded: a provisioning flow is reported as
+ *          #WIFI_PROVISIONING_MANAGER_EVENT_STARTED before
+ *          #WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED — never reordered.
+ *          Notifications from a stale controller lifecycle (delivered after
+ *          adapter deinit()/re-init()) are discarded by the adapter and are
+ *          never returned here.  The supervisor (TASK-133) is the intended
+ *          consumer; the adapter itself never touches app_state.
+ *
+ * @return  The next pending event, or #WIFI_PROVISIONING_MANAGER_EVENT_NONE
+ *          when no event is pending (including after deinit() — safe
+ *          default).
+ */
+wifi_provisioning_manager_event_t wifi_provisioning_manager_poll_event(void);
 
 #ifdef WIFI_PROVISIONING_MANAGER_TEST_OBSERVABILITY
 /* --------------------------------------------------------------------- */

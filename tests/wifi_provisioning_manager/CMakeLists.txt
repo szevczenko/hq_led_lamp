@@ -3,11 +3,12 @@
 # Standalone host test project for the product-owned provisioning adapter
 # (components/wifi_provisioning_manager).  It compiles the production source
 # against test-only doubles for every platform boundary — the provisioning
-# application double (wifi_provisioning_mock.c), the shared Mongoose process
-# double (mongoose_process_mock.c), the Wi-Fi manager saved-credentials
-# double (wifi_mgmt_mock.c) and the OSAL doubles (osal_test_support.c) —
-# plus the vendored Unity framework, and runs as a normal CTest executable
-# on the host.
+# application double (wifi_provisioning_mock.c), the automatic fallback
+# controller double (wifi_provisioning_controller_mock.c, TASK-132), the
+# shared Mongoose process double (mongoose_process_mock.c), the Wi-Fi
+# manager saved-credentials double (wifi_mgmt_mock.c) and the OSAL doubles
+# (osal_test_support.c) — plus the vendored Unity framework, and runs as a
+# normal CTest executable on the host.
 #
 # The adapter is compiled with WIFI_PROVISIONING_MANAGER_TEST_OBSERVABILITY
 # so the runtime listener-URL overrides are exercised; on the ESP target
@@ -18,8 +19,11 @@
 # running, stop with the portal already stopped, start/stop failure
 # propagation, concurrent start/stop serialization, listener-URL override
 # behavior, the is-portal-active and has-saved-credentials queries, deinit
-# teardown of an active portal, and the credentials-never-logged secrecy
-# rule (log-content regression).
+# teardown of an active portal, the controller notification translation
+# (TASK-132: hook registration, an event stored for each transition,
+# stale-session notifications discarded, poll-event ordering STARTED then
+# SUCCEEDED, portal start failure -> FAILED) and the credentials-never-logged
+# secrecy rule (log-content regression).
 #
 # Usage:
 #   cmake -S tests/wifi_provisioning_manager -B <build-dir>
@@ -44,6 +48,7 @@ find_package(Threads REQUIRED)
 add_executable(wifi_provisioning_manager_tests
     ${CMAKE_CURRENT_LIST_DIR}/wifi_provisioning_manager_test.c
     ${CMAKE_CURRENT_LIST_DIR}/wifi_provisioning_mock.c
+    ${CMAKE_CURRENT_LIST_DIR}/wifi_provisioning_controller_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/mongoose_process_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/wifi_mgmt_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/osal_test_support.c

@@ -10,6 +10,11 @@
  *     (wifi_http_provisioning.h): idempotent lifecycle, runtime URL
  *     overrides, failure injection, a credential "mock connect path" for
  *     the log-content regression and a start/stop concurrency watermark,
+ *   - wifi_provisioning_controller_mock.c — the platform automatic fallback
+ *     controller (wifi_provisioning_controller.h, TASK-132): records the
+ *     notification hook the adapter registers and lets tests fire
+ *     state-change notifications transition by transition with a chosen
+ *     lifecycle session token,
  *   - mongoose_process_mock.c    — the shared Mongoose process
  *     (mongoose_process.h): running-state query and Init/Deinit/Invoke
  *     counters proving the adapter never tears the process down and never
@@ -28,7 +33,11 @@
  * start before Mongoose is running, stop with the portal already stopped,
  * start/stop failure propagation, listener-URL override behavior, the
  * is-portal-active and has-saved-credentials queries, deinit tearing down
- * an active portal, concurrent start/stop serialization and the
+ * an active portal, concurrent start/stop serialization, the controller
+ * notification translation (TASK-132: hook registration with the platform
+ * fallback-budget default untouched, an event stored for each transition,
+ * stale-session notifications discarded across deinit/re-init, poll-event
+ * ordering STARTED then SUCCEEDED, portal start failure -> FAILED) and the
  * credentials-never-logged secrecy rule.
  */
 
@@ -42,6 +51,7 @@
 #include "osal_test_support.h"
 #include "unity.h"
 #include "wifi_mgmt_mock.h"
+#include "wifi_provisioning_controller_mock.h"
 #include "wifi_provisioning_manager.h"
 #include "wifi_provisioning_mock.h"
 
@@ -52,6 +62,7 @@
 void setUp(void)
 {
     wifi_provisioning_mock_reset();
+    wifi_provisioning_controller_mock_reset();
     mongoose_process_mock_reset();
     wifi_mgmt_mock_reset();
     osal_test_log_reset();
@@ -67,6 +78,7 @@ void tearDown(void)
      * adapter is deinitialized.  tearDown must never fail the suite. */
     (void)wifi_provisioning_manager_deinit();
     wifi_provisioning_mock_reset();
+    wifi_provisioning_controller_mock_reset();
     mongoose_process_mock_reset();
     wifi_mgmt_mock_reset();
     osal_test_log_reset();
@@ -580,6 +592,200 @@ static void test_log_content_regression(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* Controller notification translation (TASK-132)                          */
+/* --------------------------------------------------------------------- */
+
+static void test_init_registers_controller_notification_hook(void)
+{
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+
+    /* init() registered the product handler with the platform controller. */
+    wifi_provisioning_controller_mock_counters_t ctrl =
+        wifi_provisioning_controller_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(1u, ctrl.init_with_config_calls);
+    TEST_ASSERT_NOT_NULL(ctrl.registered_cb);
+    TEST_ASSERT_NOT_NULL(ctrl.registered_user_ctx);
+
+    /* The platform fallback-budget default from TASK-131 is untouched: the
+     * adapter hands the controller no per-device override. */
+    TEST_ASSERT_FALSE(ctrl.config_fallback_budget_set);
+
+    /* Idempotent init does not re-register the hook. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+    ctrl = wifi_provisioning_controller_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(1u, ctrl.init_with_config_calls);
+
+    /* deinit() ends the controller lifecycle. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_deinit());
+    ctrl = wifi_provisioning_controller_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(1u, ctrl.deinit_calls);
+    TEST_ASSERT_NULL(ctrl.registered_cb);
+}
+
+static void test_notification_stored_for_each_transition(void)
+{
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+
+    /* The full provisioning lifecycle as the controller reports it: the
+     * fallback entry into PROVISIONING stores STARTED, the grace/retire
+     * completion (ONLINE) stores exactly one SUCCEEDED. */
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_DISABLED,
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT, 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT,
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING, 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_STARTED,
+                          wifi_provisioning_manager_poll_event());
+
+    /* GRACE and RETIRING_AP are intermediate: no product event yet. */
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING,
+        WIFI_PROVISIONING_CONTROLLER_GRACE, 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_GRACE,
+        WIFI_PROVISIONING_CONTROLLER_RETIRING_AP, 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_RETIRING_AP,
+        WIFI_PROVISIONING_CONTROLLER_ONLINE, 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+}
+
+static void test_saved_credential_connect_is_not_a_success(void)
+{
+    /* A credentialed device never enters PROVISIONING; its connect retires
+     * the startup SoftAP through RETIRING_AP -> ONLINE.  That must NOT be
+     * reported as a provisioning success. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_DISABLED,
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT, 1u);
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT,
+        WIFI_PROVISIONING_CONTROLLER_RETIRING_AP, 1u);
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_RETIRING_AP,
+        WIFI_PROVISIONING_CONTROLLER_ONLINE, 1u);
+
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+}
+
+static void test_stale_session_notification_discarded(void)
+{
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT,
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING, 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_STARTED,
+                          wifi_provisioning_manager_poll_event());
+
+    /* Deinit ends the controller lifecycle and drops pending events. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_deinit());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* Re-init starts a fresh adapter lifecycle. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_DISABLED,
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT, 2u);
+
+    /* A notification carrying the PREVIOUS lifecycle's session token is
+     * discarded, even though PROVISIONING would normally mean STARTED. */
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT,
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING, 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* The fresh lifecycle's own transition is accepted. */
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT,
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING, 2u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_STARTED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+}
+
+static void test_poll_event_ordering_started_then_succeeded(void)
+{
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+
+    /* Queue the whole lifecycle before polling: the supervisor must see
+     * STARTED first and SUCCEEDED second - no reordering. */
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_DISABLED,
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT, 1u);
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT,
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING, 1u);
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING,
+        WIFI_PROVISIONING_CONTROLLER_GRACE, 1u);
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_GRACE,
+        WIFI_PROVISIONING_CONTROLLER_RETIRING_AP, 1u);
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_RETIRING_AP,
+        WIFI_PROVISIONING_CONTROLLER_ONLINE, 1u);
+
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_STARTED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+}
+
+static void test_portal_start_failure_records_failed_event(void)
+{
+    wifi_provisioning_mock_config_t fail = {.fail_start = true};
+    wifi_provisioning_mock_set_config(&fail);
+
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_ERR_START_FAILED,
+                          wifi_provisioning_manager_start());
+
+    /* The adapter stored the outcome; the supervisor polls it. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_FAILED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* A later successful start does not fabricate an event. */
+    wifi_provisioning_mock_config_t ok = {.fail_start = false};
+    wifi_provisioning_mock_set_config(&ok);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_start());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+}
+
+/* --------------------------------------------------------------------- */
 /* Test registry                                                          */
 /* --------------------------------------------------------------------- */
 
@@ -601,6 +807,14 @@ int main(void)
     RUN_TEST(test_deinit_stops_active_portal);
     RUN_TEST(test_concurrent_start_stop_is_serialized);
     RUN_TEST(test_log_content_regression);
+
+    /* Controller notification translation (TASK-132). */
+    RUN_TEST(test_init_registers_controller_notification_hook);
+    RUN_TEST(test_notification_stored_for_each_transition);
+    RUN_TEST(test_saved_credential_connect_is_not_a_success);
+    RUN_TEST(test_stale_session_notification_discarded);
+    RUN_TEST(test_poll_event_ordering_started_then_succeeded);
+    RUN_TEST(test_portal_start_failure_records_failed_event);
 
     return UNITY_END();
 }
