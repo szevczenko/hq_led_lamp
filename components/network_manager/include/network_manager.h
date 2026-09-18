@@ -138,10 +138,18 @@ typedef struct network_callbacks {
 /* --------------------------------------------------------------------- */
 
 /**
- * @brief   Start the network: bring up the Wi-Fi manager in station mode and
- *          request a connection with the persisted credentials.
+ * @brief   Start the network: bring up the Wi-Fi manager in the
+ *          Kconfig-selected default mode (KLC_WIFI_DEFAULT_MODE, AP+STA by
+ *          default) and request a connection with the persisted credentials.
  *
- * @details Ordering contract: this operation runs Wi-Fi onboarding to
+ * @details The start mode is a product policy decision owned by this adapter
+ *          (the network stage is the single Wi-Fi owner): AP+STA is the
+ *          default so the provisioning portal's soft-AP is available when no
+ *          usable credentials exist; station-only is selectable for hardened
+ *          builds.  The mode never appears in this header — it is set inside
+ *          the adapter before onboarding.
+ *
+ *          Ordering contract: this operation runs Wi-Fi onboarding to
  *          completion (manager initialized, started, ready) before it
  *          returns, and a ThingsBoard connect may only be attempted after
  *          network_manager_wait_connected() has reported a connection.

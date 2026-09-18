@@ -108,4 +108,35 @@ menu "Kitchen LED Controller"
             a failure always parks the machine degraded with the existing
             bounded backoff.
 
+    choice KLC_WIFI_DEFAULT_MODE
+        prompt "Default Wi-Fi start mode"
+        default KLC_WIFI_DEFAULT_MODE_APSTA
+        help
+            Wi-Fi mode the network stage (network_manager, TASK-109) selects
+            before starting the platform Wi-Fi manager. AP+STA is the default
+            because the provisioning portal needs the AP interface: a device
+            with no usable credentials must be reachable over its provisioning
+            soft-AP to be (re)provisioned, and a station-only start strands an
+            unprovisioned device (the portal's mode request cannot bring the
+            AP up after a client-only start). Select station-only only for
+            hardened production builds that are provisioned out-of-band.
+
+        config KLC_WIFI_DEFAULT_MODE_APSTA
+            bool "AP+STA (station plus provisioning access point)"
+            help
+                Start the Wi-Fi manager in AP+STA mode (T_WIFI_TYPE_CLI_SER),
+                matching the provisioning demo's ownership order. The soft-AP
+                interface stays available for the provisioning portal when no
+                usable credentials exist yet.
+
+        config KLC_WIFI_DEFAULT_MODE_CLIENT
+            bool "Station-only (client)"
+            help
+                Start the Wi-Fi manager in station-only mode (T_WIFI_TYPE_
+                CLIENT) for hardened production builds. The provisioning
+                portal cannot open its AP in this mode, so only choose it when
+                the device is provisioned out-of-band and never needs the
+                portal.
+    endchoice
+
 endmenu

@@ -38,6 +38,18 @@
  *      callbacks/context.  stop() joins an in-flight callback (the handler
  *      holds the same mutex during delivery), so no application
  *      callback can run after stop() returns.
+ *
+ *   6. Mode policy: the Wi-Fi start mode is a product policy decision that
+ *      lives HERE (the network stage is the single Wi-Fi owner, TASK-109),
+ *      selected by the KLC_WIFI_DEFAULT_MODE Kconfig choice.  AP+STA
+ *      (T_WIFI_TYPE_CLI_SER) is the default and matches the provisioning
+ *      demo's ownership order because the provisioning portal needs the AP
+ *      interface: a station-only start strands an unprovisioned device, and
+ *      the portal's wifi_mgmt_request_mode(T_WIFI_TYPE_CLI_SER) cannot bring
+ *      the AP up after a client-only start.  Pure station-only
+ *      (T_WIFI_TYPE_CLIENT) remains selectable for hardened production
+ *      builds that are provisioned out-of-band and never need the portal.
+ *      No platform Wi-Fi type ever appears in network_manager.h.
  */
 
 #include "network_manager.h"
@@ -337,9 +349,19 @@ int network_manager_start(const network_callbacks_t *callbacks)
     network_unlock();
 
     /* Wi-Fi onboarding must complete before anything downstream (ThingsBoard)
-     * may begin connecting.  Station (client) mode is the product role; the
-     * persistence schema inside the manager is none of this layer's business. */
+     * may begin connecting.  The start mode is a product policy decision
+     * (KLC_WIFI_DEFAULT_MODE): by default the manager starts in AP+STA so the
+     * provisioning portal's soft-AP is available when no usable credentials
+     * exist yet; the hardened station-only mode is selectable for builds
+     * provisioned out-of-band.  Keep the demo's ownership order:
+     * set_wifi_type -> init -> start. */
+#if defined(CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA)
+    wifi_mgmt_set_wifi_type(T_WIFI_TYPE_CLI_SER);
+#elif defined(CONFIG_KLC_WIFI_DEFAULT_MODE_CLIENT)
     wifi_mgmt_set_wifi_type(T_WIFI_TYPE_CLIENT);
+#else
+#error "KLC_WIFI_DEFAULT_MODE must resolve to APSTA or CLIENT"
+#endif
     wifi_mgmt_init();
 
     /* The token travels as user_data: every event the manager delivers to
