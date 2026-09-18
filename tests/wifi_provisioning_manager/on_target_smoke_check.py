@@ -399,7 +399,9 @@ def main(argv=None):
     # boot reaches it right after the controller's STARTED event; a       #
     # credentialed pass-through boot intentionally never shows it, so the #
     # assertion applies only to --expect provisioning.                    #
-    if args.expect == "provisioning" and PORTAL_REACHABLE_SIGNATURE not in text:
+    entered = "ENTER" in sequence
+    if (args.expect == "provisioning" or entered) and \
+            PORTAL_REACHABLE_SIGNATURE not in text:
         failures.append(
             "expected a fresh-device boot with a reachable provisioning "
             "portal, but the TASK-135 signature %r was not observed"
