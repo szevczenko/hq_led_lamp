@@ -186,7 +186,7 @@ every A record with the portal address, so any address lands on
 3. Submit (`POST /api/v1/wifi/credentials`).
 
 Use the **documented smoke-test credential** when possible so the automated
-no-secret-leak assertion of the smoke check (assertion (c) below) mirrors
+no-secret-leak assertion of the smoke check (assertion (d) below) mirrors
 exactly what was submitted:
 
 - test SSID: `KLC-Smoke-128-Test`
@@ -233,7 +233,11 @@ flash/monitor loop.  Given a captured monitor log it asserts:
   --PROVISIONING_SUCCEEDED/FAILED--> NETWORK | SAFE_OFF`, driven by the
   controller's outcome events since TASK-133, with the bounded-retry
   re-entry after a provisioning failure being legal),
-- **(c)** no SSID or password substring of the test credential appears
+- **(c)** on a fresh-device boot (`--expect provisioning`) the TASK-135
+  portal-reachability signature `[INFO]: [prov_mgr] provisioning AP up;
+  portal reachable` was observed — the WHOLE portal (radio AP+STA and both
+  bound listeners) is up, not merely the radio (added in TASK-138),
+- **(d)** no SSID or password substring of the test credential appears
   anywhere in the captured log (secrecy rule, TASK-120/126).
 
 It prints the observed transition sequence (useful for task notes) and
@@ -444,9 +448,9 @@ the portal.
 | Concern | Where it is verified |
 |---------|----------------------|
 | Adapter lifecycle, start/stop idempotency, failure propagation, URL overrides, concurrency | Host unit tests (`wifi_provisioning_manager_test.c`, `ctest`) |
-| Credentials-never-logged secrecy rule | Host unit tests (log-content regression) **and** on-target smoke check assertion (c) |
+| Credentials-never-logged secrecy rule | Host unit tests (log-content regression) **and** on-target smoke check assertion (d) |
 | Portal state observability signatures (reachable edge / distinct start-failure code / 30 s rate-limited wait heartbeat) | Host unit tests (log-content regression: exact signatures, rate-limit count, and no known SSID/password/URL in the captured log) |
-| Portal startup/stop observable in the log | On target (smoke check assertion (b) + manual procedure) |
+| Portal startup/reachability observable in the log | On target (smoke check assertions (b) + (c), TASK-138, + manual procedure) |
 | End-to-end provision (radio: join AP → submit → connect → grace retire) | On target manual procedure (needs a second radio and a lab WLAN) |
 | **Portal submit overwrites a stale saved credential (TASK-136)** | Host unit tests (`wifi_storage_overwrite_test.c`, CTest `wifi_storage_overwrite_tests`) — see the [overwrite-path trace](#task-136-overwrite-path-trace) below |
 
@@ -898,3 +902,103 @@ Run the smoke check against a captured log at any time:
 python3 tests/wifi_provisioning_manager/on_target_smoke_check.py \
     --log /tmp/hq_led_lamp_esp.log --expect any
 ```
+
+---
+
+## TASK-138: on-target verification record — fresh device reaches the portal
+
+Scope: **scenario (a) only** — a fresh device (no saved station credential)
+opens the provisioning portal and stays provisionable at the
+`NETWORK --PROVISIONING_STARTED--> PROVISIONING` gate.  The interactive
+success path (a human joins the AP and submits a real test SSID/password;
+the controller retires the AP after the grace period; the machine proceeds
+`PROVISIONING_SUCCEEDED -> NETWORK -> TLS`) is the **MANUAL STEP** and is
+deferred to the single batched session with TASK-139; the automated log
+assertions below cover the fresh-entry half, and the same smoke checker
+covers the success-path signatures whenever that session exercises them.
+
+**Setup.**  WROOM build rebuilt from scratch (`idf.py fullclean &&
+idf.py build`, passes).  A fresh storage image was prepared with the
+platform `littlefs_util` (4096-byte blocks, 393216 B) from the manual-
+procedure step-1 payload — `device.json`, `manufacturing.json`
+(`state=1 mode=1`), `mqtt.json`, `identity.json`, `/cert/ca.crt` — with
+**no** `wifi_ap.json` (the fresh-device target state).  The credential
+store was erased per the TASK-137 procedure (path B, serial):
+`idf.py erase-flash -p /dev/ttyUSB1` (fresh NVS -> no saved station
+credential; fresh storage) + `write_flash 0x3A0000 /tmp/klc_storage_fresh.littlefs`
+(restores the four config documents + CA), then `idf.py flash -p /dev/ttyUSB1`.
+Device: ESP32-WROOM-32D (`/dev/ttyUSB1`, chip `ESP32-D0WD-V3`,
+MAC `c0:49:ef:e8:24:b8`), ESP-IDF v5.5.5.
+
+**Observed log sequence (first fresh cycle, 60 s monitor).**  The boot goes
+filesystem -> configuration -> network; the NETWORK gate's first entry finds
+no `wifi_ap.json`, the controller's fresh-device fallback opens the portal,
+and the supervisor delivers the STARTED outcome:
+
+```
+I (604) klc: Kitchen LED Controller starting (state-machine supervisor)
+[app_state] boot --start(bootstrap)--> filesystem (session 1)
+I (664) klc: Filesystem ready: storage mounted at /littlefs (cert/, config/, state/)
+[app_state] filesystem --fs-ok(filesystem)--> configuration (session 1)
+I (724) klc: device.json loaded: product='HQ Lamp' hw='B' tb='klc-kitchen-01'
+I (754) klc: manufacturing.json loaded: state=1 mode=1
+I (844) klc: Device identity loaded (access-token auth, client id ready for ThingsBoard initialization)
+[app_state] configuration --config-ok(configuration)--> network (session 1)
+[DEBUG]: wifi_config_load: path=wifi_ap.json        <- credential store erased:
+[DBG]/[ERR]: wifi_config_read_file: osal_stat failed rc=-46  <- no wifi_ap.json -> wifi_mgmt_is_read_data()=false
+[INFO]: [prov_mgr] wifi provisioning adapter initialized
+[INFO]: [prov_mgr] controller transition 1 -> 3 (product event 1)
+[INFO]: [prov_mgr] provisioning AP up; portal reachable          <- TASK-135 portal-reachability signature
+I (1344) klc: Provisioning flow started by the controller; entering Wi-Fi provisioning
+[INFO]: [app_state] network --provisioning-started(network)--> provisioning (session 1)
+I (1364) klc: Provisioning gate: portal owned by the controller; waiting for its outcome events
+[INFO]: [prov_mgr] portal up; station not yet connected (waiting for a client to join and submit; one log line per 30 s)
+```
+
+(The `esp_wifi_connect failed: ESP_ERR_WIFI_SSID` lines bracketing the
+portal-up line are the STA side of AP+STA trying to connect with the
+still-empty config before a submission — expected on a fresh device, never
+a credential leak.)
+
+**Automated log assertions** (`on_target_smoke_check.py --log
+/tmp/hq_led_lamp_esp.log --expect provisioning`) — **PASS**:
+
+- no `Backtrace:` (0 lines in the captured window),
+- legal provisioning sequence (`ENTER` only): the supervisor delivered the
+  controller's STARTED event, i.e. the legal `NETWORK --provisioning-started-->
+  PROVISIONING` entry — exactly scenario (a),
+- **TASK-135 portal-reachability signature** `[INFO]: [prov_mgr] provisioning
+  AP up; portal reachable` observed (assertion (c), added in TASK-138 — the
+  WHOLE portal, not merely the radio, is up),
+- no `KLC-Smoke-128-Test` / `KLC-Sm0ke-Pa55-128!` substring anywhere.
+
+**Reproducibility.**  A second `idf.py flash` (app flash never touches the
+storage partition, so no `wifi_ap.json` re-appears) + 60 s monitor
+reproduced the **identical** entry sequence (configuration gate -> `No saved
+station credential` path -> `provisioning AP up; portal reachable` ->
+`network --provisioning-started--> provisioning` -> rate-limited wait
+heartbeat); the smoke check PASSED again on `/tmp/hq_led_lamp_esp2.log`.
+The dev workstation's Wi-Fi was never touched (serial-only procedure).
+
+**On-target observation — AP identity.**  This product build does not call
+`wifi_mgmt_set_ap_credentials()` before `wifi_mgmt_start()`, so the
+provisioning AP this build advertises is the platform **default**:
+`wifi_provisioning:<MAC>` (observed `wifi_provisioning:c0:49:ef:e8:24`),
+**open** (no password — the platform logs
+`starting an UNSECURED (open, no password) provisioning AP ... because no
+product identity was configured`).  The `Bimbrownik:<MAC>` /
+`SuperTrudne1!-_` identity documented above is the platform **demo**
+example's runtime identity; wiring a product AP identity (serial-derived
+SSID + WPA2 password) is a follow-up, not part of this verification.  Until
+then, the manual join step looks for the `wifi_provisioning:<MAC>` network
+(see the AP facts table in the [manual procedure](#manual-on-target-procedure);
+a later task should update it when the identity is wired).
+
+**Manual step (deferred to TASK-139's batched session).**  A human joins the
+provisioning AP with a phone/laptop and submits a real test SSID/password
+through the captive portal (the workstation's Wi-Fi stays untouched); the
+captured log must then be asserted for: no SSID/password substring anywhere,
+the station connects, the controller retires the AP after the grace period,
+and the machine proceeds `PROVISIONING_SUCCEEDED -> NETWORK -> TLS` (the
+smoke checker validates the `SUCCESS` transition and the no-secret rule;
+the NETWORK/TLS gate lines are recorded from that session).

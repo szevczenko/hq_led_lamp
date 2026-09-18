@@ -18,7 +18,11 @@ loop itself or from an already-captured log file) and asserts:
       --PROVISIONING_STARTED--> PROVISIONING --PROVISIONING_SUCCEEDED/FAILED->
       NETWORK | SAFE_OFF), including the bounded-retry re-entry the
       state machine legally performs after a provisioning failure,
-  (c) no SSID or password substring of the test credential appears
+  (c) on a fresh-device boot (``--expect provisioning``) the TASK-135
+      portal-reachability signature ``[INFO]: [prov_mgr] provisioning AP up;
+      portal reachable`` was observed — the WHOLE portal (radio AP+STA plus
+      the bound HTTP/captive-DNS listeners) is up, not merely the radio,
+  (d) no SSID or password substring of the test credential appears
       anywhere in the captured log — the secrecy rule holds even for the
       credential the manual procedure submits.
 
@@ -156,6 +160,15 @@ TRANSITIONS = {
 # provisioning stage on a fresh device.
 _EXPECT_PROVISIONING_MARKERS = ("ENTER",)
 
+# TASK-135 portal-reachability signature: the adapter emits ONE
+# credential-free line per portal-up period when the WHOLE portal is up —
+# the radio reached AP+STA **and** both owned listeners (HTTP + captive
+# DNS) are bound, i.e. exactly the platform reachability surface
+# `wifi_http_provisioning_is_reachable()`.  A fresh-device boot must show it;
+# it is not part of the transition state machine because it can legally
+# repeat across fallback re-entries (each portal-up false->true edge).
+PORTAL_REACHABLE_SIGNATURE = "provisioning AP up; portal reachable"
+
 # Boot banner that proves the monitor captured a real boot (sanity check
 # against an empty/quiet serial line).
 BOOT_BANNER = "Kitchen LED Controller starting"
@@ -223,9 +236,9 @@ def parse_args(argv):
         choices=("provisioning", "pass-through", "any"),
         default="provisioning",
         help="Boot branch the test expects: 'provisioning' (fresh device "
-             "must enter the portal), 'pass-through' (credentialed device "
-             "must skip the portal), or 'any' (validate whatever legal "
-             "branch occurs).",
+             "must enter the portal AND show the TASK-135 portal-reachable "
+             "signature), 'pass-through' (credentialed device must skip the "
+             "portal), or 'any' (validate whatever legal branch occurs).",
     )
     return parser.parse_args(argv)
 
@@ -379,7 +392,21 @@ def main(argv=None):
     if not ok:
         failures.append("state-machine sequence check failed: %s" % detail)
 
-    # (c) no credential content in the log ----------------------------- #
+    # (c) TASK-135 portal-reachability signature on a fresh-device boot - #
+    # The WHOLE portal (radio AP+STA + both bound listeners) must be up,  #
+    # not merely the radio: the signature fires once per portal-up        #
+    # false->true edge (deduplicated, re-armed by stop).  A fresh-device  #
+    # boot reaches it right after the controller's STARTED event; a       #
+    # credentialed pass-through boot intentionally never shows it, so the #
+    # assertion applies only to --expect provisioning.                    #
+    if args.expect == "provisioning" and PORTAL_REACHABLE_SIGNATURE not in text:
+        failures.append(
+            "expected a fresh-device boot with a reachable provisioning "
+            "portal, but the TASK-135 signature %r was not observed"
+            % ("[INFO]: [prov_mgr] " + PORTAL_REACHABLE_SIGNATURE)
+        )
+
+    # (d) no credential content in the log ------------------------------ #
     leak = find_secret_leak(text, test_ssid, test_password)
     if leak is not None:
         failures.append(
@@ -400,10 +427,17 @@ def main(argv=None):
     else:
         verb = "flash/monitor loop on %s" % args.port
     entered = "ENTER" in sequence
+    portal = PORTAL_REACHABLE_SIGNATURE in text
     print(
-        "PASS: %s — backtrace-free, legal %s transition sequence, no "
-        "test-credential substring in %d log lines."
-        % (verb, "provisioning" if entered else "pass-through", len(lines))
+        "PASS: %s — backtrace-free, legal %s transition sequence, "
+        "TASK-135 portal-reachability signature %s, no test-credential "
+        "substring in %d log lines."
+        % (
+            verb,
+            "provisioning" if entered else "pass-through",
+            "observed" if portal else "not applicable (pass-through)",
+            len(lines),
+        )
     )
     return 0
 
