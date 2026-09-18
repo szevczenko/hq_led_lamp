@@ -11,22 +11,32 @@
  *      (type selection -> init -> subscribe -> start -> connect), reports
  *      NETWORK_OK, arms both callbacks and gates ThingsBoard through
  *      network_manager_wait_connected(),
- *   2. disconnect — a disconnect-class event forces the lamp output
+ *   2. mode policy (TASK-129/TASK-130) — the adapter owns the Wi-Fi start
+ *      mode (KLC_WIFI_DEFAULT_MODE): the default build requests AP+STA
+ *      (T_WIFI_TYPE_CLI_SER) and it does so BEFORE wifi_mgmt_start()
+ *      (ordering, not just occurrence); in AP+STA mode the
+ *      connect/disconnect callbacks fire exactly as before the mode policy;
+ *      and a concurrent stop during start still disarms the session
+ *      regardless of the mode,
+ *   3. disconnect — a disconnect-class event forces the lamp output
  *      inactive BEFORE the application on_disconnected() runs, and the
  *      connected-state query turns false,
- *   3. invalid credentials — a failed connect attempt (CONNECT_FAILED)
+ *   4. invalid credentials — a failed connect attempt (CONNECT_FAILED)
  *      drives the same fail-off path and leaves the adapter started, so a
  *      later reconnect is possible,
- *   4. reconnect — after a loss the adapter reports the restored
+ *   5. reconnect — after a loss the adapter reports the restored
  *      connection and delivers on_connected() again for every restore,
- *   5. stale callbacks — after network_manager_stop() a late event that
+ *   6. stale callbacks — after network_manager_stop() a late event that
  *      raced the unsubscribe is dropped (no application callback runs
  *      again) while the idempotent lamp fail-off still happens,
- *   6. API contract — argument validation, double start, failed start
+ *   7. API contract — argument validation, double start, failed start
  *      rollback (nothing stays registered, restart allowed), the
  *      zero-timeout wait and the stop-before-start no-op,
- *   7. secrecy — the adapter log records state transitions only; no
- *      credential-like content (SSID/password) is ever logged.
+ *   8. secrecy — the adapter log records state transitions only; no
+ *      credential-like content (SSID/password) is ever logged,
+ *   9. concurrency — first-use races for the started flag and the lazy
+ *      lock (review findings 3 and 4), plus the published-lock lifecycle
+ *      race.
  */
 
 #include <pthread.h>
@@ -128,8 +138,12 @@ static void test_connect_starts_wifi_and_reports_connected(void)
     TEST_ASSERT_TRUE(network_manager_is_connected() == false);
 
     counters = wifi_mgmt_mock_get_counters();
-    /* Station mode is the product role. */
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
+    /* The default build requests AP+STA (T_WIFI_TYPE_CLI_SER): the mode
+     * policy (KLC_WIFI_DEFAULT_MODE) is a product decision, and the mode is
+     * requested BEFORE the manager is started (ordering, not just
+     * occurrence). */
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_TRUE(counters.type_before_start);
     TEST_ASSERT_TRUE(counters.set_type_calls >= 1U);
     TEST_ASSERT_TRUE(counters.init_calls >= 1U);
     TEST_ASSERT_TRUE(counters.start_calls >= 1U);
@@ -180,7 +194,146 @@ static void test_wait_connected_blocks_until_connected(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 2. Disconnect: fail-off before the application callback                */
+/* 2. Mode policy (TASK-129/TASK-130)                                     */
+/* --------------------------------------------------------------------- */
+
+/* The Wi-Fi start mode is a product policy decision owned by the adapter
+ * (KLC_WIFI_DEFAULT_MODE, main/Kconfig.projbuild): the default build must
+ * request AP+STA (T_WIFI_TYPE_CLI_SER) and it must do so BEFORE
+ * wifi_mgmt_start() runs — the mode is selected inside the onboarding
+ * transaction (set_wifi_type -> init -> subscribe -> start), not applied
+ * afterwards.  The mock records this ordering explicitly
+ * (type_before_start), so the assertion is order-based, not
+ * occurrence-based. */
+static void test_default_build_requests_apsta_mode_before_start(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    wifi_mock_counters_t counters;
+
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+
+    counters = wifi_mgmt_mock_get_counters();
+    /* The default build requests AP+STA: the provisioning portal's soft-AP
+     * must be available when no usable credentials exist yet. */
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    /* Ordering: the Kconfig-selected mode was requested BEFORE the manager
+     * was started (not just requested at all). */
+    TEST_ASSERT_TRUE(counters.type_before_start);
+    /* The default onboarding path selects the mode exactly once, before any
+     * other platform call. */
+    TEST_ASSERT_EQUAL_UINT(1U, counters.set_type_calls);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.init_calls);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.start_calls);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.connect_calls);
+    TEST_ASSERT_TRUE(counters.start_before_connect);
+}
+
+/* The platform behaves differently in AP+STA mode (the AP interface is up
+ * while the station retries), so the connect/disconnect callback semantics
+ * must be regression-covered: with the mocked boundary reporting AP+STA
+ * mode, on_connected/on_disconnected fire exactly as before the mode policy
+ * — CONNECTED delivers on_connected(context) once per event, DISCONNECTED
+ * forces the lamp output inactive BEFORE on_disconnected(context) runs. */
+static void test_callbacks_fire_in_apsta_mode_as_before(void)
+{
+    static int ctx;
+    network_callbacks_t cb = make_callbacks(&ctx);
+    wifi_mock_counters_t counters;
+
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+
+    /* The session onboarded in AP+STA mode. */
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+
+    /* Connected: exactly one on_connected with the registered context, no
+     * spurious disconnect delivery. */
+    wifi_mgmt_mock_set_connected(true);
+    TEST_ASSERT_EQUAL_INT(1, wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.connected_calls);
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.disconnected_calls);
+    TEST_ASSERT_EQUAL_PTR(&ctx, s_app.last_context);
+
+    /* Disconnected: fail-off happens BEFORE the application callback, the
+     * lamp is off and exactly one on_disconnected runs. */
+    wifi_mgmt_mock_set_connected(false);
+    TEST_ASSERT_EQUAL_INT(1,
+                          wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_DISCONNECTED));
+    TEST_ASSERT_EQUAL_UINT(1U, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.lamp_off_calls_at_disconnect_entry);
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.disconnected_calls);
+    TEST_ASSERT_EQUAL_UINT(1U, s_app.connected_calls);
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+
+    /* A second cycle delivers the same exact semantics again. */
+    wifi_mgmt_mock_set_connected(true);
+    TEST_ASSERT_EQUAL_INT(1, wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(2U, s_app.connected_calls);
+    wifi_mgmt_mock_set_connected(false);
+    TEST_ASSERT_EQUAL_INT(1,
+                          wifi_mgmt_mock_emit(WIFI_MGMT_EVENT_DISCONNECTED));
+    TEST_ASSERT_EQUAL_UINT(2U, s_app.disconnected_calls);
+    TEST_ASSERT_EQUAL_PTR(&ctx, s_app.last_context);
+}
+
+/* Start/stop transaction race regression for the mode policy (TASK-130): a
+ * concurrent stop() that completes while a start() is still inside its
+ * platform transaction must still disarm the session REGARDLESS of the
+ * Kconfig-selected mode — with the default AP+STA request active, no
+ * subscription survives the completed stop(), no application callback ever
+ * fires and the racing start() reports a startup failure (never NETWORK_OK
+ * for an adapter that was already stopped). */
+static void test_stop_during_start_disarms_apsta_session(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    wifi_mock_counters_t counters;
+
+    /* Park the in-flight start() inside its transaction (after it subscribed
+     * and started the manager), exactly like the generic race regression —
+     * but now with the AP+STA mode policy observable in the counters. */
+    wifi_mgmt_mock_block_wait_ready();
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&s_tx_thread, NULL,
+                                            tx_start_worker, NULL));
+    wifi_mgmt_mock_wait_blocked_in_wait_ready();
+
+    /* The mode policy was applied before the manager was started. */
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_TRUE(counters.type_before_start);
+
+    /* A complete stop() runs while the start() is still in flight: it must
+     * disarm the session regardless of the mode. */
+    network_manager_stop();
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+
+    /* Let the start() continue: it must observe the completed stop(), roll
+     * everything back and report a startup failure. */
+    wifi_mgmt_mock_release_wait_ready();
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(s_tx_thread, NULL));
+
+    TEST_ASSERT_TRUE(atomic_load(&s_tx_result) != NETWORK_OK);
+
+    /* Nothing survives the completed stop(): no subscription and no armed
+     * callback; a fresh AP+STA start works normally afterwards. */
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_NULL(
+        wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.connected_calls);
+    TEST_ASSERT_EQUAL_UINT(0U, s_app.disconnected_calls);
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+    (void)counters;
+
+    wifi_mock_config_t config = { .connected_state = true };
+    wifi_mgmt_mock_set_config(&config);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    TEST_ASSERT_TRUE(network_manager_wait_connected(0));
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+}
+
+/* --------------------------------------------------------------------- */
+/* 3. Disconnect: fail-off before the application callback                */
 /* --------------------------------------------------------------------- */
 
 static void test_disconnect_forces_lamp_off_before_callback(void)
@@ -247,7 +400,7 @@ static void test_unrelated_events_are_ignored(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 3. Invalid credentials: connect attempt fails, device fails off        */
+/* 4. Invalid credentials: connect attempt fails, device fails off        */
 /* --------------------------------------------------------------------- */
 
 static void test_invalid_credentials_fail_off_and_stay_started(void)
@@ -287,7 +440,7 @@ static void test_invalid_credentials_fail_off_and_stay_started(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 4. Reconnect                                                           */
+/* 5. Reconnect                                                           */
 /* --------------------------------------------------------------------- */
 
 static void test_reconnect_after_loss_restores_connection(void)
@@ -330,7 +483,7 @@ static void test_repeated_connect_events_deliver_each_time(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 5. Stale callbacks after stop                                          */
+/* 6. Stale callbacks after stop                                          */
 /* --------------------------------------------------------------------- */
 
 static void test_late_event_after_stop_is_dropped_but_fails_off(void)
@@ -504,7 +657,7 @@ static void test_stop_is_idempotent(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 6. API contract                                                        */
+/* 7. API contract                                                        */
 /* --------------------------------------------------------------------- */
 
 static void test_start_rejects_invalid_callbacks(void)
@@ -709,7 +862,7 @@ static void test_stop_in_connect_window_rolls_back_start(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 7. Secrecy: no credential content in adapter logs                      */
+/* 8. Secrecy: no credential content in adapter logs                      */
 /* --------------------------------------------------------------------- */
 
 static void test_logs_never_contain_credential_content(void)
@@ -729,11 +882,10 @@ static void test_logs_never_contain_credential_content(void)
     TEST_ASSERT_NOT_NULL(strstr(log, "network connected"));
     TEST_ASSERT_NOT_NULL(strstr(log, "network disconnected"));
 
-    /* No credential-looking content: neither the platform default AP
-     * credentials (WIFI_AP_NAME / WIFI_AP_PASSWORD macros) nor generic
-     * SSID/password reporting may appear in adapter logs. */
-    TEST_ASSERT_NULL(strstr(log, WIFI_AP_NAME));
-    TEST_ASSERT_NULL(strstr(log, WIFI_AP_PASSWORD));
+    /* No credential-looking content may appear in adapter logs.
+     * (wifi_managment.h no longer ships WIFI_AP_NAME / WIFI_AP_PASSWORD at
+     * all — the provisioning AP identity is runtime-only — so the generic
+     * SSID/password checks below are the regression surface.) */
     TEST_ASSERT_NULL(strstr(log, "ssid"));
     TEST_ASSERT_NULL(strstr(log, "SSID"));
     TEST_ASSERT_NULL(strstr(log, "password"));
@@ -741,7 +893,7 @@ static void test_logs_never_contain_credential_content(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 8. Concurrency: first-use races (review findings 3 and 4)              */
+/* 9. Concurrency: first-use races (review findings 3 and 4)              */
 /* --------------------------------------------------------------------- */
 
 /* The adapter mutex is created lazily on the very first API call and the
@@ -874,12 +1026,13 @@ static void test_concurrent_first_start_race_is_safe(void)
     TEST_ASSERT_EQUAL_UINT(CONCURRENT_THREADS - 1U,
                            atomic_load(&s_conc.start_rejected));
 
-    /* The winner's onboarding ran: station mode selected and the three
-     * product events subscribed exactly once (the losers never subscribed:
-     * they were rejected under the adapter lock before touching the
-     * manager). */
+    /* The winner's onboarding ran: the default AP+STA mode selected (before
+     * the manager was started) and the three product events subscribed
+     * exactly once (the losers never subscribed: they were rejected under
+     * the adapter lock before touching the manager). */
     counters = wifi_mgmt_mock_get_counters();
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_TRUE(counters.type_before_start);
     TEST_ASSERT_EQUAL_UINT(3U, counters.subscribe_calls);
 
     /* The adapter is operational after the race: events deliver normally
@@ -972,26 +1125,31 @@ int main(void)
     RUN_TEST(test_connect_event_delivers_on_connected_with_context);
     RUN_TEST(test_wait_connected_blocks_until_connected);
 
-    /* 2. disconnect */
+    /* 2. mode policy (TASK-129/TASK-130) */
+    RUN_TEST(test_default_build_requests_apsta_mode_before_start);
+    RUN_TEST(test_callbacks_fire_in_apsta_mode_as_before);
+    RUN_TEST(test_stop_during_start_disarms_apsta_session);
+
+    /* 3. disconnect */
     RUN_TEST(test_disconnect_forces_lamp_off_before_callback);
     RUN_TEST(test_connect_failure_event_also_fails_off);
     RUN_TEST(test_fail_off_error_is_survived_and_logged);
     RUN_TEST(test_unrelated_events_are_ignored);
 
-    /* 3. invalid credentials */
+    /* 4. invalid credentials */
     RUN_TEST(test_invalid_credentials_fail_off_and_stay_started);
 
-    /* 4. reconnect */
+    /* 5. reconnect */
     RUN_TEST(test_reconnect_after_loss_restores_connection);
     RUN_TEST(test_repeated_connect_events_deliver_each_time);
 
-    /* 5. stale callbacks */
+    /* 6. stale callbacks */
     RUN_TEST(test_late_event_after_stop_is_dropped_but_fails_off);
     RUN_TEST(test_stale_token_from_previous_session_is_dropped);
     RUN_TEST(test_stop_disarms_and_unsubscribes);
     RUN_TEST(test_stop_is_idempotent);
 
-    /* 6. API contract */
+    /* 7. API contract */
     RUN_TEST(test_start_rejects_invalid_callbacks);
     RUN_TEST(test_double_start_is_rejected);
     RUN_TEST(test_failed_start_rolls_back_and_allows_restart);
@@ -1001,10 +1159,10 @@ int main(void)
     RUN_TEST(test_stop_in_connect_window_rolls_back_start);
     RUN_TEST(test_is_connected_false_before_start);
 
-    /* 7. secrecy */
+    /* 8. secrecy */
     RUN_TEST(test_logs_never_contain_credential_content);
 
-    /* 8. concurrency: first-use races for the started flag and the lazy
+    /* 9. concurrency: first-use races for the started flag and the lazy
      *    lock (review findings 3 and 4). */
     RUN_TEST(test_concurrent_first_start_race_is_safe);
     RUN_TEST(test_concurrent_first_start_stop_is_connected_race_is_safe);

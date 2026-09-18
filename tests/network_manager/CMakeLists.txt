@@ -8,8 +8,11 @@
 # normal CTest executable on the host.
 #
 # Coverage: connect, disconnect (fail-off ordering), invalid credentials,
-# reconnect, stale/late callbacks after stop, start/stop lifecycle contract
-# and the credentials-never-logged secrecy rule.
+# reconnect, stale/late callbacks after stop, start/stop lifecycle contract,
+# the mode policy (TASK-130: the default build requests the Kconfig-selected
+# AP+STA mode BEFORE wifi_mgmt_start(), callbacks fire identically in AP+STA,
+# and a concurrent stop during start still disarms the session regardless of
+# the mode) and the credentials-never-logged secrecy rule.
 #
 # Usage:
 #   cmake -S tests/network_manager -B <build-dir>
@@ -50,6 +53,17 @@ target_include_directories(network_manager_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/config
     ${LAMP_CONTROL_UNITY_DIR}
+)
+
+# The adapter's Wi-Fi start mode is a product policy owned by Kconfig
+# (KLC_WIFI_DEFAULT_MODE, main/Kconfig.projbuild): the network adapter
+# compiles the Kconfig-selected mode into network_manager_start().  The host
+# test build mirrors the product DEFAULT (AP+STA, T_WIFI_TYPE_CLI_SER — the
+# provisioning portal's soft-AP must be available), which is exactly what
+# the mode-policy cases (TASK-130) assert.  Keep this in lockstep with the
+# project default in main/Kconfig.projbuild.
+target_compile_definitions(network_manager_tests PRIVATE
+    CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA=1
 )
 
 # Match the platform project's strict host-test flags where Unity tolerates

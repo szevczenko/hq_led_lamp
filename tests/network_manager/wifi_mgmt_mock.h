@@ -17,8 +17,12 @@
  *   - failure injection lets tests flip wait-ready / connect / subscribe
  *     results so every adapter failure and rollback path is reachable,
  *   - call counters expose how often each manager operation was invoked so
- *     tests can assert the onboarding order (init -> subscribe -> start ->
- *     connect) and the stop behavior.
+ *     tests can assert the onboarding order (type selection -> init ->
+ *     subscribe -> start -> connect) and the stop behavior; the counter
+ *     snapshot also records ORDERING observations (type_before_start,
+ *     start_before_connect) so tests can assert, e.g., that the
+ *     Kconfig-selected mode is requested BEFORE wifi_mgmt_start() — an
+ *     ordering contract, not just an occurrence.
  *
  * Secrecy: the double contains no SSID/password API at all.  The adapter
  * under test must not reference credential persistence (wifi_config), and
@@ -119,6 +123,7 @@ typedef struct wifi_mock_counters
   unsigned unsubscribe_calls;
   wifi_type_t last_type;
   bool start_before_connect; /**< start observed before first connect.     */
+  bool type_before_start;    /**< set_wifi_type observed before start.    */
   unsigned init_before_start_violations;
 } wifi_mock_counters_t;
 

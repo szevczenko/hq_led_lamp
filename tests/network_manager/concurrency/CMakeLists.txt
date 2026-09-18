@@ -47,6 +47,13 @@ target_include_directories(network_manager_concurrency_tests PRIVATE
     ${UNITY_DIR}
 )
 
+# Mirror the product default for the adapter's Kconfig-selected Wi-Fi start
+# mode (KLC_WIFI_DEFAULT_MODE, main/Kconfig.projbuild): the host build uses
+# AP+STA (T_WIFI_TYPE_CLI_SER), matching the main network-manager suite.
+target_compile_definitions(network_manager_concurrency_tests PRIVATE
+    CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA=1
+)
+
 target_compile_options(network_manager_concurrency_tests PRIVATE -Wall -Wextra -Werror -Wpedantic)
 
 target_link_libraries(network_manager_concurrency_tests PRIVATE Threads::Threads)

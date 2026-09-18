@@ -180,12 +180,13 @@ static void test_concurrent_true_first_start_race_is_safe(void)
     TEST_ASSERT_EQUAL_UINT(CONCURRENT_THREADS - 1U,
                            atomic_load(&s_conc.start_rejected));
 
-    /* The winner's onboarding ran: station mode selected and the three
-     * product events subscribed exactly once (the losers never subscribed:
-     * they were rejected under the adapter lock before touching the
-     * manager). */
+    /* The winner's onboarding ran: the default AP+STA mode selected (before
+     * the manager was started) and the three product events subscribed
+     * exactly once (the losers never subscribed: they were rejected under
+     * the adapter lock before touching the manager). */
     counters = wifi_mgmt_mock_get_counters();
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_TRUE(counters.type_before_start);
     TEST_ASSERT_EQUAL_UINT(3U, counters.subscribe_calls);
 
     /* The adapter is operational after the race: events deliver normally

@@ -244,6 +244,13 @@ void wifi_mgmt_start(void)
 {
   pthread_mutex_lock(&s_mock_lock);
   ++s_mock.counters.start_calls;
+  /* Ordering observation for the mode policy (TASK-130): record, at the
+   * moment the manager is started, whether a wifi_mgmt_set_wifi_type() call
+   * was already observed.  Tests use this to assert that the adapter
+   * requests the Kconfig-selected mode BEFORE wifi_mgmt_start() — an
+   * ordering contract, not just an occurrence. */
+  s_mock.counters.type_before_start =
+      (s_mock.counters.set_type_calls > 0U);
   pthread_mutex_unlock(&s_mock_lock);
 }
 
