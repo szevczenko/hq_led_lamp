@@ -390,7 +390,13 @@ through the controller — `ENTER -> …` again in the same log).
 ## Failure-mode matrix
 
 Every row lists the trigger, the observable log signature, the state the
-device ends in, and the recovery path.
+device ends in, and the recovery path.  A park in **any** row is recoverable
+**without a reflash** through the documented
+[erase/re-provision escape hatch](#task-137-erasureprovision-escape-hatch)
+below (platform `wifi_mgmt_erase_credentials()` where reachable, or the
+serial storage-partition erase for a device that cannot reach the API),
+followed by a restart — the controller's fresh-device fallback then reopens
+the portal.
 
 ### 1. Portal bind failure
 
@@ -551,6 +557,189 @@ ctest --test-dir <build-dir> --output-on-failure
 
 ---
 
+## TASK-137: erase/re-provision escape hatch
+
+A device that parks in `SAFE_OFF` after a failed portal window — or that
+holds a stale/unusable saved credential (TASK-136 covers the
+portal-submission overwrite, not the "saved credential is wrong and no
+client is around to fix it" case) — must always be bringable back to the
+PROVISIONING flow.  The escape hatch is a **supported platform API**
+(`wifi_mgmt_erase_credentials()`, platform TASK-015), not a reflash: erase
+the saved credential, restart/re-init, and the platform controller's
+fresh-device fallback reopens the portal.  This section documents the erase
+paths, the restart/re-init step, the product trigger decision, and the
+on-target verification record.
+
+### How a device becomes "fresh" again (source trace)
+
+The provisioning entry decision chain:
+
+1. **Boot-time credential load.**  `wifi_managment.c`
+   `_load_saved_config()` (called inside `wifi_mgmt_init()`, which the
+   product runs on the NETWORK gate's first entry) loads
+   `WIFI_CONFIG_FILE_PATH` (`wifi_ap.json` → `/littlefs/wifi_ap.json` under
+   the product mount) and sets the private flag `read_wifi_data` — the
+   public view is `wifi_mgmt_is_read_data()` — only when a usable saved
+   credential exists.  (TASK-136 additionally sets the flag on a successful
+   portal submission; `wifi_mgmt_erase_credentials()` clears it again.)
+2. **Controller init fallback.**  `wifi_provisioning_controller.c` init
+   (reached through the adapter's `wifi_provisioning_manager_init()` on the
+   NETWORK gate's first entry) runs `if (!wifi_mgmt_is_read_data())`: on a
+   fresh device it opens the provisioning application immediately
+   (`fallback_started = true`, portal start,
+   `WIFI_PROVISIONING_CONTROLLER_PROVISIONING`, STARTED notification).  A
+   credentialed device gets no portal here and proceeds to the connect path.
+3. **Supervisor delivery.**  The supervisor (TASK-133) delivers the
+   controller's STARTED event, the machine moves
+   `NETWORK --provisioning-started--> PROVISIONING`, and the portal runs
+   (`[prov_mgr] provisioning AP up; portal reachable`).
+
+Erasing the saved credential makes step 1 report "no credential" on the next
+init, so step 2 opens the portal — an erased device is indistinguishable
+from a fresh one.
+
+### Erase path A — platform API where reachable
+
+`wifi_mgmt_erase_credentials()` (declared in
+`platform/hq_platform/src/wifi/wifi_managment.h`, implemented in
+`wifi_managment.c`; platform tests cover it in
+`platform/hq_platform/tests/wifi/wifi_mgmt_test.c`):
+
+- removes `wifi_ap.json` from the mounted storage **and** clears the
+  in-memory credential state (`config_list`, `current_cred_nb`,
+  `config_loaded`, `read_wifi_data`, `saved_data`, `sta_cfg`) under the
+  state lock, so a concurrent `wifi_mgmt_is_read_data()` never observes a
+  partial erase,
+- is idempotent: erasing with no saved credential is a no-op success
+  (returns true),
+- is safe in every Wi-Fi state: not-initialized/stopped (removes any
+  credential file on the mounted storage), running-disconnected (fresh
+  immediately), running-connected (the live session stays up — the HAL owns
+  the running network configuration — but the next reconnect/restart starts
+  from the fresh-device state),
+- never logs credential content — only the outcome
+  (`[wifi] saved credentials erased` or
+  `[wifi] credential erase failed rc=<rc>`), per the platform Wi-Fi logging
+  policy (TASK-015).
+
+Precondition: the LittleFS `storage` partition must be mounted (the product
+FILESYSTEM gate ran) so the OSAL file operations reach
+`/littlefs/wifi_ap.json`; the Wi-Fi manager itself does not need to be
+running.
+
+**Reachability in this product:** the API is part of the platform the
+product links, but no product trigger is wired to it yet (product trigger
+decision below).  "Where reachable" today means a developer/CI harness (the
+platform POSIX builds compile the same manager API and can call it
+programmatically) or a temporary product test build; a future product
+trigger (long-press factory reset / OTA command) becomes the supported call
+site for field devices.  The recovery contract is identical to path B:
+erase → restart/re-init → the controller's fresh-device fallback reopens
+the portal.
+
+### Erase path B — erase the littlefs storage partition (API not reachable)
+
+When the API cannot be reached (no trigger, no console, unresponsive
+firmware), erase the saved credential at the partition level.  The
+credential file lives on the LittleFS `storage` partition:
+
+| Storage fact | Value |
+|---|---|
+| Partition | `storage` (`data, littlefs`); offset `0x3A0000`, size `0x60000` (393216 B) — see `partitions.csv` |
+| Credential file | `/littlefs/wifi_ap.json` (relative OSAL path `wifi_ap.json`) |
+| Required config documents | `/config/{device,manufacturing,mqtt,identity}.json` + `/cert/ca.crt` — the CONFIGURATION gate requires them, so a **bare** partition erase (without re-writing the documents) parks the device at `configuration --config-fail--> safe-off`, before the provisioning stage |
+
+Procedure (serial-attached operator; **no app reflash**):
+
+```sh
+# 1. Build the credential-free storage image: unpack the current image,
+#    drop wifi_ap.json, recreate (or start from the canonical fresh payload
+#    of the manual procedure step 1, which has no wifi_ap.json):
+/tmp/littlefs_util --unpack /tmp/current.littlefs --out /tmp/klc_payload_fresh
+rm -f /tmp/klc_payload_fresh/wifi_ap.json
+/tmp/littlefs_util --create /tmp/klc_payload_fresh \
+    --out /tmp/klc_storage_fresh.littlefs --size 393216
+
+# 2. Erase the partition region (removes wifi_ap.json and anything else on
+#    the partition), then write the credential-free image back (restores
+#    the four config documents + CA that the CONFIGURATION gate requires):
+python -m esptool --chip esp32 -p /dev/ttyUSB1 -b 460800 \
+    erase_region 0x3A0000 0x60000
+python -m esptool --chip esp32 -p /dev/ttyUSB1 -b 460800 \
+    --before default_reset --after hard_reset write_flash \
+    --flash_mode dio --flash_size 4MB --flash_freq 40m \
+    0x3A0000 /tmp/klc_storage_fresh.littlefs
+
+# 3. Restart (the write hard-resets; or press EN/RST).  The application is
+#    NOT reflashed — that is the whole point of the escape hatch.
+```
+
+Equivalently, the `write_flash` step alone overwrites the whole partition
+(no credential survives), so the `erase_region` step is only needed to make
+the "erase" explicit; the credential-free image must always be written back
+for the CONFIGURATION gate to pass.
+
+> **`idf.py erase-flash` is NOT the escape hatch.**  It erases the whole
+> flash — the app, the partition table and NVS — and leaves storage without
+> the required config documents, so both the firmware and the storage image
+> must be re-written afterwards (a reflash).  The hatched path rewrites at
+> most the storage partition and reboots.
+
+### Restart / re-init step
+
+After either erase path, restart the device (or re-run the re-init path:
+the NETWORK gate's first entry re-brings-up the manager).  The restart is
+required because the fresh-device decision happens at controller init
+(`wifi_provisioning_manager_init()` → `wifi_http_provisioning_init()` →
+`if (!wifi_mgmt_is_read_data())`).  On the next boot:
+
+1. FILESYSTEM gate mounts storage; CONFIGURATION gate passes (documents
+   present),
+2. NETWORK gate first entry: `wifi_mgmt_init()` → `_load_saved_config()`
+   finds no `wifi_ap.json` → `wifi_mgmt_is_read_data()` is false,
+3. `wifi_provisioning_manager_init()` registers with the platform controller,
+   whose init sees a fresh device and opens the portal,
+4. the supervisor delivers the controller's STARTED event:
+   `NETWORK --provisioning-started--> PROVISIONING`, portal up
+   (`[prov_mgr] provisioning AP up; portal reachable`).
+
+Because `wifi_mgmt_erase_credentials()` also clears the in-memory state, a
+re-init without a physical restart (a future trigger that stops/restarts the
+NETWORK gate in place) works identically.
+
+### Product trigger decision (TASK-137)
+
+**Decision: serial-only for now.**  This task implements **no** new product
+trigger; the supported recovery today is the serial-attached procedure (path
+B above for any device; path A for a developer/CI harness).  A long-press
+factory reset (GPIO) and an OTA / ThingsBoard-RPC erase command are deferred.
+
+**Rationale**
+
+- The escape hatch must exist *before* any trigger UI: the platform API is
+  already verified by the platform's own tests, and the serial-only
+  procedure forces any parked device back to PROVISIONING without a reflash
+  — the Definition of Done does not depend on a product trigger.
+- A long-press factory reset needs a GPIO input/debounce layer the product
+  does not have yet, plus a state-machine-safe call site (which states may
+  erase? must the controller lifecycle/portal be stopped first?) — not
+  trivial, and outside this task's scope.
+- An OTA / ThingsBoard-RPC erase needs the RPC transport glue
+  (TASK-112/113/114 modules exist but are not wired to the sync/online gate
+  yet) plus a progress/result contract — not trivial.
+- Cost/benefit: every bench/lab device in this project's workflow is
+  serial-attached, so serial-only covers all currently reachable devices;
+  the supported API is already in place for whatever trigger a later task
+  selects.
+
+**Known gap (explicit):** a customer-owned device without serial access
+cannot trigger the erase itself yet; until the factory-reset or RPC trigger
+lands, field recovery of such a device goes through serial support or an OTA
+push of a corrected credential.  Documented here so the decision and its
+consequence stay visible.
+
+---
+
 ## Task notes (TASK-128 verification record)
 
 Observed with `/dev/ttyUSB1` (ESP32-WROOM-32D), ESP-IDF v5.5.5
@@ -624,6 +813,84 @@ Observed with `/dev/ttyUSB1` (ESP32-WROOM-32D), ESP-IDF v5.5.5
    documented above and each signature is asserted mechanically by the
    smoke checker on the entry path (and by the automaton on the success
    path when exercised).
+
+### TASK-137 verification record (erase/re-provision escape hatch, on target)
+
+Observed on `/dev/ttyUSB1` (ESP32-WROOM-32D), ESP-IDF v5.5.5.
+
+**Setup.**  The WROOM build was rebuilt from scratch (`idf.py fullclean &&
+idf.py build`, passes).  Two storage images were prepared with the
+platform `littlefs_util` (4096-byte blocks, 393216 B):
+
+- credentialed: the TASK-136 payload **plus** `wifi_ap.json` (a stale
+  credential `{"last_use":0,"credentials":[{"nb":0,"ssid":"KLC-Stale-Net",
+  "password":"KLC-Stale-Pass-136!"}]}` — the same document the TASK-136
+  overwrite tests used, never logged by the firmware),
+- fresh: the same payload **without** `wifi_ap.json` (the manual-procedure
+  step-1 payload = the escape-hatch target state).
+
+**Before the erase (credentialed device, parked, no portal).**  Wrote the
+credentialed image at `0x3A0000`, flashed the app, monitored ~75 s:
+
+```
+[INFO]: [app_state] configuration --config-ok(configuration)--> network (session 1)
+[INFO]: [prov_mgr] wifi provisioning adapter initialized
+W (9034) klc: Network lost; lamp forced off by adapter, ThingsBoard stays disconnected until reconnect
+W (31294) klc: No Wi-Fi connection within 30000 ms; verified TLS connect stays blocked
+[INFO]: [app_state] network --network-failed(network)--> safe-off (session 1)
+[INFO]: [app_state] safe-off --retry-due(timer)--> network (session 2)
+[INFO]: [app_state] network --network-failed(network)--> safe-off (session 2)
+```
+
+Key observations: `wifi_mgmt_is_read_data()` is true (the stale credential
+is loaded), so the controller's **init-time fallback does NOT fire** — no
+`No saved station credential; entering Wi-Fi provisioning` and no
+`[prov_mgr] provisioning AP up; portal reachable` appear anywhere.  The
+device cannot reach its saved network (no lab WLAN), the NETWORK gate
+times out (`NETWORK_CONNECT_TIMEOUT_MS`), and the machine parks in
+`SAFE_OFF` with the bounded retry — exactly the "device that parks" state
+the escape hatch must recover.
+
+**The erase (documented path B).**  Overwrote only the storage partition
+with the fresh image — **no app reflash**:
+
+```
+python -m esptool --chip esp32 -p /dev/ttyUSB1 -b 460800 \
+    --before default_reset --after hard_reset write_flash \
+    --flash_mode dio --flash_size 4MB --flash_freq 40m \
+    0x3A0000 /tmp/klc_storage_fresh.littlefs
+```
+
+**After the erase + restart (forced back to PROVISIONING).**  The device
+rebooted from the same application image; the fresh-device fallback opened
+the portal on the NETWORK gate's first entry:
+
+```
+[INFO]: [app_state] configuration --config-ok(configuration)--> network (session 1)
+[INFO]: [prov_mgr] wifi provisioning adapter initialized
+[INFO]: [prov_mgr] controller transition 1 -> 3 (product event 1)
+[INFO]: [prov_mgr] provisioning AP up; portal reachable
+I (1344) klc: Provisioning flow started by the controller; entering Wi-Fi provisioning
+[INFO]: [app_state] network --provisioning-started(network)--> provisioning (session 1)
+I (1364) klc: Provisioning gate: portal owned by the controller; waiting for its outcome events
+[INFO]: [prov_mgr] portal up; station not yet connected (waiting for a client to join and submit; one log line per 30 s)
+```
+
+The documented recovery sequence is confirmed: (1) the controller's
+init-time fallback `if (!wifi_mgmt_is_read_data())` fires because the erase
+removed `wifi_ap.json`; (2) the machine enters PROVISIONING via the
+supervisor-delivered STARTED event; (3) the portal is reachable.  No
+`Backtrace:` in the log; `on_target_smoke_check.py --expect provisioning`
+**PASSES** (`legal provisioning sequence: ENTER`, backtrace-free, no test-
+credential substring).  A second `idf.py flash` (fresh state persists —
+app flash never touches the storage partition) reproduced the same entry
+sequence and the smoke check passed again on `/tmp/hq_led_lamp_esp.log`.
+
+**Product trigger decision (from the TASK-137 section): serial-only for
+now** — no long-press factory reset and no OTA/RPC erase in this milestone;
+the documented serial procedure (path B, or the platform API path A) is the
+supported escape hatch, and the platform API is in place for a future
+trigger.
 
 Run the smoke check against a captured log at any time:
 
