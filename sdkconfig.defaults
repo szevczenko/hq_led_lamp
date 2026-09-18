@@ -32,8 +32,22 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 # Wi-Fi HTTP provisioning (TASK-126): the product-owned provisioning adapter
 # (components/wifi_provisioning_manager) builds the platform provisioning
 # portal (HTTP portal + captive DNS on the shared Mongoose process) into the
-# image.  The platform's automatic fallback controller is deliberately NOT
-# enabled: the product owns the "start provisioning when no saved credential
-# exists" decision through the adapter's has-saved-credentials query.
+# image.  The platform's automatic fallback controller
+# (wifi_provisioning_controller.c, hq_platform TASK-011..016) is COMPILED IN
+# (TASK-131): CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y with a bounded
+# CONNECT_FAILED budget (CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS=2)
+# so a transient connect failure does not open the provisioning AP but
+# exhausted credentials do.  The controller is NOT yet wired into app_main
+# (wiring is TASK-132/133): while half-wired it is inert, and the product
+# still owns the "start provisioning when no saved credential exists"
+# decision through the adapter's has-saved-credentials query.
 CONFIG_WIFI_HTTP_PROVISIONING=y
-# CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK is not set
+CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y
+CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS=2
+# Success-grace interval (TASK-131): the single source of truth is the
+# platform knob CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS — the product
+# duplicate CONFIG_KLC_PROVISIONING_GRACE_MS was dropped (documented decision
+# in the TASK-131 notes) so the product's grace retire and the platform
+# controller's grace retire both drive the same portal value.  2000 ms keeps
+# the product's historical default.
+CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS=2000

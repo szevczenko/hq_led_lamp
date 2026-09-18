@@ -53,9 +53,10 @@
  *      the provisioning portal (HTTP portal + captive DNS on the shared
  *      Mongoose process) and waits for the station to connect while
  *      feeding the watchdog in-loop.  On success the portal stays up for
- *      a bounded success-grace interval (CONFIG_KLC_PROVISIONING_GRACE_MS,
- *      mirroring the platform controller's grace/retire pattern), is
- *      stopped through the adapter (listeners closed; the shared Mongoose
+ *      a bounded success-grace interval
+ *      (CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS — the single grace
+ *      source of truth since TASK-131; the duplicate KLC knob was dropped),
+ *      is stopped through the adapter (listeners closed; the shared Mongoose
  *      process and MQTT/TLS untouched), and PROVISIONING_SUCCEEDED hands
  *      control back to the NETWORK gate, which then passes the now
  *      credentialed station to TLS.  A credentialed device never enters
@@ -63,6 +64,14 @@
  *      ThingsBoard STILL never starts before a verified network
  *      connection: provisioning only ever hands control back to the
  *      NETWORK gate, never past it.
+ *   7c. Platform fallback controller (TASK-131): the automatic fallback
+ *      controller (wifi_provisioning_controller.c) is COMPILED IN
+ *      (CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y, bounded
+ *      FALLBACK_ATTEMPTS budget) but NOT yet wired — app_main does not
+ *      register its notification hook or start it (wiring is TASK-132/133).
+ *      While half-wired the controller is inert and the product decision in
+ *      7b remains the only provisioning driver; the intermediate,
+ *      half-wired state is deliberate and explicit.
  *   8. The single re-enable transition for the lamp fail-off barrier is a
  *      successful verified MQTT/TLS connection (mqtt_cfg_connect(),
  *      TASK-110), consumed at the TLS gate.  A Wi-Fi connection alone, an
@@ -277,13 +286,15 @@ static bool wait_station_connected_while_provisioning(void)
  * Mirrors the platform controller's grace/retire pattern: keep the AP (and
  * its HTTP/DNS listeners) available briefly so the freshly provisioned
  * station settles, then stop the portal.  The interval is bounded and
- * Kconfig-configurable (CONFIG_KLC_PROVISIONING_GRACE_MS); a value of 0
- * retires immediately.  Every iteration feeds the watchdog so the grace wait
- * never spans the watchdog window.
+ * Kconfig-configurable (CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS —
+ * the platform knob is the single grace source of truth since TASK-131; the
+ * product duplicate CONFIG_KLC_PROVISIONING_GRACE_MS was dropped); a value
+ * of 0 retires immediately.  Every iteration feeds the watchdog so the
+ * grace wait never spans the watchdog window.
  */
 static void honor_provisioning_success_grace(void)
 {
-    uint32_t grace_ms = (uint32_t)CONFIG_KLC_PROVISIONING_GRACE_MS;
+    uint32_t grace_ms = (uint32_t)CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS;
     uint32_t waited_ms = 0U;
 
     while (waited_ms < grace_ms)

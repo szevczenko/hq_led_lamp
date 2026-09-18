@@ -43,7 +43,7 @@ Device-side portal facts used by the procedure (platform defaults):
 | Portal HTTP listen URL  | `http://0.0.0.0:80` (reachable at `http://10.10.0.1`) |
 | Captive DNS listen URL  | `udp://0.0.0.0:53` (captures every DNS query and redirects to the portal) |
 | Portal API              | `POST /api/v1/wifi/credentials` (JSON `{"ssid":…,"password":…}`), `GET /api/v1/wifi/status`, `GET /api/v1/wifi/networks` |
-| Success grace interval  | `CONFIG_KLC_PROVISIONING_GRACE_MS`, default `2000` ms (0 retires immediately, max 30000) |
+| Success grace interval  | `CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default `2000` ms in this product's `sdkconfig.defaults` (0 retires immediately, max 60000; single grace source of truth since TASK-131 — the duplicate `CONFIG_KLC_PROVISIONING_GRACE_MS` was dropped) |
 | Provisioning wait window| `PROVISIONING_WAIT_TIMEOUT_MS` = `180000` ms (bounded station connect window) |
 | Network gate timeout    | `NETWORK_CONNECT_TIMEOUT_MS` = `30000` ms          |
 
@@ -188,7 +188,8 @@ to the smoke check via `--test-ssid` / `--test-password`.)
 ### 5. Confirm the grace retire and the TLS gate
 
 Watch the monitor session.  Once the device connects to the lab WLAN the
-portal stays up for `CONFIG_KLC_PROVISIONING_GRACE_MS` (default 2 s), then
+portal stays up for `CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`
+(default 2 s in `sdkconfig.defaults`), then
 retires and the boot chain continues:
 
 ```
@@ -394,7 +395,7 @@ device ends in, and the recovery path.
 
 | | |
 |---|---|
-| **Trigger** | Station connects, the success-grace interval (`CONFIG_KLC_PROVISIONING_GRACE_MS`, default 2 s) elapses and the portal retires while a client is still attached or a repeat submission races the teardown. |
+| **Trigger** | Station connects, the success-grace interval (`CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default 2 s in `sdkconfig.defaults`) elapses and the portal retires while a client is still attached or a repeat submission races the teardown. |
 | **Log** | `[INFO]: [prov_mgr] provisioning portal stopped`, `… klc: Provisioning succeeded and portal retired; continuing to the NETWORK gate -> TLS`, then the NETWORK/TLS gate lines. |
 | **End state** | `NETWORK` → `TLS` — the credential is saved, so the retry/`DISCONNECTED` path reconnects through the network gate with the saved credential; the machine never re-enters provisioning. |
 | **Recovery** | None required.  If the station drop happens during teardown, the network gate's bounded retry reconnects with the saved credential.  A client submitting twice inside the grace window gets a retry/idempotent response — the portal's second `stop()` is a safe no-op. |

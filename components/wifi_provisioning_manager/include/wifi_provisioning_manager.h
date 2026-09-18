@@ -32,11 +32,14 @@
  *
  * Product decision ownership
  * --------------------------
- * The platform's automatic fallback controller
- * (CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK) is deliberately NOT enabled
- * for the product (see sdkconfig.defaults): the adapter exposes
- * wifi_provisioning_manager_has_saved_credentials() so app_main owns the
- * "start provisioning when no saved credential exists" decision explicitly.
+ * Since TASK-131 the platform's automatic fallback controller
+ * (CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y with a bounded
+ * CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS budget, see
+ * sdkconfig.defaults) is COMPILED IN but not yet wired into the product
+ * (wiring is TASK-132/133); while half-wired it is inert.  The adapter still
+ * exposes wifi_provisioning_manager_has_saved_credentials() so app_main owns
+ * the "start provisioning when no saved credential exists" decision
+ * explicitly.
  *
  * Mongoose process ownership
  * --------------------------

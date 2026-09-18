@@ -16,8 +16,10 @@
 #      delivers PROVISIONING_STARTED, the supervisor runs the provisioning
 #      portal (wifi_provisioning_manager, HTTP + captive DNS on the shared
 #      Mongoose process) until the station connects, keeps the AP up for a
-#      bounded success-grace interval (CONFIG_KLC_PROVISIONING_GRACE_MS),
-#      stops the portal and delivers PROVISIONING_SUCCEEDED back to the
+#      bounded success-grace interval
+#      (CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS, the single grace
+#      source of truth since TASK-131), stops the portal and delivers
+#      PROVISIONING_SUCCEEDED back to the
 #      NETWORK gate.  A credentialed device never enters provisioning — it
 #      passes the NETWORK gate straight to TLS.  ThingsBoard STILL never
 #      starts before a verified network connection: provisioning only ever

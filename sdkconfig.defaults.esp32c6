@@ -14,3 +14,12 @@ CONFIG_KLC_LED_PWM_ACTIVE_LOW=n
 CONFIG_KLC_DEFAULT_BRIGHTNESS_PERCENT=100
 CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS=10000
 CONFIG_KLC_TELEMETRY_PERIOD_MS=30000
+
+# Wi-Fi HTTP provisioning (TASK-131): mirror the base sdkconfig.defaults so
+# C6 support needs no product-domain changes — the platform automatic
+# fallback controller is compiled in with a bounded CONNECT_FAILED budget,
+# and the platform success-grace knob is the single grace source of truth.
+CONFIG_WIFI_HTTP_PROVISIONING=y
+CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y
+CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS=2
+CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS=2000
