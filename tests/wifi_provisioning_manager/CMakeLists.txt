@@ -88,5 +88,74 @@ add_test(NAME wifi_provisioning_manager_tests
 set_tests_properties(wifi_provisioning_manager_tests PROPERTIES
                      LABELS "unit;wifi_provisioning_manager")
 
-message(STATUS "Tests: Building provisioning-manager host test "
-               "(wifi_provisioning_manager_tests)")
+# --------------------------------------------------------------------- #
+# TASK-136: wifi_storage_overwrite_tests — portal submit-overwrite path #
+# --------------------------------------------------------------------- #
+#
+# Second host test executable for the portal "submit a credential while a
+# stale one already exists" path.  Unlike the adapter tests above (which
+# double every platform boundary), this one compiles the REAL platform
+# Wi-Fi manager (wifi_managment.c) and its persistence module
+# (wifi_config.c) on the host and drives the exact submission sequence the
+# portal POST /api/v1/wifi/credentials handler executes:
+#
+#   wifi_mgmt_set_ap_name() + wifi_mgmt_set_password() + wifi_mgmt_connect()
+#
+# against:
+#   - a deterministic radio double (wifi_hal_mock_min.c) that rejects the
+#     stale credential and accepts the newly submitted one,
+#   - a real temp-directory-backed file system (wifi_storage_osal_support.c)
+#     that stands in for the product storage mount (lamp_fs mounts the
+#     LittleFS "storage" partition at /littlefs; the ESP OSAL maps the
+#     relative WIFI_CONFIG_FILE_PATH "wifi_ap.json" onto
+#     /littlefs/wifi_ap.json — the host double applies the same logical-path
+#     mapping and the same CREATE|TRUNCATE open semantics against a real
+#     file),
+#   - the REAL platform POSIX OSAL back-ends for mutex / binary semaphore /
+#     task (/osal/posix), so the manager's worker task, its semaphores and
+#     the connect/persist state machine behave exactly like on target.
+#
+# The tests prove that a submitted credential unconditionally replaces the
+# saved one (same-SSID submissions update in place; different-SSID
+# submissions become the last-used entry), that the station switches within
+# the same lifecycle (no reboot), and that no log line contains the old or
+# new secret.
+
+set(CJSON_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/third_party/cJSON)
+
+add_executable(wifi_storage_overwrite_tests
+    ${CMAKE_CURRENT_LIST_DIR}/wifi_storage_overwrite_test.c
+    ${CMAKE_CURRENT_LIST_DIR}/wifi_hal_mock_min.c
+    ${CMAKE_CURRENT_LIST_DIR}/wifi_storage_osal_support.c
+    ${WIFI_INCLUDE_DIR}/wifi_managment.c
+    ${WIFI_INCLUDE_DIR}/wifi_config.c
+    ${OSAL_IMPL_DIR}/osal_mutex_impl.c
+    ${OSAL_IMPL_DIR}/osal_bin_sem_impl.c
+    ${OSAL_IMPL_DIR}/osal_task_impl.c
+    ${OSAL_IMPL_DIR}/osal_assert.c
+    ${CJSON_DIR}/cJSON.c
+    ${UNITY_DIR}/unity.c
+)
+
+target_include_directories(wifi_storage_overwrite_tests PRIVATE
+    ${WIFI_INCLUDE_DIR}
+    ${OSAL_INCLUDE_DIR}
+    ${OSAL_IMPL_DIR}
+    ${CJSON_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/config
+    ${UNITY_DIR}
+)
+
+target_compile_options(wifi_storage_overwrite_tests PRIVATE
+    -Wall -Wextra -Werror -Wpedantic)
+
+target_link_libraries(wifi_storage_overwrite_tests PRIVATE Threads::Threads)
+
+add_test(NAME wifi_storage_overwrite_tests
+         COMMAND wifi_storage_overwrite_tests)
+set_tests_properties(wifi_storage_overwrite_tests PROPERTIES
+                     LABELS "unit;wifi_provisioning_manager;overwrite")
+
+message(STATUS "Tests: Building wifi_ap.json overwrite host test "
+               "(wifi_storage_overwrite_tests)")

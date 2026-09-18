@@ -442,6 +442,112 @@ device ends in, and the recovery path.
 | Portal state observability signatures (reachable edge / distinct start-failure code / 30 s rate-limited wait heartbeat) | Host unit tests (log-content regression: exact signatures, rate-limit count, and no known SSID/password/URL in the captured log) |
 | Portal startup/stop observable in the log | On target (smoke check assertion (b) + manual procedure) |
 | End-to-end provision (radio: join AP → submit → connect → grace retire) | On target manual procedure (needs a second radio and a lab WLAN) |
+| **Portal submit overwrites a stale saved credential (TASK-136)** | Host unit tests (`wifi_storage_overwrite_test.c`, CTest `wifi_storage_overwrite_tests`) — see the [overwrite-path trace](#task-136-overwrite-path-trace) below |
+
+---
+
+## TASK-136: overwrite-path trace
+
+### Platform submission path (source trace)
+
+The portal credential route is
+`platform/hq_platform/src/wifi_provisioning/wifi_http_provisioning.c`:
+`POST /api/v1/wifi/credentials` is handled by
+`prov_handle_credentials_request()`, which validates the JSON body and then
+**unconditionally** overwrites the station config and requests an
+asynchronous connect:
+
+```
+wifi_mgmt_set_ap_name( ssid, ssid_len )
+wifi_mgmt_set_password( password, pass_len )
+wifi_mgmt_connect()
+```
+
+The Wi-Fi manager's worker task
+(`platform/hq_platform/src/wifi/wifi_managment.c`) consumes the connect
+request: `_state_connect()` hands the new `sta_cfg` to the radio
+(`wifi_hal_set_sta_config()`) and calls `wifi_hal_connect()`; on the
+station's GOT_IP event, `_state_wait_connect()` calls
+`_save_current_sta_config()`, which persists through
+`platform/hq_platform/src/wifi/wifi_config.c`:
+
+```
+wifi_config_add_credential( &config_list, ssid, pass )
+wifi_config_save( &config_list )   ->  _write_file( "wifi_ap.json",
+                                                    CREATE | TRUNCATE )
+```
+
+`wifi_config_add_credential()` semantics:
+
+- an entry with the **same SSID** (the classic stale-password case) is
+  updated **in place** — the stale password cannot survive,
+- an entry with a **different SSID** is appended (or, at capacity, the
+  oldest entry is evicted) and `last_use` is promoted to the submitted
+  entry, so the boot-time loader (`_load_saved_config()` → last_use)
+  selects the submitted credential and the stale entry can survive only as
+  an unselected rotation slot (the platform's documented multi-credential
+  design, `WIFI_CONFIG_MAX_CREDENTIALS=8`),
+- the write is atomic from the reader's perspective (`CREATE|TRUNCATE` on a
+  single file), so a concurrent `wifi_mgmt_is_read_data()` never observes a
+  partial overwrite.
+
+### Product storage mount (why the product path behaves identically)
+
+The persistence layer speaks only the portable OSAL file API and stores to
+the relative path `WIFI_CONFIG_FILE_PATH` = `"wifi_ap.json"`.  On the ESP
+the OSAL littlefs back-end resolves a relative path under the mounted
+volume (`osal_lfs_build_vfs_path()` prefixes the configured mount point),
+i.e. `/littlefs/wifi_ap.json`.  On the product the supervisor runs the
+FILESYSTEM gate first — `lamp_fs_init()` mounts the LittleFS `storage`
+partition at `/littlefs` — then the CONFIGURATION gate, and only then the
+NETWORK gate; the Wi-Fi manager and the provisioning adapter are brought
+up on the NETWORK gate's **first entry** (product-layer fix in
+`main/app_main.c`, TASK-136).  The manager's init-time saved-credential
+load (`wifi_mgmt_init()` → `_load_saved_config()` → `wifi_ap.json`) and
+every portal-submission save therefore land on the lamp_fs-mounted storage
+exactly like the demo.  **Conclusion: the submitted credential
+unconditionally replaces the saved one, and the station reconnects with it
+in the same lifecycle (no reboot).**  No platform change was needed for the
+overwrite itself; the fix was the *boot ordering* — originally the manager
+was started in `app_main()` before the FILESYSTEM gate, the OSAL rejected
+the init-time load with `OSAL_ERR_INCORRECT_OBJ_STATE` (unmounted volume,
+observed on target as `wifi_config_read_file: osal_stat failed rc=-35`),
+so `wifi_mgmt_is_read_data()` stayed false and even after a successful
+portal submission the NETWORK gate would park the machine instead of
+handing the now-credentialed station to TLS.  With the mount-first
+ordering, a device with a saved credential passes the gate straight to
+TLS, and a portal submission (SUCCEEDED → NETWORK) does the same without a
+reboot.
+
+### Host test (`wifi_storage_overwrite_tests`)
+
+`tests/wifi_provisioning_manager/wifi_storage_overwrite_test.c` compiles
+the REAL `wifi_managment.c` + `wifi_config.c` (with the real POSIX OSAL
+mutex/semaphore/task back-ends) against a deterministic radio double
+(`wifi_hal_mock_min.c`) and a real temp-dir file system that stands in for
+the product storage mount (`wifi_storage_osal_support.c` — the same logical
+path mapping and CREATE|TRUNCATE semantics as the ESP OSAL).  It drives the
+exact portal submission sequence while a stale credential is present and
+asserts, in AP+STA concurrent mode:
+
+1. `test_submit_overwrites_stale_credential` — same SSID, corrected
+   password: the storage file ends up holding **exactly** the newly
+   submitted credential (one entry, stale password absent), the station
+   switched without a reboot (the radio double received exactly the new
+   credential), and neither the old nor the new secret (nor the SSID)
+   appears in any captured log line,
+2. `test_submit_different_network_replaces_selected_credential` — a
+   different network is submitted while the stale one exists: the submitted
+   credential becomes the last-used entry (what a reboot selects), the
+   station switches in the same lifecycle, and the log stays secret-free.
+
+Run:
+
+```sh
+cmake -S tests/wifi_provisioning_manager -B <build-dir>
+cmake --build <build-dir>
+ctest --test-dir <build-dir> --output-on-failure
+```
 
 ---
 

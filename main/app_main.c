@@ -3,7 +3,7 @@
  * @brief Kitchen LED Controller application entry point.
  *
  *  ## Boot-order contract (TASK-107 / TASK-118 / TASK-109 / TASK-115 /
- *                        TASK-127)
+ *                        TASK-127 / TASK-136)
  *
  *   1. lamp_control_init() — the output is initialized off and stays off
  *      until a valid desired state arrives.
@@ -39,14 +39,21 @@
  *      missing, empty, oversized or malformed identity input, never logs
  *      the token, and is FATAL safe-off: a missing or invalid identity
  *      forces the output inactive and blocks the ThingsBoard session.
- *   7. Wi-Fi onboarding (TASK-109) runs next through the product-owned
- *      network adapter.  The machine's NETWORK gate is the consumed
- *      network_manager_is_connected() polling loop below (the successor
- *      of network_manager_wait_connected()): ThingsBoard must never
- *      connect before this gate passes.  A Wi-Fi loss forces the adapter
- *      to fail the lamp off synchronously; the supervisor converts the
- *      disconnect into the machine's DISCONNECTED event within one
- *      supervisor cadence.
+ *   7. Wi-Fi onboarding (TASK-109) runs at the machine's NETWORK gate,
+ *      through the product-owned network adapter.  TASK-136: the manager
+ *      (and the provisioning infrastructure of 7b) is brought up on the
+ *      gate's FIRST entry — after the FILESYSTEM gate mounted the LittleFS
+ *      storage and the CONFIGURATION gate passed — so the manager's
+ *      init-time load of saved station credentials (wifi_ap.json) reads
+ *      from the mounted volume, wifi_mgmt_is_read_data() reflects reality,
+ *      and the controller's fresh-device decision (7b) sees the truth.
+ *      The gate itself is the consumed network_manager_is_connected()
+ *      polling loop below (the successor of
+ *      network_manager_wait_connected()): ThingsBoard must never connect
+ *      before this gate passes.  A Wi-Fi loss forces the adapter to fail
+ *      the lamp off synchronously; the supervisor converts the disconnect
+ *      into the machine's DISCONNECTED event within one supervisor
+ *      cadence.
  *   7b. Wi-Fi provisioning (TASK-127) sits between the Wi-Fi gate and TLS.
  *      The platform fallback controller (TASK-131/132,
  *      CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y with a bounded
@@ -144,6 +151,24 @@ static const char *TAG = "klc";
  * app_state.h).
  */
 #define APP_SUPERVISE_WATCHDOG_MS 60000u
+
+/* --------------------------------------------------------------------- */
+/* Lazy Wi-Fi/provisioning bring-up (TASK-136)                             */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief One-shot guard for the NETWORK gate's first-run bring-up.
+ *
+ * The Wi-Fi manager and the provisioning adapter are initialized on the
+ * FIRST entry of the machine's NETWORK gate — never before it (see the
+ * boot-order contract above).  By then the FILESYSTEM gate has mounted the
+ * LittleFS storage, so the manager's init-time load of saved station
+ * credentials (wifi_mgmt_init -> _load_saved_config -> wifi_ap.json) reads
+ * from the mounted volume: a device with a saved credential passes the gate
+ * straight to TLS and a portal submission (SUCCEEDED -> NETWORK) passes the
+ * now-credentialed station to TLS without a reboot.
+ */
+static bool s_network_bringup_done;
 
 /* --------------------------------------------------------------------- */
 /* Network adapter wiring (TASK-109)                                       */
@@ -627,6 +652,55 @@ static void supervise_iteration(void)
         break;
 
     case APP_STATE_NETWORK:
+        /* First NETWORK entry — the FILESYSTEM and CONFIGURATION gates have
+         * already passed (machine-order contract), so the LittleFS storage
+         * is mounted: the Wi-Fi manager's init-time saved-credential load
+         * (wifi_mgmt_init -> _load_saved_config -> wifi_ap.json) reads the
+         * TRUTHFUL storage contents and wifi_mgmt_is_read_data() reflects
+         * reality.  TASK-136: bringing the network up here (instead of in
+         * app_main before the FILESYSTEM gate) is what lets a device with a
+         * saved credential pass this gate straight to TLS, and lets a portal
+         * submission (SUCCEEDED -> NETWORK) pass the now-credentialed
+         * station to TLS without a reboot. */
+        if (!s_network_bringup_done)
+        {
+            s_network_bringup_done = true;
+            if (!start_network())
+            {
+                /* Degraded boot: the manager never started, so there is
+                 * nothing to poll.  Fail the gate now; the machine parks
+                 * SAFE_OFF (the bounded retry re-enters the network stage,
+                 * never provisioning directly). */
+                (void)app_state_deliver(APP_EVENT_NETWORK_FAILED,
+                                        APP_OWNER_NETWORK);
+                break;
+            }
+
+            /* Provisioning infrastructure (TASK-127).  The portal rides the
+             * shared Mongoose process that also hosts MQTT/TLS; the process
+             * is initialized once here and NEVER torn down by provisioning
+             * (the adapter's stop() ends the controller lifecycle and closes
+             * only the portal listeners).  init() registers the product
+             * notification hook with the platform fallback controller
+             * (TASK-132) — now that the manager loaded the saved-credential
+             * state, the controller's fresh-device decision sees the truth.
+             * The adapter itself is idempotent; a failure here only disables
+             * the fresh-device portal, never the credentialed boot path. */
+            MongooseProcess_Init();
+            if (!MongooseProcess_IsRunning())
+            {
+                ESP_LOGW(TAG, "Shared Mongoose process failed to start; "
+                              "fresh devices will not reach the portal "
+                              "(credentialed boot unaffected)");
+            }
+            if (wifi_provisioning_manager_init() !=
+                WIFI_PROVISIONING_MANAGER_OK)
+            {
+                ESP_LOGW(TAG, "Provisioning adapter init failed; fresh "
+                              "devices will not reach the portal "
+                              "(credentialed boot unaffected)");
+            }
+        }
         /* The network gate keeps ONLY the credentialed connect path
          * (TASK-133): poll for the station within the bounded window, then
          * NETWORK_CONNECTED -> TLS (or NETWORK_FAILED -> SAFE_OFF with the
@@ -807,39 +881,15 @@ void app_main(void)
         return;
     }
 
-    /* Wi-Fi onboarding (TASK-109) is brought up lazily by the NETWORK
-     * gate; start the manager now so the gate has a stack to wait on. */
-    if (!start_network())
-    {
-        /* The machine is in FILESYSTEM; a network-start failure is treated
-         * as a degraded boot (the supervisor delivers NETWORK_FAILED once
-         * the gate runs). */
-        ESP_LOGW(TAG, "Network manager not started; device stays offline");
-    }
-
-    /* Provisioning infrastructure (TASK-127).  The portal rides the shared
-     * Mongoose process that also hosts MQTT/TLS; the process is initialized
-     * once here and NEVER torn down by provisioning (the adapter's stop()
-     * ends the controller lifecycle and closes only the portal listeners).
-     * init() registers the product notification hook with the platform
-     * fallback controller (TASK-132), which owns the portal decision: a
-     * fresh device gets the portal opened right here (its STARTED outcome
-     * is delivered by the supervisor once the machine reaches the NETWORK
-     * gate).  The adapter itself is idempotent; a failure here only disables
-     * the fresh-device portal, never the credentialed boot path. */
-    MongooseProcess_Init();
-    if (!MongooseProcess_IsRunning())
-    {
-        ESP_LOGW(TAG, "Shared Mongoose process failed to start; fresh "
-                      "devices will not reach the portal (credentialed "
-                      "boot unaffected)");
-    }
-    if (wifi_provisioning_manager_init() != WIFI_PROVISIONING_MANAGER_OK)
-    {
-        ESP_LOGW(TAG, "Provisioning adapter init failed; fresh devices "
-                      "will not reach the portal (credentialed boot "
-                      "unaffected)");
-    }
-
+    /* Wi-Fi onboarding (TASK-109) and the provisioning infrastructure
+     * (TASK-127) are brought up lazily by the NETWORK gate on its first
+     * entry (TASK-136): the supervisor loop runs the FILESYSTEM gate
+     * (LittleFS mount) and the CONFIGURATION gate before the NETWORK gate,
+     * so the Wi-Fi manager's init-time saved-credential load
+     * (wifi_mgmt_init -> _load_saved_config) reads from the mounted storage
+     * and the platform controller's fresh-device decision sees the truth.
+     * Starting the manager here would load nothing (the OSAL file layer
+     * rejects unmounted access) and would wedge the NETWORK gate forever
+     * after a portal submission — see the boot-order contract above. */
     supervise();
 }
