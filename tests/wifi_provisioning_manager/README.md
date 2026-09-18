@@ -412,33 +412,51 @@ through the controller — `ENTER -> …` again in the same log).
 
 ## Failure-mode matrix
 
-Every row lists the trigger, the observable log signature, the state the
-device ends in, and the recovery path.  A park in **any** row is recoverable
-**without a reflash** through the documented
-[erase/re-provision escape hatch](#task-137-erasureprovision-escape-hatch)
+The matrix consolidates the **portal-only** failure modes documented since
+TASK-128 (rows 1–4) and the **controller-driven** failure modes the platform
+fallback controller adds (rows 5–6: fallback-budget exhaustion with a stale
+credential, and the AP-not-up start error).  Every row lists the trigger,
+the observable log signature, the state the device ends in, and the recovery
+path.  A park in **any** row is recoverable **without a reflash** through the
+documented [erase/re-provision escape hatch](#task-137-erasureprovision-escape-hatch)
 below (platform `wifi_mgmt_erase_credentials()` where reachable, or the
 serial storage-partition erase for a device that cannot reach the API),
 followed by a restart — the controller's fresh-device fallback then reopens
-the portal.
+the portal.  Rows 2 and 5 were observed on target (TASK-138/139 records
+below); the policy semantics behind them live in the platform controller
+(`platform/hq_platform/src/wifi_provisioning/wifi_provisioning_controller.h`).
 
-### 1. Portal bind failure
+### 1. Portal bind failure (per distinct TASK-134 start status)
 
 | | |
 |---|---|
-| **Trigger** | The platform controller opens the provisioning application (fresh device at init, or exhausted `CONNECT_FAILED` budget) and the listeners cannot bind (shared Mongoose process not running, port taken, resource exhaustion, radio refused AP+STA).  Since TASK-134 the adapter maps each documented platform start failure mode (`wifi_http_provisioning_start_ex()`) onto a distinct product status (`ERR_DEPENDENCY`, `ERR_MODE_TRANSITION`, `ERR_HTTP_BIND`, `ERR_DNS_BIND`, `ERR_AP_NOT_UP`, or the generic `ERR_START_FAILED` for undocumented modes) so the supervisor can tell exactly which start step failed. |
-| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d, start_status=%d, adapter_status=%d)` — one line per distinct start failure, `adapter_status` carrying the TASK-134 mapped product code — and (when the adapter observes the start failure) `… klc: Provisioning failed; machine parks degraded (bounded retry)`; no `provisioning AP up; portal reachable` line. |
+| **Trigger** | The platform controller opens the provisioning application (fresh device at init, or exhausted `CONNECT_FAILED` budget) and the start fails.  Since TASK-134 the adapter maps each documented platform start failure mode (`wifi_http_provisioning_start_ex()`) onto a **distinct** product status, so the supervisor can tell exactly which start step failed: |
+
+| Platform start status (`wifi_http_provisioning_start_ex()`) | Mapped product code (TASK-134) | Meaning |
+|---|---|---|
+| `WIFI_HTTP_PROVISIONING_START_ERR_DEPENDENCY` | `ERR_DEPENDENCY` | A required dependency (shared Mongoose process, Wi-Fi management) is not initialized |
+| `WIFI_HTTP_PROVISIONING_START_ERR_MODE_TRANSITION` | `ERR_MODE_TRANSITION` | The AP+STA mode request was refused by the Wi-Fi management layer |
+| `WIFI_HTTP_PROVISIONING_START_ERR_HTTP_BIND` | `ERR_HTTP_BIND` | The provisioning HTTP listener bind was refused (port taken / resource exhaustion) |
+| `WIFI_HTTP_PROVISIONING_START_ERR_DNS_BIND` | `ERR_DNS_BIND` | The captive DNS listener bind was refused |
+| `WIFI_HTTP_PROVISIONING_START_ERR_NO_AP` | `ERR_AP_NOT_UP` | Listeners bound but the radio never reached AP+STA — dedicated row 6 |
+| (undocumented mode) | `ERR_START_FAILED` | Defensive default for start modes the adapter does not recognize |
+
+| | |
+|---|---|
+| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d, start_status=%d, adapter_status=%d)` — one line per distinct start failure, `adapter_status` carrying the mapped product code — and, when the adapter observes the start failure, `… klc: Provisioning failed; machine parks degraded (bounded retry)`; no `provisioning AP up; portal reachable` line. |
 | **End state** | `SAFE_OFF` (degraded); `PROVISIONING_FAILED` scheduled a bounded retry to NETWORK. |
-| **Recovery** | The bounded retry returns to the NETWORK gate; a later fallback cycle re-opens the portal once the binding condition clears. If the retry budget exhausts, the device parks (no storm) and waits for provisioning / reset / OTA. |
-| **Verification** | Host unit tests (`wifi_provisioning_mock` failure injection + Mongoose-not-running precondition, and the TASK-133 adapter-stop controller-lifecycle tests); on-target signature as above. |
+| **Recovery** | The bounded retry returns to the NETWORK gate; a later fallback cycle re-opens the portal once the binding/dependency condition clears.  If the retry budget exhausts, the device parks (no storm) and waits for provisioning / reset / OTA — or use the [erase/re-provision escape hatch](#task-137-erasureprovision-escape-hatch). |
+| **Verification** | Host unit tests (`wifi_provisioning_mock` failure injection + Mongoose-not-running precondition, the TASK-133 adapter-stop controller-lifecycle tests, and the TASK-134 per-status mapping assertions); on-target signature as above. |
 
-### 2. No client ever connects
+### 2. No client ever connects (no wait window in this product)
 
 | | |
 |---|---|
-| **Trigger** | Nobody joins the AP / submits a credential.  Since TASK-133 removed the supervisor's `PROVISIONING_WAIT_TIMEOUT_MS`, the product has **no wait window**: the controller keeps the portal up indefinitely (until success/stop/OTA/FATAL), so an idle user simply takes as long as needed. |
+| **Trigger** | Nobody joins the AP / submits a credential within the wait window.  Since TASK-133 removed the supervisor's `PROVISIONING_WAIT_TIMEOUT_MS`, the product's wait window is **unbounded**: the controller keeps the portal up indefinitely (until success/stop/OTA/FATAL), so an idle user simply takes as long as needed. |
 | **Log** | `… klc: Provisioning flow started by the controller; …` + `… klc: Provisioning gate: portal owned by the controller; …` + `[INFO]: [prov_mgr] provisioning AP up; portal reachable`, then the rate-limited wait heartbeat `[INFO]: [prov_mgr] portal up; station not yet connected (waiting for a client to join and submit; one log line per 30 s)` at most once per 30 s while the controller waits in `PROVISIONING` with the portal up (TASK-135). |
 | **End state** | `PROVISIONING` (portal up). |
-| **Recovery** | Join `Bimbrownik:<MAC>` and submit a valid credential at any time. |
+| **Recovery** | Join the provisioning AP (see the [AP facts table](#manual-on-target-procedure) — the current build advertises the platform-default `wifi_provisioning:<MAC>`) and submit a valid credential at any time; or use the [erase/re-provision escape hatch](#task-137-erasureprovision-escape-hatch). |
+| **Verification** | **On target (TASK-138 record below):** the fresh-device entry was observed twice (`controller transition 1 -> 3` → `provisioning AP up; portal reachable` → `network --provisioning-started--> provisioning` → rate-limited wait heartbeat) and the smoke check (`--expect provisioning`) PASSED both times. |
 
 ### 3. Wrong submitted credential
 
@@ -448,17 +466,37 @@ the portal.
 | **Log** | No failure is logged on this path — the device **never learns or logs the submitted value** (secrecy rule); the portal-side "connect failed" status is visible to the client in `GET /api/v1/wifi/status`, never in the device log.  The `[prov_mgr] controller transition …` lines carry state codes only. |
 | **End state** | `PROVISIONING` (portal up). |
 | **Recovery** | Resubmit the correct credential through the still-open portal, or reset. |
-| **Verification** | On target: join the AP, submit a deliberately wrong credential, confirm the portal stays up and no submitted value ever appears in the log. |
+| **Verification** | On target: join the AP, submit a deliberately wrong credential, confirm the portal stays up and no submitted value ever appears in the log.  The stale-credential runs of TASK-139 (a wrong **saved** credential; row 5) exercise the same no-leak rule on the connect-failure side. |
 
-### 4. AP retirement (success path / explicit stop)
+### 4. AP retirement race (success path / explicit stop)
 
 | | |
 |---|---|
-| **Trigger** | Station connects, the success-grace interval (`CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default 2 s in `sdkconfig.defaults`) elapses and the controller retires the portal; a client submitting twice inside the grace window races the teardown.  An explicit adapter stop (OTA entry / FATAL) ends the controller lifecycle and cancels any pending grace timer. |
-| **Log** | Success: `… klc: Provisioning succeeded; portal retired by the controller; NETWORK gate resumes`, then the NETWORK/TLS gate lines.  Explicit stop: `[INFO]: [prov_mgr] provisioning portal stopped (controller lifecycle ended)`. |
-| **End state** | Success: `NETWORK` → `TLS` — the credential is saved, so the retry/`DISCONNECTED` path reconnects through the network gate with the saved credential; the machine never re-enters provisioning.  OTA/FATAL: the controller lifecycle is ended and no listener or grace timer is left. |
-| **Recovery** | None required.  If the station drop happens during teardown, the network gate's bounded retry reconnects with the saved credential.  A client submitting twice inside the grace window gets a retry/idempotent response — the controller's retirement is a safe no-op on a stop-while-stopping. |
-| **Verification** | **Pending: requires a lab WLAN** — the interactive success path (join AP → submit → grace retire → NETWORK/TLS handoff) was **not** exercised on target during this milestone (no lab WLAN available; see the task notes).  The success signature set and the automaton are documented above and asserted mechanically by the smoke check whenever the path is exercised; teardown idempotency and the controller-lifecycle stop are covered by the adapter host unit tests (TASK-133). |
+| **Trigger** | Station connects, the success-grace interval (`CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default 2 s in `sdkconfig.defaults`) elapses and the controller retires the portal; a client submitting twice inside the grace window races the teardown.  If the submitted connection fails **before** the grace expires, the controller cancels the timer and the portal stays open (grace-abort path → `PROVISIONING`).  An explicit adapter stop (OTA entry / FATAL) ends the controller lifecycle and cancels any pending grace timer. |
+| **Log** | Success: `… klc: Provisioning succeeded; portal retired by the controller; NETWORK gate resumes`, then the NETWORK/TLS gate lines.  Grace-abort: no device log line (the portal simply stays up; the connect failure is only visible portal-side in `GET /api/v1/wifi/status`).  Explicit stop: `[INFO]: [prov_mgr] provisioning portal stopped (controller lifecycle ended)`. |
+| **End state** | Success: `NETWORK` → `TLS` — the credential is saved, so the retry/`DISCONNECTED` path reconnects through the network gate with the saved credential; the machine never re-enters provisioning.  Grace-abort (connect failed before grace expired): `PROVISIONING`, portal still up.  OTA/FATAL: the controller lifecycle is ended and no listener or grace timer is left. |
+| **Recovery** | None required on success.  Grace-abort: resubmit the correct credential through the still-open portal.  If the station drops during teardown, the network gate's bounded retry reconnects with the saved credential.  A client submitting twice inside the grace window gets a retry/idempotent response — the controller's retirement is a safe no-op on a stop-while-stopping. |
+| **Verification** | **Pending: requires a lab WLAN** — the interactive success path (join AP → submit → grace retire → NETWORK/TLS handoff) was **not** exercised on target during this milestone (no lab WLAN available; see the task notes).  The success signature set and the automaton are documented above and asserted mechanically by the smoke check whenever the path is exercised (including `--expect stale-recovery`, TASK-139); teardown idempotency, the grace-abort path and the controller-lifecycle stop are covered by the adapter host unit tests (TASK-133) and the platform controller tests. |
+
+### 5. Fallback-budget exhaustion — stale saved credential (TASK-139)
+
+| | |
+|---|---|
+| **Trigger** | A credentialed device whose saved credential cannot connect (router replaced / password changed / AP out of range).  Each bounded-retry session contributes exactly **one** `CONNECT_FAILED` (the manager emits at most one per connect request); since TASK-139 the NETWORK gate re-drives the saved-credential connect on every credentialed (re-)entry, so once the count reaches `CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS` (default 2 in this product) the platform fallback controller opens the portal — the device must **not** park forever with no AP. |
+| **Log** | The [stale-credential bounded fallback signatures](#stale-credential-bounded-fallback-task-139): `… klc: Network lost; lamp forced off by adapter, …` (`CONNECT_FAILED #N`), `[app_state] network --network-failed--> safe-off` / `safe-off --retry-due--> network` (one episode per connect cycle), `[INFO]: [prov_mgr] controller transition 1 -> 3 (product event 1)` (budget exhausted), `[INFO]: [prov_mgr] provisioning AP up; portal reachable`, `… klc: Provisioning flow started by the controller; entering Wi-Fi provisioning`. |
+| **End state** | `PROVISIONING` (portal up) — entered **in the same session where the budget exhausted** (the NETWORK gate services the controller's STARTED in-loop since TASK-139): no extra park, no portal restart storm. |
+| **Recovery** | Submit the correct credential through the still-open portal (the controller retires it after the success grace and the machine proceeds to TLS), or use the [erase/re-provision escape hatch](#task-137-erasureprovision-escape-hatch) to drop the stale credential and re-provision from fresh. |
+| **Verification** | **On target (TASK-139 record below):** `on_target_stale_check.py` seeded a deliberately wrong saved credential onto storage, app-flashed, captured 90 s and ran the smoke check `--expect stale-credential` — **PASS on two independent runs** (exactly one NETWORK_FAILED episode before ENTER = within the budget of 2, exactly one portal-up period, backtrace-free, no stale/test credential substring anywhere). |
+
+### 6. AP-not-up start error
+
+| | |
+|---|---|
+| **Trigger** | `wifi_http_provisioning_start_ex()` bound both listeners but the radio **never actually reached AP+STA** (the Wi-Fi management mode/query surface disagrees).  The platform rolls the partial listeners back and leaves the application in `ERROR`; the adapter maps `WIFI_HTTP_PROVISIONING_START_ERR_NO_AP` to `ERR_AP_NOT_UP` (TASK-134) so a "started without an AP" can never be mistaken for a reachable portal. |
+| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d, start_status=%d, adapter_status=%d)` with `adapter_status=ERR_AP_NOT_UP`, the `… klc: Provisioning failed; machine parks degraded (bounded retry)` park line, and **no** `provisioning AP up; portal reachable` — the TASK-135 reachability signature explicitly requires the radio in AP+STA (`wifi_http_provisioning_is_reachable()`). |
+| **End state** | `SAFE_OFF` (degraded); `PROVISIONING_FAILED` scheduled a bounded retry to NETWORK. |
+| **Recovery** | The bounded retry returns to the NETWORK gate and a later fallback cycle re-attempts the portal start once the radio can actually enter AP+STA; if the retry budget exhausts, the device parks (no storm) and waits for provisioning / reset / OTA — or use the [erase/re-provision escape hatch](#task-137-erasureprovision-escape-hatch). |
+| **Verification** | Host unit tests: the TASK-134 mock injects the platform `WIFI_HTTP_PROVISIONING_START_ERR_NO_AP` status and asserts the `ERR_AP_NOT_UP` mapping and the distinct start-failure log line (plus the platform's own `radio_verify_hook` tests for the rollback); on-target signature as above. |
 
 ---
 
@@ -921,6 +959,36 @@ Run the smoke check against a captured log at any time:
 python3 tests/wifi_provisioning_manager/on_target_smoke_check.py \
     --log /tmp/hq_led_lamp_esp.log --expect any
 ```
+
+### TASK-138/139 on-target verification evidence (controller-driven provisioning)
+
+The two controller-driven entry paths are the verification evidence for the
+failure-mode rows above (fresh-device entry in row 2, fallback-budget
+exhaustion in row 5).  Both were observed on `/dev/ttyUSB1`
+(ESP32-WROOM-32D, MAC `c0:49:ef:e8:24:b8`), ESP-IDF v5.5.5, with the
+automated smoke checker (`on_target_smoke_check.py` /
+`on_target_stale_check.py`) **PASS**ing on every run:
+
+- **TASK-138 — fresh device reaches the portal (scenario a).**  After the
+  TASK-137 erase/re-provision procedure (no `wifi_ap.json`), the NETWORK
+  gate's first entry found no saved credential (`wifi_mgmt_is_read_data()`
+  false), the controller's init-time fallback opened the portal and the
+  supervisor delivered STARTED:
+  `controller transition 1 -> 3` →
+  `[INFO]: [prov_mgr] provisioning AP up; portal reachable` →
+  `network --provisioning-started--> provisioning` → the rate-limited wait
+  heartbeat.  Reproduced **twice** (identical sequence, smoke check
+  `--expect provisioning` PASS on both logs); full log sequence in the
+  TASK-138 record below.
+- **TASK-139 — stale credential falls back after the budget (scenario b).**
+  A device seeded with a deliberately wrong saved credential went through
+  one bounded-retry episode per connect cycle (`CONNECT_FAILED #1` /
+  `#2`; the NETWORK gate re-drives the connect on every
+  `safe-off --retry-due--> network` re-entry since TASK-139), the budget of
+  2 exhausted (`controller transition 1 -> 3`) and the controller opened
+  the portal **in the same session** — no extra park, no restart storm.
+  `on_target_stale_check.py` (`--expect stale-credential`) **PASSED on two
+  independent runs**; full log sequence in the TASK-139 record below.
 
 ---
 

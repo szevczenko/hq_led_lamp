@@ -25,22 +25,53 @@ The application state machine (`components/app_state`, driven by
 
 ```
 boot -> safe-off -> filesystem -> configuration -> Wi-Fi
-     -> provisioning (only when no saved station credential exists)
+     -> provisioning (controller-driven: fresh device at init, or
+        exhausted-credential fallback)
      -> verified MQTT/TLS -> state sync -> online
 ```
 
-A **fresh device** (no saved station credential) enters the Wi-Fi
-provisioning stage between the Wi-Fi gate and TLS: the supervisor starts
-the provisioning portal — a temporary access point (`Bimbrownik:<MAC>`,
-password `SuperTrudne1!-_`) with an HTTP portal and captive DNS on the
-shared Mongoose process — and waits a bounded window for a phone/laptop to
-submit the home SSID/password.  On success the portal stays up for the
-configured grace interval (default 2 s), is retired cleanly (only the
-portal listeners close; MQTT/TLS are untouched), and the boot chain
-continues to the TLS gate with the now saved credential.  A
-**credentialed device** passes the Wi-Fi gate straight to TLS and never
-enters provisioning.  A provisioning failure parks the machine degraded
-(SAFE_OFF) with the existing bounded retry — never a portal restart storm.
+The **provisioning stage** sits between the Wi-Fi gate and the TLS gate and
+is owned by the **platform fallback controller** (`wifi_provisioning_controller`
+in `platform/hq_platform`), not by the application state machine: the
+supervisor (`main/app_main.c`) only mirrors the controller's outcome events
+into the machine (`NETWORK --provisioning-started--> PROVISIONING` and back
+on success) and never starts or restarts the portal itself.  The controller
+opens the portal on either of **two entry paths**:
+
+1. **Fresh device at init** — no saved station credential (`wifi_ap.json`):
+   the controller opens the provisioning portal on the NETWORK gate's first
+   entry.
+2. **Exhausted-credential fallback** — a saved credential that fails to
+   connect counts against a bounded `CONNECT_FAILED` budget
+   (`CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS`, default 2 in this
+   product); when the budget is spent the controller opens the portal
+   instead of leaving the device parked without an AP.
+
+The portal is a temporary access point with an HTTP portal and captive DNS
+on the shared Mongoose process — this build advertises the platform-default
+identity `wifi_provisioning:<MAC>` (the documented demo identity
+`Bimbrownik:<MAC>` / `SuperTrudne1!-_` applies once a product AP identity is
+wired; see `tests/wifi_provisioning_manager/README.md`).  After a submitted
+credential connects, the controller keeps the portal up for the configured
+success grace (`CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default
+2 s), then retires it cleanly — only the portal listeners close; MQTT/TLS
+are untouched — and the boot chain continues to the TLS gate with the now
+saved credential.  If the submitted connection fails before the grace
+expires, the portal stays up for another attempt (grace-abort).  A
+**credentialed device that connects on the first try** passes the Wi-Fi gate
+straight to TLS and never enters provisioning.  A provisioning failure parks
+the machine degraded (SAFE_OFF) with the existing bounded retry — never a
+portal restart storm — and any parked or credential-less device is bringable
+back to the portal through the **erase/re-provision escape hatch**
+(platform `wifi_mgmt_erase_credentials()`, or the serial storage-partition
+erase; TASK-137 in `tests/wifi_provisioning_manager/README.md`).
+
+The policy semantics behind these entry paths, the fallback budget and the
+success-grace retirement are defined by the platform controller — see
+`platform/hq_platform/src/wifi_provisioning/wifi_provisioning_controller.h`
+and `platform/hq_platform/examples/esp/wifi_provisioning_demo/README.md`;
+this README only records how the product wires them (entry paths, budget and
+grace defaults, escape hatch).
 
 Note that provisioning sits *after* the configuration gate: a fresh device
 must carry the validated configuration documents (`device.json`, `mqtt.json`,
@@ -52,9 +83,10 @@ step 1).
 
 This flow is inherently radio-level and is verified on target: see
 `tests/wifi_provisioning_manager/README.md` for the manual procedure, the
-expected log signatures, the failure-mode matrix and the automated
-monitor-log smoke check (`on_target_smoke_check.py`, part of the standard
-flash/monitor loop).
+expected log signatures, the controller-driven failure-mode matrix (with
+the on-target TASK-138/139 records as verification evidence) and the
+automated monitor-log smoke check (`on_target_smoke_check.py`, part of the
+standard flash/monitor loop).
 
 ## Platform submodule
 
