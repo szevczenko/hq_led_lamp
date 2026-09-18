@@ -111,6 +111,24 @@ uint32_t osal_test_delay_total_ms(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* Task time: test-controlled monotonic clock (TASK-135 rate limit)       */
+/* --------------------------------------------------------------------- */
+
+static uint32_t s_time_ms;
+
+uint32_t osal_task_get_time_ms(void)
+{
+    /* Test-controlled so the 30 s wait-signature rate limit is exercised
+     * deterministically (bounds the adapter's time source without sleeping). */
+    return s_time_ms;
+}
+
+void osal_test_set_time_ms(uint32_t milliseconds)
+{
+    s_time_ms = milliseconds;
+}
+
+/* --------------------------------------------------------------------- */
 /* Log capture                                                            */
 /* --------------------------------------------------------------------- */
 
@@ -123,6 +141,9 @@ void osal_test_log_reset(void)
 {
     memset(s_log, 0, sizeof(s_log));
     s_log_len = 0U;
+    /* Fresh test: the monotonic clock restarts at 0 so the rate-limit
+     * assertions are deterministic across tests. */
+    s_time_ms = 0U;
 }
 
 const char *osal_test_log_get(void)

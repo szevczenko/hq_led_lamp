@@ -18,6 +18,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "osal_common_type.h"
 #include "osal_error.h"
@@ -37,6 +38,20 @@ unsigned osal_test_delay_call_count(void);
 
 /** @brief Total accumulated delayed time [ms] recorded. */
 uint32_t osal_test_delay_total_ms(void);
+
+/* --------------------------------------------------------------------- */
+/* Task time (TASK-135)                                                  */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Set the test-controlled monotonic clock value in milliseconds.
+ *
+ * The adapter rates its "portal up; station not yet connected" wait
+ * signature off osal_task_get_time_ms(); this function returns this value
+ * (0 initially, restarted by osal_test_log_reset()) so tests can exercise
+ * the 30 s rate limit deterministically.
+ */
+void osal_test_set_time_ms(uint32_t milliseconds);
 
 /* --------------------------------------------------------------------- */
 /* Log capture                                                            */

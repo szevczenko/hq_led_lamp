@@ -751,6 +751,21 @@ static void test_concurrent_start_stop_is_serialized(void)
 #define KNOWN_SSID     "SecretHomeWiFi_126"
 #define KNOWN_PASSWORD "VerySecretPassword_126"
 
+/* Count non-overlapping occurrences of @p needle in @p haystack.  Used
+ * to prove the TASK-135 rate limit (exactly two wait lines) and the
+ * once-per-portal-up-period reachable edge. */
+static unsigned count_substrings(const char *haystack, const char *needle)
+{
+    unsigned count = 0u;
+    const char *p = haystack;
+    while ((p = strstr(p, needle)) != NULL)
+    {
+        ++count;
+        p += strlen(needle);
+    }
+    return count;
+}
+
 static void test_log_content_regression(void)
 {
     /* Known credential content is present in the system (fed through the
@@ -780,8 +795,55 @@ static void test_log_content_regression(void)
     wifi_provisioning_mock_set_config(&fail);
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_ERR_START_FAILED,
                           wifi_provisioning_manager_start());
+
+    /* A distinct TASK-134 failure mode (HTTP bind refusal) must surface
+     * with its mapped adapter error code in the log line. */
+    wifi_provisioning_mock_config_t bind_cfg = {
+        .start_status_set = true,
+        .start_status      = WIFI_HTTP_PROVISIONING_START_ERR_HTTP_BIND};
+    wifi_provisioning_mock_set_config(&bind_cfg);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_ERR_HTTP_BIND,
+                          wifi_provisioning_manager_start());
     wifi_provisioning_mock_config_t ok = {.fail_start = false};
     wifi_provisioning_mock_set_config(&ok);
+
+    /* Drain the two FAILED outcomes queued by the failure starts above:
+     * the wait-path polls below must observe an empty adapter queue. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_FAILED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_FAILED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* Portal-up wait signature (TASK-135): the controller waits in
+     * PROVISIONING with the portal up and reachable.  Start the portal,
+     * put the controller into the provisioning-wait state and poll the
+     * adapter's periodic pump (the supervisor cadence). */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_start());
+    wifi_provisioning_controller_mock_set_state(
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING);
+
+    /* First poll fires the wait signature immediately (the clock starts at
+     * 0 and the never-fired sentinel guarantees a prompt first line). */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+    /* Two more polls inside the 30 s window add nothing. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* Advance the monotonic clock past the 30 s rate-limit window: only
+     * then does the second wait line appear. */
+    osal_test_set_time_ms(30000u + 1u);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* The portal is down again: re-arm the reachable edge guard. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_stop());
 
     /* Queries and the provisioning decision hook. */
     (void)wifi_provisioning_manager_get_state();
@@ -790,7 +852,9 @@ static void test_log_content_regression(void)
     TEST_ASSERT_TRUE(wifi_provisioning_manager_has_saved_credentials());
 
     /* Captured log: the adapter logged sanitized transitions, but never any
-     * credential content and never a provisioning URL. */
+     * credential content and never a provisioning URL.  The new TASK-135
+     * signatures are present: the portal-reachable edge and the rate-limited
+     * wait signature. */
     const char *log = osal_test_log_get();
     TEST_ASSERT_NOT_NULL(log);
     TEST_ASSERT_TRUE(strlen(log) > 0u);
@@ -803,10 +867,25 @@ static void test_log_content_regression(void)
     TEST_ASSERT_NULL(strstr(log, "udp://"));
     TEST_ASSERT_NULL(strstr(log, "127.0.0.1"));
 
-    /* Sanity: the sanitized adapter transitions WERE logged. */
+    /* Sanity: the sanitized adapter transitions WERE logged, including the
+     * new portal-observability signatures. */
     TEST_ASSERT_NOT_NULL(strstr(log, "[prov_mgr]"));
-    TEST_ASSERT_NOT_NULL(strstr(log, "provisioning portal running"));
+    TEST_ASSERT_NOT_NULL(strstr(log, "provisioning AP up; portal reachable"));
+    TEST_ASSERT_NOT_NULL(strstr(log,
+        "provisioning portal start failed"));
+    TEST_ASSERT_NOT_NULL(strstr(log, "adapter_status=-8")); /* ERR_HTTP_BIND */
+    TEST_ASSERT_NOT_NULL(strstr(log, "portal up; station not yet connected"));
     TEST_ASSERT_NOT_NULL(strstr(log, "provisioning portal stopped"));
+
+    /* Rate limit: the sanitized wait signature appears EXACTLY twice - the
+     * first poll (t=0) and the poll after the 30 s window - while the two
+     * intermediate polls (still within the window) added nothing. */
+    TEST_ASSERT_EQUAL_UINT(2u,
+        count_substrings(log, "portal up; station not yet connected"));
+    /* The portal-reachable edge signature appears exactly once per
+     * portal-up period: two portal periods in this test, two lines. */
+    TEST_ASSERT_EQUAL_UINT(2u,
+        count_substrings(log, "provisioning AP up; portal reachable"));
 }
 
 /* --------------------------------------------------------------------- */

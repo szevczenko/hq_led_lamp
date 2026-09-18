@@ -27,7 +27,12 @@
  *   2. Secrecy: nothing that could contain an SSID, a password, a token or
  *      a provisioning URL with embedded credentials is ever accepted,
  *      stored or logged here.  The adapter logs state transitions, listener
- *      bind outcomes and error codes only.
+ *      bind outcomes and error codes only.  TASK-135 adds three bounded,
+ *      credential-free observability signatures: the portal-reachable edge
+ *      ("provisioning AP up; portal reachable"), one line per distinct
+ *      start failure carrying the mapped adapter error code (TASK-134), and
+ *      a rate-limited (once per 30 s) "portal up; station not yet
+ *      connected" line while the controller waits with the portal up.
  *
  *   3. Mongoose ownership: the portal rides the shared Mongoose process
  *      that also hosts MQTT/TLS.  start() checks MongooseProcess_IsRunning()
@@ -64,11 +69,13 @@
 
 #include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "mongoose_process.h"
 #include "osal_log.h"
 #include "osal_mutex.h"
+#include "osal_task.h"
 #include "wifi_http_provisioning.h"
 #include "wifi_managment.h"
 #include "wifi_provisioning_controller.h"
@@ -82,6 +89,11 @@
 
 /** @brief Bounded FIFO capacity for pending product provisioning events. */
 #define WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN 8u
+
+/** @brief Rate limit for the credential-free "portal up; station not yet
+ *         connected" wait signature (TASK-135): at most one line per this
+ *         many milliseconds while the controller waits with the portal up. */
+#define WIFI_PROVISIONING_MANAGER_WAIT_LOG_PERIOD_MS 30000u
 
 /* --------------------------------------------------------------------- */
 /* Internal state                                                          */
@@ -110,6 +122,20 @@ typedef struct wifi_provisioning_manager_ctx
                                    /**< Pending product events, FIFO. */
   unsigned pending_head;           /**< Index of the oldest pending event. */
   unsigned pending_count;          /**< Number of pending events. */
+
+  /* Portal-observability log state (TASK-135).  Bounded by construction:
+   * the "provisioning AP up; portal reachable" signature fires once per
+   * false->true edge of the platform reachability query (the atomic edge
+   * guard is shared lock-free by start(), is_active() and poll_event()),
+   * and the "portal up; station not yet connected" wait signature is
+   * rate-limited to one line per WIFI_PROVISIONING_MANAGER_WAIT_LOG_PERIOD_MS
+   * while the controller waits in PROVISIONING with the portal up.  Neither
+   * message ever carries an SSID, password, token or URL-with-credential
+   * value. */
+  atomic_bool reachable_announced;  /**< true once the current reachable
+                                         period has been announced. */
+  uint32_t wait_log_last_ms;        /**< Monotonic ms of the last wait
+                                         signature (protected by @c lock). */
 #ifdef WIFI_PROVISIONING_MANAGER_TEST_OBSERVABILITY
   /* Test/host-build-only listen-URL overrides, applied at the next start().
    * Protected by @c lock; never logged. */
@@ -123,6 +149,8 @@ typedef struct wifi_provisioning_manager_ctx
 static wifi_provisioning_manager_ctx_t s_ctx = {
     .lock        = NULL,
     .initialized = false,
+    .reachable_announced = false,
+    .wait_log_last_ms    = UINT32_MAX,
 };
 
 /* --------------------------------------------------------------------- */
@@ -453,6 +481,13 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_init(void)
         s_ctx.success_pending        = false;
         s_ctx.pending_head           = 0u;
         s_ctx.pending_count          = 0u;
+        /* Fresh observability lifecycle (TASK-135): the reachable edge
+         * guard starts re-armed and the wait-signature clock starts in the
+         * never-fired state so the next portal-up period is announced and
+         * the first wait line is emitted promptly. */
+        atomic_store_explicit(&s_ctx.reachable_announced, false,
+                              memory_order_release);
+        s_ctx.wait_log_last_ms        = UINT32_MAX;
         osal_log_info("[prov_mgr] wifi provisioning adapter initialized");
     }
     wifi_provisioning_manager_unlock();
@@ -532,6 +567,12 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_deinit(void)
     s_ctx.success_pending        = false;
     s_ctx.pending_head           = 0u;
     s_ctx.pending_count          = 0u;
+    /* Fresh observability lifecycle (TASK-135): re-arm the reachable
+     * edge guard and reset the wait-signature clock so the next adapter
+     * lifecycle starts from a clean observation state. */
+    atomic_store_explicit(&s_ctx.reachable_announced, false,
+                          memory_order_release);
+    s_ctx.wait_log_last_ms         = UINT32_MAX;
 
 #ifdef WIFI_PROVISIONING_MANAGER_TEST_OBSERVABILITY
     s_ctx.http_url_set = false;
@@ -558,6 +599,70 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_deinit(void)
 /* --------------------------------------------------------------------- */
 /* Portal lifecycle                                                       */
 /* --------------------------------------------------------------------- */
+
+/* --------------------------------------------------------------------- */
+/* Portal observability (TASK-135)                                        */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Announce the "provisioning AP up; portal reachable" edge signature.
+ *
+ * Fires exactly one credential-free line per false->true edge of the
+ * platform reachability query.  The atomic edge guard is lock-free and is
+ * shared by start() (explicit portal start), is_active() and poll_event()
+ * (the supervisor's periodic pump, which also observes the controller-owned
+ * fresh-device portal).  A stop() (or lifecycle reset) re-arms the guard so
+ * a later portal re-open is announced again.  Never logs an SSID, password,
+ * token or URL-with-credential value.
+ */
+static void wifi_provisioning_manager_announce_reachable(void)
+{
+    if (wifi_http_provisioning_is_reachable())
+    {
+        const bool was_announced =
+            atomic_exchange_explicit(&s_ctx.reachable_announced, true,
+                                    memory_order_acq_rel);
+        if (!was_announced)
+        {
+            osal_log_info("[prov_mgr] provisioning AP up; portal reachable");
+        }
+    }
+}
+
+/**
+ * @brief Rate-limited "portal up; station not yet connected" wait signature.
+ *
+ * While the controller waits for a station to join and submit (platform
+ * controller state PROVISIONING) with the whole portal up, the supervisor
+ * sees at most one credential-free line per
+ * WIFI_PROVISIONING_MANAGER_WAIT_LOG_PERIOD_MS (30 s).  The caller must hold
+ * the adapter lock: the last-logged timestamp is protected by it.  Never
+ * logs an SSID, password, token or URL-with-credential value.
+ */
+static void wifi_provisioning_manager_observe_wait_state(void)
+{
+    uint32_t now;
+
+    if (!wifi_http_provisioning_is_reachable())
+    {
+        return;
+    }
+    if (wifi_provisioning_controller_get_state() !=
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING)
+    {
+        return;
+    }
+    now = osal_task_get_time_ms();
+    if ((s_ctx.wait_log_last_ms == UINT32_MAX) ||
+        ((now - s_ctx.wait_log_last_ms) >=
+         WIFI_PROVISIONING_MANAGER_WAIT_LOG_PERIOD_MS))
+    {
+        s_ctx.wait_log_last_ms = now;
+        osal_log_info("[prov_mgr] portal up; station not yet connected "
+                      "(waiting for a client to join and submit; one log "
+                      "line per 30 s)");
+    }
+}
 
 wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void)
 {
@@ -631,20 +736,26 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void)
             wifi_provisioning_manager_enqueue_event(
                 WIFI_PROVISIONING_MANAGER_EVENT_FAILED);
             wifi_provisioning_manager_unlock();
-            /* Error and state codes only — never the listen URLs. */
+            /* Error and state codes only — never the listen URLs.  One line
+             * per distinct start failure, carrying the mapped adapter error
+             * code (TASK-134) so the supervisor and the log reader can tell
+             * exactly which start step failed. */
             osal_log_error("[prov_mgr] provisioning portal start failed "
-                           "(platform_state=%d, start_status=%d)",
-                           (int)platform_state, (int)platform_status);
+                           "(platform_state=%d, start_status=%d, "
+                           "adapter_status=%d)",
+                           (int)platform_state, (int)platform_status,
+                           (int)status);
             return status;
         }
     }
 
     wifi_provisioning_manager_unlock();
     /* Reached RUNNING with the radio verified in AP+STA: the whole portal
-     * (AP + HTTP listener + captive DNS listener) is up.  TASK-135 will
-     * enrich this log line with the failure-mode context. */
-    osal_log_info("[prov_mgr] provisioning portal running "
-                  "(portal reachable: AP + both listeners up)");
+     * (AP + HTTP listener + captive DNS listener) is up.  TASK-135: the
+     * announce helper emits ONE credential-free "provisioning AP up; portal
+     * reachable" line per false->true reachability edge, deduplicated across
+     * start()/is_active()/poll_event() via the atomic edge guard. */
+    wifi_provisioning_manager_announce_reachable();
     return WIFI_PROVISIONING_MANAGER_OK;
 }
 
@@ -715,6 +826,10 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_stop(void)
                        (int)platform_state);
         return WIFI_PROVISIONING_MANAGER_ERR_STOP_FAILED;
     }
+    /* The portal is confirmed down (listeners closed): re-arm the reachable
+     * edge guard so a later portal re-open is announced again (TASK-135). */
+    atomic_store_explicit(&s_ctx.reachable_announced, false,
+                          memory_order_release);
     wifi_provisioning_manager_unlock();
 
     osal_log_info("[prov_mgr] provisioning portal stopped "
@@ -748,6 +863,10 @@ bool wifi_provisioning_manager_is_active(void)
      * reached AP+STA ("started without an AP" would otherwise read as
      * active), so back the query off the platform's reachability surface
      * (TASK-134). */
+    /* Fire the "provisioning AP up; portal reachable" edge signature
+     * (TASK-135) once per false->true reachability edge (atomic edge
+     * guard shared with start()/poll_event()). */
+    wifi_provisioning_manager_announce_reachable();
     return wifi_http_provisioning_is_reachable();
 }
 
@@ -770,6 +889,12 @@ wifi_provisioning_manager_event_t wifi_provisioning_manager_poll_event(void)
         /* Safe default after deinit(). */
         return WIFI_PROVISIONING_MANAGER_EVENT_NONE;
     }
+    /* Portal observability edge (TASK-135): "provisioning AP up; portal
+     * reachable" fires once per false->true reachability edge.  The lock-free
+     * atomic edge guard is shared with start()/is_active() so the whole
+     * portal-up period yields exactly one line, wherever the supervisor or a
+     * query first observes it. */
+    wifi_provisioning_manager_announce_reachable();
     if (!wifi_provisioning_manager_ensure_lock() ||
         !wifi_provisioning_manager_lock())
     {
@@ -782,6 +907,12 @@ wifi_provisioning_manager_event_t wifi_provisioning_manager_poll_event(void)
                              WIFI_PROVISIONING_MANAGER_EVENT_QUEUE_LEN;
         --s_ctx.pending_count;
     }
+    /* Rate-limited wait signature (TASK-135): "portal up; station
+     * not yet connected" once per WIFI_PROVISIONING_MANAGER_WAIT_LOG_PERIOD_MS
+     * while the controller waits (PROVISIONING state) with the portal up.
+     * Fired under the adapter lock so the wait clock is serialized; carries
+     * no SSID, password, token or URL-with-credential content. */
+    wifi_provisioning_manager_observe_wait_state();
     wifi_provisioning_manager_unlock();
     return event;
 }

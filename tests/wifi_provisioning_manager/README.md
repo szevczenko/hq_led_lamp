@@ -322,8 +322,15 @@ lines are the adapter's OSAL logs (printed raw to the UART).
 | `… klc: Provisioning gate: portal owned by the controller; waiting for its outcome events` | Machine entered `PROVISIONING` (bookkeeping only; the controller keeps the portal up) |
 
 The portal listeners are opened by the platform controller itself (TASK-132
-notification translation), so no `[prov_mgr] provisioning portal running`
-line appears on the fresh-device boot.
+notification translation).  Once the WHOLE portal is up — the radio reached
+AP+STA **and** both owned listeners (HTTP + captive DNS) are bound, which is
+exactly the platform's reachability surface `wifi_http_provisioning_is_reachable()`
+— the adapter emits ONE credential-free line per portal-up period
+(TASK-135): `[INFO]: [prov_mgr] provisioning AP up; portal reachable`.
+The line fires at most once per false→true reachability edge, wherever the
+supervisor first observes it (start/poll/query), and is never re-emitted
+until the portal goes down again (stop/lifecycle reset re-arms the edge
+guard).
 
 ### Provisioning success
 
@@ -346,10 +353,27 @@ ThingsBoard broker the TLS line is replaced by
 provisioning stage itself still succeeded (this is a post-provisioning
 network/broker condition, not a provisioning failure).
 
+### Portal up; waiting for a station (idle portal)
+
+TASK-135 adds the bounded, credential-free observability for the "portal is
+up but no station has joined yet" state — the state an operator actually
+needs to distinguish from "portal down" and from "portal start failed":
+
+| Log line | Meaning |
+|----------|---------|
+| `[INFO]: [prov_mgr] provisioning AP up; portal reachable` | The WHOLE portal is up (radio in AP+STA, HTTP + captive DNS listeners bound): `wifi_http_provisioning_is_reachable()` first became true.  Fires once per portal-up period (false→true edge), deduplicated across `start()`/`is_active()`/`poll_event()` via an atomic edge guard, re-armed by `stop()`/lifecycle reset |
+| `[INFO]: [prov_mgr] portal up; station not yet connected (waiting for a client to join and submit; one log line per 30 s)` | The controller waits in `PROVISIONING` with the portal up and reachable; **rate-limited to at most one line per 30 s** (`WIFI_PROVISIONING_MANAGER_WAIT_LOG_PERIOD_MS`) so an idle portal stays observable without flooding the log |
+
+Neither message ever carries an SSID, a password, a token or a URL value;
+they are emitted from the adapter's supervisor pump (`poll_event()`), so they
+appear on both the controller-owned fresh-device portal and the explicit
+adapter-start path.
+
 ### Provisioning failure / park
 
 | Log line | Meaning |
 |----------|---------|
+| `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d, start_status=%d, adapter_status=%d)` | Adapter observed a portal start failure; `adapter_status` is the TASK-134 mapped product code (`ERR_DEPENDENCY`/`ERR_MODE_TRANSITION`/`ERR_HTTP_BIND`/`ERR_DNS_BIND`/`ERR_AP_NOT_UP`/`ERR_START_FAILED`) so the log reader can tell exactly which start step failed — one line per distinct failure |
 | `… klc: Provisioning failed; machine parks degraded (bounded retry)` | Supervisor delivered the adapter's FAILED outcome (portal start failure observed by the adapter); `PROVISIONING_FAILED` delivered, machine parks SAFE_OFF |
 | `[INFO]: [prov_mgr] provisioning portal stopped` | Explicit adapter stop (OTA entry / FATAL): controller lifecycle ended and portal listeners closed |
 | `… klc: Safe-off (degraded): no retry scheduled; waiting for provisioning / reset / OTA` | Final park (non-retryable) |
@@ -373,7 +397,7 @@ device ends in, and the recovery path.
 | | |
 |---|---|
 | **Trigger** | The platform controller opens the provisioning application (fresh device at init, or exhausted `CONNECT_FAILED` budget) and the listeners cannot bind (shared Mongoose process not running, port taken, resource exhaustion, radio refused AP+STA).  Since TASK-134 the adapter maps each documented platform start failure mode (`wifi_http_provisioning_start_ex()`) onto a distinct product status (`ERR_DEPENDENCY`, `ERR_MODE_TRANSITION`, `ERR_HTTP_BIND`, `ERR_DNS_BIND`, `ERR_AP_NOT_UP`, or the generic `ERR_START_FAILED` for undocumented modes) so the supervisor can tell exactly which start step failed. |
-| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d, start_status=%d)` and (when the adapter observes the start failure) `… klc: Provisioning failed; machine parks degraded (bounded retry)`; no `portal running` line. |
+| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d, start_status=%d, adapter_status=%d)` — one line per distinct start failure, `adapter_status` carrying the TASK-134 mapped product code — and (when the adapter observes the start failure) `… klc: Provisioning failed; machine parks degraded (bounded retry)`; no `provisioning AP up; portal reachable` line. |
 | **End state** | `SAFE_OFF` (degraded); `PROVISIONING_FAILED` scheduled a bounded retry to NETWORK. |
 | **Recovery** | The bounded retry returns to the NETWORK gate; a later fallback cycle re-opens the portal once the binding condition clears. If the retry budget exhausts, the device parks (no storm) and waits for provisioning / reset / OTA. |
 | **Verification** | Host unit tests (`wifi_provisioning_mock` failure injection + Mongoose-not-running precondition, and the TASK-133 adapter-stop controller-lifecycle tests); on-target signature as above. |
@@ -383,7 +407,7 @@ device ends in, and the recovery path.
 | | |
 |---|---|
 | **Trigger** | Nobody joins the AP / submits a credential.  Since TASK-133 removed the supervisor's `PROVISIONING_WAIT_TIMEOUT_MS`, the product has **no wait window**: the controller keeps the portal up indefinitely (until success/stop/OTA/FATAL), so an idle user simply takes as long as needed. |
-| **Log** | `… klc: Provisioning flow started by the controller; …` + `… klc: Provisioning gate: portal owned by the controller; …`, then nothing further while the portal idles. |
+| **Log** | `… klc: Provisioning flow started by the controller; …` + `… klc: Provisioning gate: portal owned by the controller; …` + `[INFO]: [prov_mgr] provisioning AP up; portal reachable`, then the rate-limited wait heartbeat `[INFO]: [prov_mgr] portal up; station not yet connected (waiting for a client to join and submit; one log line per 30 s)` at most once per 30 s while the controller waits in `PROVISIONING` with the portal up (TASK-135). |
 | **End state** | `PROVISIONING` (portal up). |
 | **Recovery** | Join `Bimbrownik:<MAC>` and submit a valid credential at any time. |
 
@@ -415,6 +439,7 @@ device ends in, and the recovery path.
 |---------|----------------------|
 | Adapter lifecycle, start/stop idempotency, failure propagation, URL overrides, concurrency | Host unit tests (`wifi_provisioning_manager_test.c`, `ctest`) |
 | Credentials-never-logged secrecy rule | Host unit tests (log-content regression) **and** on-target smoke check assertion (c) |
+| Portal state observability signatures (reachable edge / distinct start-failure code / 30 s rate-limited wait heartbeat) | Host unit tests (log-content regression: exact signatures, rate-limit count, and no known SSID/password/URL in the captured log) |
 | Portal startup/stop observable in the log | On target (smoke check assertion (b) + manual procedure) |
 | End-to-end provision (radio: join AP → submit → connect → grace retire) | On target manual procedure (needs a second radio and a lab WLAN) |
 
@@ -450,9 +475,11 @@ Observed with `/dev/ttyUSB1` (ESP32-WROOM-32D), ESP-IDF v5.5.5
    [app_state] configuration --config-ok(configuration)--> network
    I klc: No saved station credential; entering Wi-Fi provisioning (portal)
    [app_state] network --provisioning-started(network)--> provisioning
-   [INFO]: [prov_mgr] provisioning portal running (listeners bound)
+   [INFO]: [prov_mgr] provisioning AP up; portal reachable
    I klc: Provisioning portal running; waiting for the station to submit a
           credential and connect (bounded wait, watchdog fed)
+   [INFO]: [prov_mgr] portal up; station not yet connected (waiting for a
+          client to join and submit; one log line per 30 s)
    ```
 
    Smoke check `--expect provisioning` **PASSES** with the legal sequence
@@ -463,9 +490,9 @@ Observed with `/dev/ttyUSB1` (ESP32-WROOM-32D), ESP-IDF v5.5.5
    `idf.py flash -p /dev/ttyUSB1` + `timeout 1m idf.py -p /dev/ttyUSB1
    monitor | tee /tmp/hq_led_lamp_esp.log` reproduced the identical entry
    boot (configuration gate → `No saved station credential; entering
-   Wi-Fi provisioning (portal)` → `[prov_mgr] provisioning portal running
-   (listeners bound)` → supervisor wait line), zero `Backtrace:`, and the
-   smoke check PASSED with `ENTER -> RUN`.
+   Wi-Fi provisioning (portal)` → `[prov_mgr] provisioning AP up; portal
+   reachable` → supervisor wait line → 30 s rate-limited wait heartbeats),
+   zero `Backtrace:`, and the smoke check PASSED with `ENTER -> RUN`.
 3. **Failure path (rows 2/3) on target** — extended monitor (>180 s) with
    no client, then a bounded retry re-entry:
 
@@ -477,7 +504,7 @@ Observed with `/dev/ttyUSB1` (ESP32-WROOM-32D), ESP-IDF v5.5.5
    [app_state] safe-off --retry-due(timer)--> network
    I klc: No saved station credential; entering Wi-Fi provisioning (portal)
    [app_state] network --provisioning-started(network)--> provisioning
-   [INFO]: [prov_mgr] provisioning portal running (listeners bound)
+   [INFO]: [prov_mgr] provisioning AP up; portal reachable
    ```
 
    Smoke check **PASSES** with the legal sequence
