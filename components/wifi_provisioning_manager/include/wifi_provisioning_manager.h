@@ -8,12 +8,15 @@
  * Purpose
  * -------
  * The platform provisioning application (hq_platform `wifi_provisioning`
- * component: `wifi_http_provisioning_start/stop/get_state`, captive DNS,
- * HTTP portal on the shared Mongoose process) is treated as an external
- * dependency with a platform-internal API (platform lifecycle states,
- * Mongoose listen URLs, listener internals).  Product code must not see any
- * of that.  This adapter narrows the platform provisioning application down
- * to the documented product contract:
+ * component: `wifi_http_provisioning_start_ex/stop/get_state/is_reachable`,
+ * captive DNS, HTTP portal on the shared Mongoose process) is treated as an
+ * external dependency with a platform-internal API (platform lifecycle
+ * states, platform start status codes, Mongoose listen URLs, listener
+ * internals).  Product code must not see any of that.  The adapter maps the
+ * platform's documented start failure modes
+ * (`wifi_http_provisioning_start_ex()`) onto distinct product status codes
+ * below — the platform enum is never exposed — and narrows the platform
+ * provisioning application down to the documented product contract:
  *
  *   @code
  *   wifi_provisioning_manager_init/deinit();   // adapter lifecycle
@@ -95,9 +98,23 @@ typedef enum wifi_provisioning_manager_status
     WIFI_PROVISIONING_MANAGER_ERR_MONGOOSE_NOT_RUNNING = -3,
     /**< start() requires the shared Mongoose process to be running. */
     WIFI_PROVISIONING_MANAGER_ERR_START_FAILED        = -4,
-    /**< The platform provisioning application refused to start. */
-    WIFI_PROVISIONING_MANAGER_ERR_STOP_FAILED         = -5
+    /**< The platform provisioning application refused to start with an
+         undocumented/unknown failure mode (defensive default). */
+    WIFI_PROVISIONING_MANAGER_ERR_STOP_FAILED         = -5,
     /**< The platform provisioning application refused to stop. */
+    WIFI_PROVISIONING_MANAGER_ERR_DEPENDENCY          = -6,
+    /**< start() failed because a required platform dependency (shared
+         Mongoose process, Wi-Fi management) is down. */
+    WIFI_PROVISIONING_MANAGER_ERR_MODE_TRANSITION     = -7,
+    /**< start() failed because the radio refused the AP+STA mode transition. */
+    WIFI_PROVISIONING_MANAGER_ERR_HTTP_BIND           = -8,
+    /**< start() failed because the provisioning HTTP listener bind was
+         refused. */
+    WIFI_PROVISIONING_MANAGER_ERR_DNS_BIND            = -9,
+    /**< start() failed because the captive DNS listener bind was refused. */
+    WIFI_PROVISIONING_MANAGER_ERR_AP_NOT_UP           = -10
+    /**< start() failed because the radio never actually reached AP+STA mode
+         (listeners bound but no AP). */
 } wifi_provisioning_manager_status_t;
 
 /* --------------------------------------------------------------------- */
@@ -206,7 +223,18 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_deinit(void);
  *          #WIFI_PROVISIONING_MANAGER_ERR_MONGOOSE_NOT_RUNNING when the
  *          shared Mongoose process is not running,
  *          #WIFI_PROVISIONING_MANAGER_ERR_START_FAILED when the platform
- *          refused to open the listeners.
+ *          refused to open the listeners with an undocumented failure mode
+ *          (defensive default),
+ *          #WIFI_PROVISIONING_MANAGER_ERR_DEPENDENCY when a platform
+ *          dependency is down,
+ *          #WIFI_PROVISIONING_MANAGER_ERR_MODE_TRANSITION when the radio
+ *          refused the AP+STA mode transition,
+ *          #WIFI_PROVISIONING_MANAGER_ERR_HTTP_BIND when the provisioning
+ *          HTTP listener bind was refused,
+ *          #WIFI_PROVISIONING_MANAGER_ERR_DNS_BIND when the captive DNS
+ *          listener bind was refused,
+ *          #WIFI_PROVISIONING_MANAGER_ERR_AP_NOT_UP when the listeners
+ *          bound but the radio never reached AP+STA mode.
  */
 wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void);
 
@@ -249,11 +277,16 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_stop(void);
 wifi_provisioning_manager_state_t wifi_provisioning_manager_get_state(void);
 
 /**
- * @brief   Query whether the provisioning portal is active (running).
+ * @brief   Query whether the provisioning portal is active (reachable).
  *
- * @return  true exactly when the portal is in the RUNNING state
- *          (HTTP portal + captive DNS listeners bound); false otherwise,
- *          including after stop() and after deinit().
+ * @return  true exactly when the whole portal is genuinely up: the radio
+ *          reached AP+STA mode AND both owned listeners (HTTP portal +
+ *          captive DNS) are bound, i.e. the platform's
+ *          #wifi_http_provisioning_is_reachable is true.  A plain RUNNING
+ *          state does not by itself prove the radio reached AP+STA, so this
+ *          query backs off the platform's reachability surface instead of
+ *          the bare state mirror.  false otherwise, including after stop()
+ *          and after deinit().
  *
  * @note    Lock-free; safe to call from any context.
  */

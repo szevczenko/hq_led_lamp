@@ -372,8 +372,8 @@ device ends in, and the recovery path.
 
 | | |
 |---|---|
-| **Trigger** | The platform controller opens the provisioning application (fresh device at init, or exhausted `CONNECT_FAILED` budget) and the listeners cannot bind (shared Mongoose process not running, port taken, resource exhaustion). |
-| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d)` and (when the adapter observes the start failure) `… klc: Provisioning failed; machine parks degraded (bounded retry)`; no `portal running` line. |
+| **Trigger** | The platform controller opens the provisioning application (fresh device at init, or exhausted `CONNECT_FAILED` budget) and the listeners cannot bind (shared Mongoose process not running, port taken, resource exhaustion, radio refused AP+STA).  Since TASK-134 the adapter maps each documented platform start failure mode (`wifi_http_provisioning_start_ex()`) onto a distinct product status (`ERR_DEPENDENCY`, `ERR_MODE_TRANSITION`, `ERR_HTTP_BIND`, `ERR_DNS_BIND`, `ERR_AP_NOT_UP`, or the generic `ERR_START_FAILED` for undocumented modes) so the supervisor can tell exactly which start step failed. |
+| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d, start_status=%d)` and (when the adapter observes the start failure) `… klc: Provisioning failed; machine parks degraded (bounded retry)`; no `portal running` line. |
 | **End state** | `SAFE_OFF` (degraded); `PROVISIONING_FAILED` scheduled a bounded retry to NETWORK. |
 | **Recovery** | The bounded retry returns to the NETWORK gate; a later fallback cycle re-opens the portal once the binding condition clears. If the retry budget exhausts, the device parks (no storm) and waits for provisioning / reset / OTA. |
 | **Verification** | Host unit tests (`wifi_provisioning_mock` failure injection + Mongoose-not-running precondition, and the TASK-133 adapter-stop controller-lifecycle tests); on-target signature as above. |

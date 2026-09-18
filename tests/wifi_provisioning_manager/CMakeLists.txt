@@ -22,8 +22,11 @@
 # teardown of an active portal, the controller notification translation
 # (TASK-132: hook registration, an event stored for each transition,
 # stale-session notifications discarded, poll-event ordering STARTED then
-# SUCCEEDED, portal start failure -> FAILED) and the credentials-never-logged
-# secrecy rule (log-content regression).
+# SUCCEEDED, portal start failure -> FAILED), the platform start-status
+# mapping (TASK-134: every documented platform failure mode maps to its
+# distinct adapter status, success maps to OK, and is_active() is true only
+# when the whole portal - AP + both listeners - is genuinely reachable) and
+# the credentials-never-logged secrecy rule (log-content regression).
 #
 # Usage:
 #   cmake -S tests/wifi_provisioning_manager -B <build-dir>

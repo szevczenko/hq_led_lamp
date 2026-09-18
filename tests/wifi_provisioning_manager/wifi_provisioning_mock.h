@@ -46,8 +46,15 @@ extern "C" {
 
 typedef struct wifi_provisioning_mock_config
 {
-  bool fail_start; /**< start() returns false and moves the state to ERROR. */
+  bool fail_start; /**< Legacy: start_ex() reports an undocumented platform
+                            status (mapped by the adapter to the generic
+                            ERR_START_FAILED) and moves the state to ERROR. */
   bool fail_stop;  /**< stop() returns false and moves the state to ERROR.  */
+  bool start_status_set; /**< When true, start_ex() reports @c start_status
+                                  instead of the legacy fail_start behavior. */
+  wifi_http_provisioning_start_status_t start_status;
+                             /**< Platform start status to report (TASK-134:
+                                  every documented failure mode is selectable). */
 } wifi_provisioning_mock_config_t;
 
 /* --------------------------------------------------------------------- */
@@ -79,6 +86,16 @@ void wifi_provisioning_mock_reset(void);
 /** @brief Apply a failure configuration (before the exercised call). */
 void wifi_provisioning_mock_set_config(
     const wifi_provisioning_mock_config_t *config);
+
+/**
+ * @brief Choose whether the mock radio reached AP+STA mode (default true).
+ *
+ * Lets tests reproduce the platform's "RUNNING without an AP" path: with the
+ * state in WIFI_PROVISIONING_RUNNING but radio_up false,
+ * wifi_http_provisioning_is_reachable() returns false, so the adapter's
+ * is_active() is false even though get_state() reports RUNNING.
+ */
+void wifi_provisioning_mock_set_radio_up(bool up);
 
 /** @brief Snapshot of the accumulated call counters. */
 wifi_provisioning_mock_counters_t wifi_provisioning_mock_get_counters(void);

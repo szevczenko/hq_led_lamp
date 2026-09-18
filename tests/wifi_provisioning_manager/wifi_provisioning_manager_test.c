@@ -38,7 +38,10 @@
  * fallback-budget default untouched, an event stored for each transition,
  * stale-session notifications discarded across deinit/re-init, poll-event
  * ordering STARTED then SUCCEEDED, portal start failure -> FAILED) and the
- * credentials-never-logged secrecy rule.
+ * platform start-status mapping (TASK-134: every documented platform
+ * failure mode maps to its distinct adapter status, success maps to OK,
+ * and is_active() is true only when the whole portal (AP + both listeners)
+ * is genuinely reachable) and the credentials-never-logged secrecy rule.
  */
 
 #include <pthread.h>
@@ -318,6 +321,133 @@ static void test_start_failure_propagates_and_recovers(void)
     TEST_ASSERT_TRUE(wifi_provisioning_manager_is_active());
 }
 
+/* --------------------------------------------------------------------- */
+/* Platform start-status mapping (TASK-134)                          */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Drive one platform start SUCCESS through the adapter.
+ *
+ * The platform result (WIFI_HTTP_PROVISIONING_START_OK on a fresh start or
+ * its idempotent ALREADY_RUNNING double) must map to the product OK; no
+ * FAILED outcome is fabricated.  Ends with the portal stopped so every
+ * case starts from a clean non-running portal.
+ */
+static void assert_platform_start_success(
+    wifi_http_provisioning_start_status_t platform_status)
+{
+    wifi_provisioning_mock_config_t cfg = {0};
+
+    if (platform_status == WIFI_HTTP_PROVISIONING_START_ALREADY_RUNNING)
+    {
+        /* Idempotent repeat: put the portal up first (the mock naturally
+         * reports ALREADY_RUNNING on the repeat start, mirroring the
+         * platform), then exercise the adapter's ALREADY_RUNNING -> OK
+         * mapping. */
+        TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                              wifi_provisioning_manager_start());
+    }
+    else
+    {
+        /* Fresh start: inject the requested platform result for start_ex. */
+        cfg.start_status_set = true;
+        cfg.start_status = platform_status;
+    }
+    wifi_provisioning_mock_set_config(&cfg);
+
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_start());
+    TEST_ASSERT_TRUE(wifi_provisioning_manager_is_active());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* Stop so every case starts from a clean non-running portal. */
+    wifi_provisioning_mock_config_t ok = {0};
+    wifi_provisioning_mock_set_config(&ok);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_stop());
+}
+
+/**
+ * @brief Drive one platform start FAILURE through the adapter.
+ *
+ * Asserts the mapped product status is EXACTLY the distinct adapter code for
+ * that failure mode, the FAILED outcome is recorded for the supervisor, and
+ * the adapter leaves no sticky failure (the next clean start succeeds; ERROR
+ * is a valid platform start point).
+ */
+static void assert_platform_start_failure(
+    wifi_http_provisioning_start_status_t platform_status,
+    wifi_provisioning_manager_status_t expected)
+{
+    wifi_provisioning_mock_config_t cfg = {.start_status_set = true,
+                                            .start_status = platform_status};
+    wifi_provisioning_mock_set_config(&cfg);
+
+    TEST_ASSERT_EQUAL_INT(expected, wifi_provisioning_manager_start());
+    TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_ERROR,
+                          wifi_provisioning_manager_get_state());
+
+    /* The supervisor still gets a FAILED outcome for any start failure. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_FAILED,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* Recovery: with the failure injection cleared the next start succeeds
+     * (no sticky adapter failure). */
+    wifi_provisioning_mock_config_t ok = {0};
+    wifi_provisioning_mock_set_config(&ok);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_start());
+    TEST_ASSERT_TRUE(wifi_provisioning_manager_is_active());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+
+    /* Stop so every failure case starts from a clean non-running portal. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_stop());
+}
+
+static void test_platform_start_status_mapping(void)
+{
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+
+    /* Success: the fresh start OK and the idempotent ALREADY_RUNNING result
+     * both mean "the portal is (or already was) up" -> product OK. */
+    assert_platform_start_success(WIFI_HTTP_PROVISIONING_START_OK);
+    assert_platform_start_success(
+        WIFI_HTTP_PROVISIONING_START_ALREADY_RUNNING);
+
+    /* Every documented platform failure mode maps to its distinct adapter
+     * status: the supervisor can distinguish "portal up and reachable" from
+     * exactly which start step failed. */
+    assert_platform_start_failure(
+        WIFI_HTTP_PROVISIONING_START_ERR_DEPENDENCY,
+        WIFI_PROVISIONING_MANAGER_ERR_DEPENDENCY);
+    assert_platform_start_failure(
+        WIFI_HTTP_PROVISIONING_START_ERR_MODE_TRANSITION,
+        WIFI_PROVISIONING_MANAGER_ERR_MODE_TRANSITION);
+    assert_platform_start_failure(
+        WIFI_HTTP_PROVISIONING_START_ERR_HTTP_BIND,
+        WIFI_PROVISIONING_MANAGER_ERR_HTTP_BIND);
+    assert_platform_start_failure(
+        WIFI_HTTP_PROVISIONING_START_ERR_DNS_BIND,
+        WIFI_PROVISIONING_MANAGER_ERR_DNS_BIND);
+    assert_platform_start_failure(
+        WIFI_HTTP_PROVISIONING_START_ERR_NO_AP,
+        WIFI_PROVISIONING_MANAGER_ERR_AP_NOT_UP);
+
+    /* Defensive default: an undocumented/unknown platform status maps to
+     * the generic ERR_START_FAILED (also exercised by the legacy fail_start
+     * fixture above). */
+    assert_platform_start_failure(
+        (wifi_http_provisioning_start_status_t)0x7E,
+        WIFI_PROVISIONING_MANAGER_ERR_START_FAILED);
+}
+
 static void test_stop_failure_propagates(void)
 {
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
@@ -433,6 +563,39 @@ static void test_is_portal_active_query(void)
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_RUNNING,
                           wifi_provisioning_manager_get_state());
 
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_stop());
+    TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_STOPPED,
+                          wifi_provisioning_manager_get_state());
+}
+
+static void test_is_active_requires_fully_reachable_portal(void)
+{
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+
+    /* Fresh start: the radio reached AP+STA and both listeners are bound,
+     * so the whole portal is reachable and is_active() is true. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_start());
+    TEST_ASSERT_TRUE(wifi_provisioning_manager_is_active());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_RUNNING,
+                          wifi_provisioning_manager_get_state());
+
+    /* "Started without an AP": the platform state still reports RUNNING,
+     * but the radio never reached AP+STA.  A bare state check would read
+     * this as active; reachability says the portal is NOT up (TASK-134). */
+    wifi_provisioning_mock_set_radio_up(false);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_RUNNING,
+                          wifi_provisioning_manager_get_state());
+    TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
+
+    /* Radio restored: the whole portal is up again. */
+    wifi_provisioning_mock_set_radio_up(true);
+    TEST_ASSERT_TRUE(wifi_provisioning_manager_is_active());
+
+    /* After stop nothing is up and the state returns to STOPPED. */
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
                           wifi_provisioning_manager_stop());
     TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
@@ -854,11 +1017,16 @@ int main(void)
     RUN_TEST(test_stop_ends_controller_lifecycle_and_closes_listeners);
     RUN_TEST(test_start_before_mongoose_running);
     RUN_TEST(test_start_failure_propagates_and_recovers);
+
+    /* Platform start-status mapping (TASK-134). */
+    RUN_TEST(test_platform_start_status_mapping);
+
     RUN_TEST(test_stop_failure_propagates);
     RUN_TEST(test_listener_url_overrides_applied_before_start);
     RUN_TEST(test_no_overrides_uses_compiled_in_defaults);
     RUN_TEST(test_invalid_url_overrides_rejected);
     RUN_TEST(test_is_portal_active_query);
+    RUN_TEST(test_is_active_requires_fully_reachable_portal);
     RUN_TEST(test_has_saved_credentials_query);
     RUN_TEST(test_deinit_stops_active_portal);
     RUN_TEST(test_concurrent_start_stop_is_serialized);

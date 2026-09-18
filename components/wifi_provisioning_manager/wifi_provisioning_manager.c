@@ -13,10 +13,16 @@
  *   1. Narrow surface: the ONLY platform headers included are
  *      wifi_http_provisioning.h, mongoose_process.h and wifi_managment.h,
  *      and only the operations the product contract needs are used
- *      (start/stop/get_state, the runtime URL overrides under the
- *      test-only guard, MongooseProcess_IsRunning, wifi_mgmt_is_read_data).
- *      None of these platform types or include paths appear in the public
- *      header (include/wifi_provisioning_manager.h).
+ *      (start_ex/stop/get_state/is_reachable, the runtime URL overrides
+ *      under the test-only guard, MongooseProcess_IsRunning,
+ *      wifi_mgmt_is_read_data).  The adapter starts the portal through the
+ *      enum API wifi_http_provisioning_start_ex() so every documented
+ *      platform failure mode is mapped to a distinct product status; the
+ *      platform's bool wifi_http_provisioning_start() wrapper is left
+ *      untouched for the fallback controller and any other platform-side
+ *      caller (see rule 5 and wifi_provisioning_controller.c).  None of
+ *      these platform types or include paths appear in the public header
+ *      (include/wifi_provisioning_manager.h).
  *
  *   2. Secrecy: nothing that could contain an SSID, a password, a token or
  *      a provisioning URL with embedded credentials is ever accepted,
@@ -215,6 +221,43 @@ wifi_provisioning_manager_map_state(wifi_http_provisioning_state_t state)
         case WIFI_PROVISIONING_ERROR:
         default:
             return WIFI_PROVISIONING_MANAGER_ERROR;
+    }
+}
+
+/**
+ * @brief Map the platform start-attempt status onto the product status type.
+ *
+ * The adapter starts the portal through wifi_http_provisioning_start_ex()
+ * (TASK-134) so the distinct platform failure modes - mode-transition
+ * refusal, HTTP bind refusal, DNS bind refusal, "started without an AP",
+ * missing dependency - each surface as a distinct product error code the
+ * supervisor can act on.  Explicit switch: the platform enum is mapped, never
+ * exposed; unknown platform values map to the generic
+ * #WIFI_PROVISIONING_MANAGER_ERR_START_FAILED (defensive default).  The
+ * idempotent ALREADY_RUNNING result maps to OK (the portal is up, which is
+ * exactly what start() promises).
+ */
+static wifi_provisioning_manager_status_t
+wifi_provisioning_manager_map_start_status(
+    wifi_http_provisioning_start_status_t status)
+{
+    switch (status)
+    {
+        case WIFI_HTTP_PROVISIONING_START_OK:
+        case WIFI_HTTP_PROVISIONING_START_ALREADY_RUNNING:
+            return WIFI_PROVISIONING_MANAGER_OK;
+        case WIFI_HTTP_PROVISIONING_START_ERR_DEPENDENCY:
+            return WIFI_PROVISIONING_MANAGER_ERR_DEPENDENCY;
+        case WIFI_HTTP_PROVISIONING_START_ERR_MODE_TRANSITION:
+            return WIFI_PROVISIONING_MANAGER_ERR_MODE_TRANSITION;
+        case WIFI_HTTP_PROVISIONING_START_ERR_HTTP_BIND:
+            return WIFI_PROVISIONING_MANAGER_ERR_HTTP_BIND;
+        case WIFI_HTTP_PROVISIONING_START_ERR_DNS_BIND:
+            return WIFI_PROVISIONING_MANAGER_ERR_DNS_BIND;
+        case WIFI_HTTP_PROVISIONING_START_ERR_NO_AP:
+            return WIFI_PROVISIONING_MANAGER_ERR_AP_NOT_UP;
+        default:
+            return WIFI_PROVISIONING_MANAGER_ERR_START_FAILED;
     }
 }
 
@@ -518,8 +561,6 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_deinit(void)
 
 wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void)
 {
-    bool platform_ok;
-
     if (!wifi_provisioning_manager_ensure_lock())
     {
         osal_log_error("[prov_mgr] adapter lock unavailable");
@@ -567,28 +608,43 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void)
     }
 #endif
 
-    platform_ok = wifi_http_provisioning_start();
-    if (!platform_ok)
+    /* Start through the enum API (TASK-134) so every documented platform
+     * failure mode - mode-transition refusal, HTTP bind refusal, DNS bind
+     * refusal, "started without an AP", missing dependency - surfaces as a
+     * distinct product status the supervisor can distinguish from "portal up
+     * and reachable".  The platform's bool wrapper
+     * (wifi_http_provisioning_start()) is left untouched for the fallback
+     * controller and other platform-side callers. */
     {
-        const wifi_http_provisioning_state_t platform_state =
-            wifi_http_provisioning_get_state();
-        /* A portal start failure observed by the adapter is a
-         * provisioning-failed outcome for the supervisor (TASK-133); the
-         * adapter stores it, it never acts on it directly. */
-        wifi_provisioning_manager_enqueue_event(
-            WIFI_PROVISIONING_MANAGER_EVENT_FAILED);
-        wifi_provisioning_manager_unlock();
-        /* Error code only — never the listen URLs. */
-        osal_log_error("[prov_mgr] provisioning portal start failed "
-                       "(platform_state=%d)",
-                       (int)platform_state);
-        return WIFI_PROVISIONING_MANAGER_ERR_START_FAILED;
+        const wifi_http_provisioning_start_status_t platform_status =
+            wifi_http_provisioning_start_ex();
+        wifi_provisioning_manager_status_t status =
+            wifi_provisioning_manager_map_start_status(platform_status);
+
+        if (status != WIFI_PROVISIONING_MANAGER_OK)
+        {
+            const wifi_http_provisioning_state_t platform_state =
+                wifi_http_provisioning_get_state();
+            /* A portal start failure observed by the adapter is a
+             * provisioning-failed outcome for the supervisor (TASK-133); the
+             * adapter stores it, it never acts on it directly. */
+            wifi_provisioning_manager_enqueue_event(
+                WIFI_PROVISIONING_MANAGER_EVENT_FAILED);
+            wifi_provisioning_manager_unlock();
+            /* Error and state codes only — never the listen URLs. */
+            osal_log_error("[prov_mgr] provisioning portal start failed "
+                           "(platform_state=%d, start_status=%d)",
+                           (int)platform_state, (int)platform_status);
+            return status;
+        }
     }
 
     wifi_provisioning_manager_unlock();
-    /* Reached RUNNING: both listeners (HTTP portal + captive DNS) bound. */
+    /* Reached RUNNING with the radio verified in AP+STA: the whole portal
+     * (AP + HTTP listener + captive DNS listener) is up.  TASK-135 will
+     * enrich this log line with the failure-mode context. */
     osal_log_info("[prov_mgr] provisioning portal running "
-                  "(listeners bound)");
+                  "(portal reachable: AP + both listeners up)");
     return WIFI_PROVISIONING_MANAGER_OK;
 }
 
@@ -686,7 +742,13 @@ bool wifi_provisioning_manager_is_active(void)
     {
         return false;
     }
-    return wifi_http_provisioning_get_state() == WIFI_PROVISIONING_RUNNING;
+    /* "Active" means the WHOLE portal is genuinely up: the radio reached
+     * AP+STA mode AND both owned listeners (HTTP + captive DNS) are bound.
+     * The platform's RUNNING state alone does not prove the radio side
+     * reached AP+STA ("started without an AP" would otherwise read as
+     * active), so back the query off the platform's reachability surface
+     * (TASK-134). */
+    return wifi_http_provisioning_is_reachable();
 }
 
 bool wifi_provisioning_manager_has_saved_credentials(void)

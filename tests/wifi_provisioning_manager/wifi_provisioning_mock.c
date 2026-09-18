@@ -20,6 +20,12 @@ typedef struct wifi_provisioning_mock_state
   wifi_provisioning_mock_config_t   config;
   wifi_provisioning_mock_counters_t counters;
   wifi_http_provisioning_state_t    state;
+                                 /**< Portal lifecycle state.                    */
+  bool                              radio_up;
+                                 /**< Whether the mock radio reached AP+STA
+                                      (is_reachable gate, TASK-134).         */
+  wifi_http_provisioning_start_status_t last_start_status;
+                                 /**< Result of the most recent start attempt.  */
   char                              last_ssid[33];
   char                              last_password[65];
 } wifi_provisioning_mock_state_t;
@@ -65,6 +71,8 @@ void wifi_provisioning_mock_reset(void)
 {
   memset(&s_mock, 0, sizeof(s_mock));
   s_mock.state = WIFI_PROVISIONING_STOPPED;
+  s_mock.radio_up = true;
+  s_mock.last_start_status = WIFI_HTTP_PROVISIONING_START_OK;
   atomic_store_explicit(&s_active, 0u, memory_order_relaxed);
   atomic_store_explicit(&s_max_active, 0u, memory_order_relaxed);
 }
@@ -74,6 +82,13 @@ void wifi_provisioning_mock_set_config(
 {
   pthread_mutex_lock(&s_mock_lock);
   if (config != NULL) s_mock.config = *config;
+  pthread_mutex_unlock(&s_mock_lock);
+}
+
+void wifi_provisioning_mock_set_radio_up(bool up)
+{
+  pthread_mutex_lock(&s_mock_lock);
+  s_mock.radio_up = up;
   pthread_mutex_unlock(&s_mock_lock);
 }
 
@@ -135,7 +150,18 @@ const char *wifi_provisioning_mock_get_last_password(void)
 
 bool wifi_http_provisioning_start(void)
 {
-  bool ok = true;
+  /* Thin bool wrapper over start_ex, exactly like the platform: succeeds
+   * when the portal is fully up (or already was).  Host mocks and other
+   * platform-side callers keep using the wrapper, while the adapter
+   * (TASK-134) uses the enum API to distinguish fault modes. */
+  wifi_http_provisioning_start_status_t status = wifi_http_provisioning_start_ex();
+  return status == WIFI_HTTP_PROVISIONING_START_OK ||
+         status == WIFI_HTTP_PROVISIONING_START_ALREADY_RUNNING;
+}
+
+wifi_http_provisioning_start_status_t wifi_http_provisioning_start_ex(void)
+{
+  wifi_http_provisioning_start_status_t status = WIFI_HTTP_PROVISIONING_START_OK;
 
   mock_enter();
 
@@ -146,26 +172,44 @@ bool wifi_http_provisioning_start(void)
   if (s_mock.state == WIFI_PROVISIONING_RUNNING ||
       s_mock.state == WIFI_PROVISIONING_STARTING)
   {
+    status = WIFI_HTTP_PROVISIONING_START_ALREADY_RUNNING;
+    s_mock.last_start_status = status;
     pthread_mutex_unlock(&s_mock_lock);
     mock_leave();
-    return true;
+    return status;
   }
 
   s_mock.state = WIFI_PROVISIONING_STARTING;
 
-  if (s_mock.config.fail_start)
+  if (s_mock.config.start_status_set)
   {
-    s_mock.state = WIFI_PROVISIONING_ERROR;
-    ok = false;
+    /* Every documented platform failure mode is selectable (TASK-134). */
+    status = s_mock.config.start_status;
+  }
+  else if (s_mock.config.fail_start)
+  {
+    /* Legacy generic failure: an undocumented platform status, which the
+     * adapter maps to WIFI_PROVISIONING_MANAGER_ERR_START_FAILED. */
+    status = (wifi_http_provisioning_start_status_t)0x7F;
   }
   else
   {
+    status = WIFI_HTTP_PROVISIONING_START_OK;
+  }
+
+  if (status == WIFI_HTTP_PROVISIONING_START_OK)
+  {
     s_mock.state = WIFI_PROVISIONING_RUNNING;
   }
-  pthread_mutex_unlock(&s_mock_lock);
+  else
+  {
+    s_mock.state = WIFI_PROVISIONING_ERROR;
+  }
+  s_mock.last_start_status = status;
 
+  pthread_mutex_unlock(&s_mock_lock);
   mock_leave();
-  return ok;
+  return status;
 }
 
 bool wifi_http_provisioning_stop(void)
@@ -210,6 +254,30 @@ wifi_http_provisioning_state_t wifi_http_provisioning_get_state(void)
   state = s_mock.state;
   pthread_mutex_unlock(&s_mock_lock);
   return state;
+}
+
+wifi_http_provisioning_start_status_t wifi_http_provisioning_get_last_start_status(void)
+{
+  wifi_http_provisioning_start_status_t status = WIFI_HTTP_PROVISIONING_START_OK;
+
+  pthread_mutex_lock(&s_mock_lock);
+  status = s_mock.last_start_status;
+  pthread_mutex_unlock(&s_mock_lock);
+  return status;
+}
+
+bool wifi_http_provisioning_is_reachable(void)
+{
+  /* Reachable only when the whole portal is up: RUNNING plus the radio
+   * actually in AP+STA.  A RUNNING-without-AP double (radio_up false) is
+   * therefore NOT reachable, exactly like the platform (TASK-134). */
+  bool reachable = false;
+
+  pthread_mutex_lock(&s_mock_lock);
+  if (s_mock.radio_up && s_mock.state == WIFI_PROVISIONING_RUNNING)
+    reachable = true;
+  pthread_mutex_unlock(&s_mock_lock);
+  return reachable;
 }
 
 bool wifi_http_provisioning_set_http_url(const char *url)
