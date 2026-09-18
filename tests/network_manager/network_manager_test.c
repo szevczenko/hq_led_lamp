@@ -469,6 +469,50 @@ static void test_reconnect_after_loss_restores_connection(void)
     TEST_ASSERT_TRUE(network_manager_wait_connected(0));
 }
 
+/* TASK-139: network_manager_reconnect() re-drives the saved-credential
+ * connect request from the NETWORK gate's bounded-retry re-entries so the
+ * fallback controller's CONNECT_FAILED budget is actually reachable (the
+ * manager emits at most one CONNECT_FAILED per connect request).  A new
+ * request must be accepted while the adapter is not connected, must NOT be
+ * issued for an established connection (that would stop the live session),
+ * and must be a clean no-op when the adapter is stopped. */
+static void test_reconnect_redrives_connect_request_only_when_not_connected(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    wifi_mock_counters_t counters;
+
+    /* Stopped adapter: reconnect is a no-op (nothing armed, no crash). */
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_reconnect());
+
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(1U, counters.connect_calls);
+
+    /* Not connected: reconnect issues a fresh connect request (the gate
+     * re-drives the saved credential on every retry re-entry). */
+    TEST_ASSERT_FALSE(network_manager_is_connected());
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_reconnect());
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(2U, counters.connect_calls);
+
+    /* Connected: reconnect must NOT issue another request — a connect
+     * request while the manager is READY would make it stop the live
+     * session (fail-off) for no gain. */
+    wifi_mgmt_mock_set_connected(true);
+    TEST_ASSERT_TRUE(network_manager_is_connected());
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_reconnect());
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(2U, counters.connect_calls);
+
+    /* Repeated re-drives while not connected stay accepted and repeat the
+     * request (each bounded-retry session may request again). */
+    wifi_mgmt_mock_set_connected(false);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_reconnect());
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_reconnect());
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(4U, counters.connect_calls);
+}
+
 static void test_repeated_connect_events_deliver_each_time(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
@@ -1142,6 +1186,7 @@ int main(void)
     /* 5. reconnect */
     RUN_TEST(test_reconnect_after_loss_restores_connection);
     RUN_TEST(test_repeated_connect_events_deliver_each_time);
+    RUN_TEST(test_reconnect_redrives_connect_request_only_when_not_connected);
 
     /* 6. stale callbacks */
     RUN_TEST(test_late_event_after_stop_is_dropped_but_fails_off);

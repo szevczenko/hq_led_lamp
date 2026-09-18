@@ -197,6 +197,36 @@ void network_manager_stop(void);
 bool network_manager_is_connected(void);
 
 /**
+ * @brief   Re-drive the saved-credential station connect request.
+ *
+ * @details TASK-139: the platform fallback controller opens the provisioning
+ *          portal only after the configured
+ *          CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS consecutive
+ *          CONNECT_FAILED events, but the platform Wi-Fi manager issues at
+ *          most ONE CONNECT_FAILED per connect request and then rests idle.
+ *          This call re-requests the station connect so the NETWORK gate can
+ *          re-drive the saved credential on every bounded-retry re-entry —
+ *          an unusable stale credential then really exhausts the fallback
+ *          budget (one CONNECT_FAILED per session) instead of parking with
+ *          no AP.  It is a no-op for an established connection: requesting a
+ *          connect while the manager is already READY would make it stop the
+ *          live session, so the guard below refuses in that state.
+ *
+ *          The request is non-blocking and may be repeated freely; the
+ *          manager applies it from its idle state at its own pace.  When the
+ *          adapter is not started the call is a no-op: start() already
+ *          requests the first connect, and an armed request from a
+ *          pre-start reconnect could outlive the session it was made for.
+ *
+ * @return  #NETWORK_OK when the request was accepted (or skipped because the
+ *          adapter already reports a connection),
+ *          #NETWORK_ERR_START_FAILED when the manager rejected the connect
+ *          request (a product build never selects the server-only mode that
+ *          rejects requests, so this is defensive).
+ */
+int network_manager_reconnect(void);
+
+/**
  * @brief   Block until the network is connected or the timeout elapses.
  *
  * @details This is the ThingsBoard ordering gate: a ThingsBoard connect may

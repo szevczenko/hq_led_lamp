@@ -229,40 +229,6 @@ static bool start_network(void)
     return true;
 }
 
-/**
- * @brief The machine's NETWORK gate: a bounded wait for Wi-Fi with in-loop
- *        watchdog feeding (blocking constraint: one task owns the feed and
- *        polls inside every bounded wait).
- *
- * This is the consumed successor of network_manager_wait_connected(): it
- * polls network_manager_is_connected() at NETWORK_WAIT_POLL_INTERVAL_MS
- * and calls app_state_poll() in each iteration, so the watchdog is fed by
- * the same (only) owner task while the gate is pending.
- *
- * @return true on a connection, false on timeout (the caller delivers
- *         NETWORK_CONNECTED / NETWORK_FAILED accordingly).
- */
-static bool supervise_network_gate(void)
-{
-    uint32_t waited_ms = 0U;
-
-    while (!network_manager_is_connected() &&
-           (waited_ms < NETWORK_CONNECT_TIMEOUT_MS))
-    {
-        app_state_poll(); /* feed — this task is the single watchdog owner */
-        (void)osal_task_delay_ms(NETWORK_WAIT_POLL_INTERVAL_MS);
-        waited_ms += NETWORK_WAIT_POLL_INTERVAL_MS;
-    }
-
-    if (!network_manager_is_connected())
-    {
-        ESP_LOGW(TAG, "No Wi-Fi connection within %u ms; "
-                      "verified TLS connect stays blocked",
-                 (unsigned)NETWORK_CONNECT_TIMEOUT_MS);
-    }
-    return network_manager_is_connected();
-}
-
 /* --------------------------------------------------------------------- */
 /* Provisioning outcome events (TASK-132/133)                              */
 /* --------------------------------------------------------------------- */
@@ -371,6 +337,71 @@ static void deliver_provisioning_events(void)
             return;
         }
     }
+}
+
+/**
+ * @brief The machine's NETWORK gate: a bounded wait for Wi-Fi with in-loop
+ *        watchdog feeding (blocking constraint: one task owns the feed and
+ *        polls inside every bounded wait).
+ *
+ * This is the consumed successor of network_manager_wait_connected(): it
+ * polls network_manager_is_connected() at NETWORK_WAIT_POLL_INTERVAL_MS
+ * and calls app_state_poll() in each iteration, so the watchdog is fed by
+ * the same (only) owner task while the gate is pending.
+ *
+ * TASK-139: the gate ALSO services the provisioning outcome events in-loop.
+ * The platform fallback controller can open the portal (and fire STARTED)
+ * while the machine is still inside this NETWORK gate — exactly the
+ * exhausted-credential case: the last CONNECT_FAILED of the bounded budget
+ * makes the controller start the portal a few seconds into the gate wait.
+ * Polling the adapter's events here lets the supervisor consume STARTED at
+ * once (NETWORK -> PROVISIONING) instead of letting the gate time out and
+ * park SAFE_OFF with an open portal behind it.  When that happens the loop
+ * breaks out of the wait and the gate is superseded by provisioning, not
+ * timed out — no timeout is logged, and the return value reports the
+ * radio truth (the caller re-checks the state before delivering either
+ * NETWORK event).
+ *
+ * @return true when connected; false when the wait timed out without a
+ *         connection.  On the supersession path (the machine left the
+ *         NETWORK state to provisioning mid-wait) the value reports the
+ *         radio truth — the caller re-checks the state before delivering
+ *         either NETWORK event.
+ */
+static bool supervise_network_gate(void)
+{
+    uint32_t waited_ms = 0U;
+
+    while (!network_manager_is_connected() &&
+           (waited_ms < NETWORK_CONNECT_TIMEOUT_MS))
+    {
+        app_state_poll(); /* feed — this task is the single watchdog owner */
+        /* TASK-139: consume a controller-opened-portal STARTED promptly so
+         * the gate yields to PROVISIONING instead of waiting out the window
+         * with the portal already up (see the doc comment above). */
+        deliver_provisioning_events();
+        if (app_state_current() != APP_STATE_NETWORK)
+        {
+            /* The controller's STARTED moved the machine to PROVISIONING:
+             * the gate was superseded by the provisioning stage, not timed
+             * out — neither NETWORK_CONNECTED nor NETWORK_FAILED applies.
+             * Report the radio truth: the caller re-checks the machine
+             * state before delivering either NETWORK event, so a connection
+             * that landed during the supersession window is not lost. */
+            return network_manager_is_connected();
+        }
+        (void)osal_task_delay_ms(NETWORK_WAIT_POLL_INTERVAL_MS);
+        waited_ms += NETWORK_WAIT_POLL_INTERVAL_MS;
+    }
+
+    if (!network_manager_is_connected() &&
+        (waited_ms >= NETWORK_CONNECT_TIMEOUT_MS))
+    {
+        ESP_LOGW(TAG, "No Wi-Fi connection within %u ms; "
+                      "verified TLS connect stays blocked",
+                 (unsigned)NETWORK_CONNECT_TIMEOUT_MS);
+    }
+    return network_manager_is_connected();
 }
 
 /* --------------------------------------------------------------------- */
@@ -708,19 +739,42 @@ static void supervise_iteration(void)
          * starts provisioning from here — the platform fallback controller
          * owns that decision (fresh device at init, or exhausted
          * CONNECT_FAILED budget) and the supervisor delivers its STARTED
-         * event above while the machine is in NETWORK. */
+         * event above while the machine is in NETWORK.
+         *
+         * TASK-139 — bounded fallback reachability: the platform Wi-Fi
+         * manager emits at most ONE CONNECT_FAILED per connect request and
+         * then rests idle, so an unusable saved credential could never
+         * exhaust the controller's CONNECT_FAILED budget (the device would
+         * park SAFE_OFF with no AP forever).  On every credentialed NETWORK
+         * (re-)entry the gate therefore re-drives the saved-credential
+         * connect: each bounded-retry session contributes one fresh
+         * CONNECT_FAILED, the controller opens the portal after the
+         * configured budget, and the gate's in-loop event service (above)
+         * consumes the STARTED at once. */
         {
             const bool credentialed =
                 wifi_provisioning_manager_has_saved_credentials();
-            if (credentialed && supervise_network_gate())
+            if (credentialed)
             {
-                (void)app_state_deliver(APP_EVENT_NETWORK_CONNECTED,
-                                        APP_OWNER_NETWORK);
-            }
-            else if (credentialed)
-            {
-                (void)app_state_deliver(APP_EVENT_NETWORK_FAILED,
-                                        APP_OWNER_NETWORK);
+                (void)network_manager_reconnect();
+                const bool connected = supervise_network_gate();
+                /* The gate may have been superseded by the controller's
+                 * STARTED (state == PROVISIONING): in that case neither
+                 * NETWORK_CONNECTED nor NETWORK_FAILED applies — the
+                 * provisioning stage owns the machine from here. */
+                if (app_state_current() == APP_STATE_NETWORK)
+                {
+                    if (connected)
+                    {
+                        (void)app_state_deliver(APP_EVENT_NETWORK_CONNECTED,
+                                                APP_OWNER_NETWORK);
+                    }
+                    else
+                    {
+                        (void)app_state_deliver(APP_EVENT_NETWORK_FAILED,
+                                                APP_OWNER_NETWORK);
+                    }
+                }
             }
         }
         break;

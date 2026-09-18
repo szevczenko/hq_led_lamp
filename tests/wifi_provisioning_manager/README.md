@@ -300,13 +300,18 @@ python3 tests/wifi_provisioning_manager/on_target_smoke_check.py \
 | `--log FILE` | – | validate an already captured log (`-` = stdin); skip flash/monitor |
 | `--port` | `/dev/ttyUSB1` | serial port for the flash/monitor loop |
 | `--monitor-duration` | `60` | bounded monitor window in seconds |
-| `--expect` | `provisioning` | `provisioning` (fresh: must enter the portal), `pass-through` (credentialed: must skip it), `any` |
+| `--expect` | `provisioning` | `provisioning` (fresh: must enter the portal), `pass-through` (credentialed: must skip it), `any`, `stale-credential` (TASK-139: bounded NETWORK_FAILED fallback then portal, no restart storm), `stale-recovery` (stale-credential PLUS `SUCCESS -> NETWORK -> TLS` after re-provisioning) |
+| `--fallback-budget` | `2` | configured `CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS` budget the stale-credential assertion checks against |
 | `--test-ssid` | `KLC-Smoke-128-Test` | test SSID whose substrings must not appear in the log (`$KLC_SMOKE_TEST_SSID`) |
 | `--test-password` | `KLC-Sm0ke-Pa55-128!` | test password whose substrings must not appear (`$KLC_SMOKE_TEST_PASSWORD`) |
+| `--stale-ssid` | `KLC-Stale-Net-139` | stale (wrong) SSID whose substrings must not appear (`$KLC_SMOKE_STALE_SSID`, TASK-139) |
+| `--stale-password` | `KLC-Stale-Pass-139!` | stale (wrong) password whose substrings must not appear (`$KLC_SMOKE_STALE_PASSWORD`, TASK-139) |
 
 `--test-ssid`/`--test-password` default to the documented smoke-test
 credential; pass the actual lab values so the secrecy assertion mirrors the
-real provision.
+real provision.  `--stale-ssid`/`--stale-password` default to the documented
+throwaway wrong credential the TASK-139 procedure seeds; pass the values the
+storage image actually used.
 
 ---
 
@@ -372,6 +377,20 @@ Neither message ever carries an SSID, a password, a token or a URL value;
 they are emitted from the adapter's supervisor pump (`poll_event()`), so they
 appear on both the controller-owned fresh-device portal and the explicit
 adapter-start path.
+
+### Stale-credential bounded fallback (TASK-139)
+
+| Log line | Meaning |
+|----------|---------|
+| `… klc: Network lost; lamp forced off by adapter, ThingsBoard stays disconnected until reconnect` | The Wi-Fi manager reported one CONNECT_FAILED for the saved (wrong) credential — the platform fallback controller counts it against the `CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS` budget (the product's `[wifi] state WAIT_CONNECT -> STOP -> IDLE` debug lines bracket it) |
+| `[INFO]: [app_state] network --network-failed(network)--> safe-off (session N)` | The NETWORK gate timed out without a connection; the machine parks SAFE_OFF with a bounded retry scheduled (one episode per connect cycle) |
+| `[INFO]: [app_state] safe-off --retry-due(timer)--> network (session N+1)` | The bounded retry re-enters NETWORK; the gate re-drives the saved-credential connect (TASK-139 fix), which fires the next CONNECT_FAILED |
+| `[INFO]: [prov_mgr] controller transition 1 -> 3 (product event 1)` | The controller exhausted the budget and started the portal (fallback fired) |
+| `… klc: Provisioning flow started by the controller; entering Wi-Fi provisioning` | The supervisor delivered the STARTED outcome; the machine enters PROVISIONING (the NETWORK gate services this in-loop since TASK-139, so the entry happens promptly in the session where the budget exhausted) |
+
+The device must show **at most** `--fallback-budget` NETWORK_FAILED episodes
+before the portal opens, exactly one ENTER and exactly one portal-up period
+(the TASK-135 reachability signature) — no restart storm, no park-without-AP.
 
 ### Provisioning failure / park
 
@@ -994,11 +1013,158 @@ then, the manual join step looks for the `wifi_provisioning:<MAC>` network
 (see the AP facts table in the [manual procedure](#manual-on-target-procedure);
 a later task should update it when the identity is wired).
 
-**Manual step (deferred to TASK-139's batched session).**  A human joins the
+**Manual step (TASK-139's batched session).**  A human joins the
 provisioning AP with a phone/laptop and submits a real test SSID/password
 through the captive portal (the workstation's Wi-Fi stays untouched); the
 captured log must then be asserted for: no SSID/password substring anywhere,
 the station connects, the controller retires the AP after the grace period,
 and the machine proceeds `PROVISIONING_SUCCEEDED -> NETWORK -> TLS` (the
 smoke checker validates the `SUCCESS` transition and the no-secret rule;
-the NETWORK/TLS gate lines are recorded from that session).
+the NETWORK/TLS gate lines are recorded from that session — see the
+TASK-139 record below).
+
+---
+
+## TASK-139: on-target verification record — stale credential falls back to the portal
+
+Scope: the bug report's core case — a device with a saved credential that
+cannot connect (router replaced / password changed) must **not** park forever
+with no AP: the controller's bounded fallback budget (TASK-131) must open
+the provisioning AP after the configured `CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS`
+budget.  Observed on `/dev/ttyUSB1` (ESP32-WROOM-32D, MAC
+`c0:49:ef:e8:24:b8`), ESP-IDF v5.5.5.
+
+### Setup — seed a deliberately wrong credential
+
+The stale-credential storage image was built from the canonical fresh
+payload of the manual procedure (four config documents + `cert/ca.crt`) with
+a `wifi_ap.json` seeding a **deliberately wrong** saved credential — the
+throwaway values of the smoke checker's `--stale-*` defaults:
+
+```json
+{"last_use":0,"credentials":[{"nb":0,"ssid":"KLC-Stale-Net-139","password":"KLC-Stale-Pass-139!"}]}
+```
+
+(Written with the platform `littlefs_util`, 4096-byte blocks, 393216 B —
+same tooling as TASK-137; the secrets never appear in any log, asserted
+below.)  The image was written at the storage offset `0x3A0000` and the app
+flashed (`idf.py flash` never touches the storage partition, so the wrong
+credential survives the flash).
+
+### Finding: the bounded budget was unreachable on hardware (fixed)
+
+The **first** on-target run (the TASK-138 build, before this task's change)
+reproduced the bug the report describes **exactly**: the device went through
+one CONNECT_FAILED (the manager emits **at most one CONNECT_FAILED per
+connect request** and then rests IDLE), the NETWORK gate timed out, the
+machine parked SAFE_OFF with the bounded retry — and **no portal ever
+opened**, because the budget of 2 was never reached:
+
+```
+[DEBUG]: [wifi] saved credentials found, auto-connect enabled
+[DEBUG]: [wifi] state IDLE -> CONNECT
+[DEBUG]: [wifi] state CONNECT -> WAIT_CONNECT
+[INFO]:  [prov_mgr] wifi provisioning adapter initialized
+W (9024) klc: Network lost; lamp forced off by adapter, …   <- CONNECT_FAILED #1 (budget 1/2)
+[DEBUG]: [wifi] state WAIT_CONNECT -> STOP -> IDLE          <- the manager rests idle; no re-connect
+W (31294) klc: No Wi-Fi connection within 30000 ms
+[INFO]:  [app_state] network --network-failed(network)--> safe-off (session 1)
+[INFO]:  [app_state] safe-off --retry-due(timer)--> network (session 2)
+W (63294) klc: No Wi-Fi connection within 30000 ms          <- session 2: NO new connect attempt
+[INFO]:  [app_state] network --network-failed(network)--> safe-off (session 2)
+```
+
+So the controller's budget could never exhaust — a genuine product gap the
+on-target verification exposed: **the NETWORK gate must re-drive the
+saved-credential connect on every bounded-retry re-entry** so each session
+contributes one CONNECT_FAILED.  Fixed in this task:
+
+- `network_manager_reconnect()` (new adapter API) — re-requests the station
+  connect (never while connected, no-op when stopped),
+- the NETWORK gate calls it on every credentialed (re-)entry, so the saved
+  credential is re-driven once per bounded-retry session,
+- `supervise_network_gate()` now services the provisioning outcome events
+  in-loop, so the controller's STARTED (fired when the budget exhausts
+  mid-window) is consumed at once and the gate yields to PROVISIONING
+  instead of timing out with an open portal behind it.
+
+Host coverage: new `network_manager_tests` case
+(`test_reconnect_redrives_connect_request_only_when_not_connected`); the
+full wifi_provisioning_manager host suites still pass.
+
+### Observed log sequence — after the fix (two independent runs)
+
+With the fixed build: session 1 contributes CONNECT_FAILED #1, the gate
+times out and parks (episode 1), the bounded retry re-enters NETWORK and the
+gate **re-drives** the connect, session 2 contributes CONNECT_FAILED #2,
+the budget (2) exhausts, the controller opens the portal and the supervisor
+consumes STARTED in-gate — the machine enters PROVISIONING in session 2,
+**no extra park, no restart storm**:
+
+```
+[INFO]:  [app_state] configuration --config-ok(configuration)--> network (session 1)
+[DEBUG]: [wifi] saved credentials found, auto-connect enabled
+[DEBUG]: [wifi] state IDLE -> CONNECT
+[INFO]:  [prov_mgr] wifi provisioning adapter initialized
+W (9104) klc: Network lost; lamp forced off by adapter, …   <- CONNECT_FAILED #1 (budget 1/2)
+[DEBUG]: [wifi] state WAIT_CONNECT -> STOP -> IDLE
+W (31364) klc: No Wi-Fi connection within 30000 ms
+[INFO]:  [app_state] network --network-failed(network)--> safe-off (session 1)   <- episode 1
+[INFO]:  [app_state] safe-off --retry-due(timer)--> network (session 2)
+[DEBUG]: [wifi] state IDLE -> CONNECT                      <- reconnect() re-drive (TASK-139)
+W (41164) klc: Network lost; lamp forced off by adapter, …  <- CONNECT_FAILED #2 (budget 2/2 EXHAUSTED)
+[INFO]:  [prov_mgr] controller transition 1 -> 3 (product event 1)   <- fallback fired
+[INFO]:  [prov_mgr] provisioning AP up; portal reachable             <- TASK-135 signature
+I (41214) klc: Provisioning flow started by the controller; entering Wi-Fi provisioning
+[INFO]:  [app_state] network --provisioning-started(network)--> provisioning (session 2)
+I (41284) klc: Provisioning gate: portal owned by the controller; waiting for its outcome events
+[INFO]:  [prov_mgr] portal up; station not yet connected (waiting for a client to join and submit; one log line per 30 s)
+```
+
+**Automated assertions** (`on_target_stale_check.py` — builds the seeded
+image, writes storage, app-flashes, captures 90 s, runs the smoke check)
+**PASS** on **two independent runs**:
+
+- `legal stale-credential-fallback sequence: NETWORK_FAILED -> ENTER` —
+  one NETWORK_FAILED episode before PROVISIONING_STARTED, i.e. within the
+  configured budget of 2,
+- `--expect stale-credential` no-restart-storm checks: exactly one ENTER
+  and exactly one `provisioning AP up; portal reachable` period,
+- backtrace-free (0 `Backtrace:` lines),
+- no `KLC-Stale-Net-139` / `KLC-Stale-Pass-139!` (stale) nor
+  `KLC-Smoke-128-Test` / `KLC-Sm0ke-Pa55-128!` (test) substring anywhere —
+  the wrong credential seeded onto storage never appears in the log.
+
+The log (`/tmp/klc_stale_fixed_2.log`) and the full procedure are recorded
+above; the device reproducibly opens the provisioning AP after the bounded
+budget.
+
+### MANUAL STEP — recovery after re-provisioning (requires a human + second radio)
+
+The interactive success path needs a phone/laptop to join
+`wifi_provisioning:c0:49:ef:e8:24` (open, platform-default identity — see
+the TASK-138 AP-identity note) and submit the **correct** credential of a
+real 2.4 GHz lab WLAN through `POST /api/v1/wifi/credentials`
+(`{"ssid":…,"password":…}` at `http://10.10.0.1`); the dev workstation's
+Wi-Fi stays untouched (host network invariant — this workstation has a
+single radio, so it cannot join the device AP without dropping the home
+network).  Once that session's log is captured, assert it with:
+
+```sh
+python3 tests/wifi_provisioning_manager/on_target_smoke_check.py \
+    --log <recovery.log> --expect stale-recovery \
+    --stale-ssid KLC-Stale-Net-139 --stale-password KLC-Stale-Pass-139! \
+    --test-ssid <lab-ssid> --test-password <lab-password>
+```
+
+The assertion set (`--expect stale-recovery`) requires, after the same
+bounded fallback, the full recovery sequence: the station connects, the
+controller retires the portal after the 2000 ms success grace
+(`Provisioning succeeded; portal retired by the controller`), the machine
+proceeds `network --provisioning-succeeded--> network` -> `Network
+connected; verified MQTT/TLS connect is now allowed` -> `Verified TLS
+connected with validated identity` (the documented success signatures
+above), backtrace-free and credential-free.  (If the lab WLAN cannot reach
+the ThingsBoard broker, the TLS line is legitimately replaced by `Verified
+TLS connect failed: …` — provisioning and NETWORK still succeeded; record
+the gate lines from that session.)

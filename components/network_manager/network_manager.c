@@ -599,6 +599,44 @@ bool network_manager_is_connected(void)
     return wifi_mgmt_is_connected();
 }
 
+int network_manager_reconnect(void)
+{
+    /* TASK-139: re-drive the saved-credential connect request.  The platform
+     * fallback controller (wifi_provisioning_controller.c) opens the portal
+     * after CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS consecutive
+     * CONNECT_FAILED events, but the Wi-Fi manager emits at most one
+     * CONNECT_FAILED per connect request and then rests in IDLE, so the
+     * NETWORK gate re-drives the request on every bounded-retry re-entry and
+     * an unusable credential exhausts the budget (one event per session).
+     *
+     * A stopped adapter is a no-op: start() already requests the first
+     * connect (and the manager re-inits its request flags on start), so an
+     * armed request from a pre-start reconnect would be redundant and could
+     * outlive the session it was made for.
+     *
+     * Never re-drive an established connection: the manager applies
+     * connect_req from READY by stopping the live session, which would tear
+     * down a working station.  The adapter's lock-free connected query keeps
+     * this safe from any caller thread (including the supervisor task). */
+    if (!atomic_load_explicit(&s_ctx.started, memory_order_acquire))
+    {
+        return NETWORK_OK;
+    }
+
+    if (network_manager_is_connected())
+    {
+        return NETWORK_OK;
+    }
+
+    if (!wifi_mgmt_connect())
+    {
+        /* Only a server-only (soft-AP-only) mode rejects a station connect
+         * request; the product never selects that mode.  Defensive. */
+        return NETWORK_ERR_START_FAILED;
+    }
+    return NETWORK_OK;
+}
+
 bool network_manager_wait_connected(uint32_t timeout_ms)
 {
     uint32_t waited_ms = 0u;
