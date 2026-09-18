@@ -111,6 +111,20 @@ static int obs_count_where_event(app_state_event_t event)
     return count;
 }
 
+/** @brief Fail the test unless the machine never entered PROVISIONING. */
+static void assert_provisioning_never_entered(void)
+{
+    int i;
+
+    TEST_ASSERT_EQUAL(0, obs_count_where_event(APP_EVENT_PROVISIONING_STARTED));
+    TEST_ASSERT_EQUAL(0, obs_count_where_event(APP_EVENT_PROVISIONING_SUCCEEDED));
+    TEST_ASSERT_EQUAL(0, obs_count_where_event(APP_EVENT_PROVISIONING_FAILED));
+    for (i = 0; i < s_obs_count; ++i)
+    {
+        TEST_ASSERT_TRUE(s_obs[i].to != APP_STATE_PROVISIONING);
+    }
+}
+
 /* --------------------------------------------------------------------- */
 /* Watchdog expiry callback                                               */
 /* --------------------------------------------------------------------- */
@@ -662,21 +676,34 @@ static void test_provisioning_legal_entry_and_exit(void)
 
 static void test_supervisor_sequence_fresh_device_provisions_then_tls(void)
 {
-    /* Supervisor-side event sequence for the fresh-device boot path (TASK-127):
-     * NETWORK -> PROVISIONING -> NETWORK -> TLS.  This is exactly the event
-     * stream app_main's NETWORK/PROVISIONING gates deliver: no saved
-     * credential, so NETWORK enters PROVISIONING on PROVISIONING_STARTED; the
-     * portal captures a credential and PROVISIONING_SUCCEEDED returns to
-     * NETWORK, which now sees the saved credential and passes the station to
-     * TLS. */
+    /* Supervisor-side event sequence for the fresh-device boot path
+     * (TASK-127/133): STARTED is delivered while the machine is at the
+     * NETWORK gate -> PROVISIONING -> SUCCEEDED -> NETWORK -> TLS.  This is
+     * exactly the event stream the supervisor's provisioning-event pump
+     * delivers from the platform fallback controller's notifications: the
+     * controller opens the portal at init (no saved credential), the
+     * supervisor holds STARTED until the machine reaches NETWORK, then
+     * delivers it, and SUCCEEDED returns to NETWORK, which now sees the
+     * saved credential and passes the station to TLS. */
     boot_to_filesystem();
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_CONFIGURATION, app_state_current());
+
+    /* Before the NETWORK gate the supervisor holds STARTED rather than
+     * delivering it: a delivery from CONFIGURATION would be rejected as
+     * illegal (and counted), which is exactly why the pump waits. */
+    TEST_ASSERT_EQUAL(APP_STATE_ERR_ILLEGAL,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_CONFIGURATION, app_state_current());
+
+    /* The configuration gate passes; the machine reaches NETWORK, where the
+     * fresh-device STARTED is legal. */
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
     TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
 
-    /* Fresh device: no saved station credential -> NETWORK -> PROVISIONING. */
+    /* Fresh device: STARTED delivered while in NETWORK -> PROVISIONING. */
     uint32_t session_before = app_state_session();
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
@@ -696,8 +723,76 @@ static void test_supervisor_sequence_fresh_device_provisions_then_tls(void)
     TEST_ASSERT_EQUAL(APP_STATE_TLS, app_state_current());
     TEST_ASSERT_FALSE(app_state_is_online());
 
-    /* The provisioning round-trip does not bump the session (same episode). */
+    /* The provisioning round-trip does not bump the session (same episode),
+     * and the controller's outcome is delivered exactly once each. */
     TEST_ASSERT_EQUAL(session_before, app_state_session());
+    TEST_ASSERT_EQUAL(1, obs_count_where_event(APP_EVENT_PROVISIONING_STARTED));
+    TEST_ASSERT_EQUAL(1, obs_count_where_event(APP_EVENT_PROVISIONING_SUCCEEDED));
+}
+
+static void test_supervisor_sequence_exhausted_budget_device_starts_provisioning(void)
+{
+    /* Exhausted-credential device (TASK-133): the saved station credential
+     * keeps failing, so the machine parks in SAFE_OFF through NETWORK_FAILED
+     * episodes with the bounded retry while the platform fallback controller
+     * burns its CONNECT_FAILED budget.  Once the budget is exhausted the
+     * controller opens the portal and reports STARTED; the supervisor holds
+     * it while the machine is parked and delivers it when the bounded retry
+     * re-enters the NETWORK gate — PROVISIONING is then reached legally. */
+    boot_to_filesystem();
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_CONFIG_OK, APP_OWNER_CONFIGURATION));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+
+    /* Episode 1: the gate times out (credential unusable) -> SAFE_OFF with
+     * the bounded backoff; the retry re-enters NETWORK. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_FAILED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
+    TEST_ASSERT_TRUE(app_state_retry_pending());
+    TEST_ASSERT_EQUAL(APP_STATE_RETRY_INITIAL_DELAY_DEFAULT_MS,
+                      app_state_retry_delay_ms());
+    s_now_ms = APP_STATE_RETRY_INITIAL_DELAY_DEFAULT_MS;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_EQUAL(1u, app_state_retry_attempts_used());
+
+    /* Episode 2: fails again (the controller counted both CONNECT_FAILED
+     * episodes against its budget) -> SAFE_OFF -> backoff -> NETWORK. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_FAILED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
+    TEST_ASSERT_EQUAL(2u * APP_STATE_RETRY_INITIAL_DELAY_DEFAULT_MS,
+                      app_state_retry_delay_ms());
+    s_now_ms += 2u * APP_STATE_RETRY_INITIAL_DELAY_DEFAULT_MS;
+    TEST_ASSERT_EQUAL(APP_STATE_OK, app_state_poll());
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_EQUAL(2u, app_state_retry_attempts_used());
+
+    /* The controller's budget is now exhausted: it opened the portal and
+     * reported STARTED.  The supervisor delivers it while the machine is at
+     * the NETWORK gate -> PROVISIONING. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_STARTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_PROVISIONING, app_state_current());
+
+    /* The user submits a credential at the portal: SUCCEEDED -> NETWORK ->
+     * TLS.  Provisioning is not re-entered on the way to ONLINE. */
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                          APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_NETWORK, app_state_current());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_NETWORK_CONNECTED, APP_OWNER_NETWORK));
+    TEST_ASSERT_EQUAL(APP_STATE_TLS, app_state_current());
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_TLS_CONNECTED, APP_OWNER_MQTT));
+    TEST_ASSERT_EQUAL(APP_STATE_OK,
+        app_state_deliver(APP_EVENT_SYNC_COMPLETE, APP_OWNER_THINGSBOARD));
+    TEST_ASSERT_TRUE(app_state_is_online());
+    TEST_ASSERT_EQUAL(1, obs_count_where_event(APP_EVENT_PROVISIONING_STARTED));
 }
 
 static void test_supervisor_sequence_credentialed_device_connects_directly(void)
@@ -727,6 +822,11 @@ static void test_supervisor_sequence_credentialed_device_connects_directly(void)
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_SYNC_COMPLETE, APP_OWNER_THINGSBOARD));
     TEST_ASSERT_TRUE(app_state_is_online());
+
+    /* Zero behavior change: PROVISIONING was never entered and no
+     * provisioning event was ever delivered (the supervisor pump has
+     * nothing to deliver for a credentialed first-try connect). */
+    assert_provisioning_never_entered();
 }
 
 static void test_provisioning_failure_degrades_and_retries_network(void)
@@ -769,7 +869,11 @@ static void test_provisioning_started_illegal_from_every_other_state(void)
     /* PROVISIONING may ONLY be entered from NETWORK on
      * PROVISIONING_STARTED (owner NETWORK).  Walk the machine through
      * every other state and assert the event is rejected (dropped and
-     * counted) with no transition. */
+     * counted) with no transition.  This is the machine-level rejection the
+     * supervisor relies on (TASK-133): the supervisor's event pump holds
+     * STARTED until the machine is at the NETWORK gate, and if a stray
+     * STARTED is ever delivered from any other state the machine rejects it
+     * as stale/illegal instead of entering PROVISIONING. */
     s_now_ms = 0u;
     TEST_ASSERT_EQUAL(APP_STATE_OK, init_with_wdt(30000u));
 
@@ -1576,6 +1680,7 @@ int main(void)
     /* 3b. Provisioning gate (TASK-125/127) */
     RUN_TEST(test_provisioning_legal_entry_and_exit);
     RUN_TEST(test_supervisor_sequence_fresh_device_provisions_then_tls);
+    RUN_TEST(test_supervisor_sequence_exhausted_budget_device_starts_provisioning);
     RUN_TEST(test_supervisor_sequence_credentialed_device_connects_directly);
     RUN_TEST(test_provisioning_failure_degrades_and_retries_network);
     RUN_TEST(test_provisioning_started_illegal_from_every_other_state);

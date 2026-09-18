@@ -43,6 +43,7 @@ typedef struct wifi_provisioning_controller_mock_counters
 {
   unsigned init_with_config_calls;   /**< init_with_config() invocations. */
   unsigned deinit_calls;             /**< deinit() invocations. */
+  unsigned stop_calls;               /**< stop() invocations (TASK-133). */
   bool     last_init_result;         /**< Result the double reports next. */
   wifi_provisioning_controller_state_cb_t registered_cb;
                                      /**< Callback the adapter registered. */
@@ -64,6 +65,14 @@ void wifi_provisioning_controller_mock_reset(void);
 /** @brief Choose the result reported by the next init_with_config() call
  *         (default true). */
 void wifi_provisioning_controller_mock_set_init_result(bool ok);
+
+/** @brief Choose the result reported by the next stop() call and the state
+ *         the controller reports afterwards (default true / DISABLED). */
+void wifi_provisioning_controller_mock_set_stop_result(bool ok);
+
+/** @brief Choose the state reported by get_state() (default DISABLED). */
+void wifi_provisioning_controller_mock_set_state(
+    wifi_provisioning_controller_state_t state);
 
 /** @brief Snapshot of the accumulated counters / registered hook. */
 wifi_provisioning_controller_mock_counters_t

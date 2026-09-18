@@ -68,23 +68,24 @@ _MIN_SUBSTRING_LEN = 6
 # The markers are credential-free substrings emitted by the product boot  #
 # flow (main/app_main.c, tag "klc") and by the provisioning adapter       #
 # (components/wifi_provisioning_manager, osal log "[prov_mgr]").  They    #
-# are the documented log signatures for the four provisioning             #
-# transitions: portal startup, portal stop, provisioning success and      #
-# provisioning failure/park.                                              #
+# are the documented log signatures for the controller-driven flow        #
+# (TASK-131/132/133): the platform fallback controller owns the portal;   #
+# the supervisor (TASK-133) only DELIVERS its outcome events, so the      #
+# observable markers are the STARTED/SUCCEEDED/FAILED deliveries, the     #
+# SAFE_OFF park line and the adapter's explicit-stop line (OTA/FATAL).    #
 # --------------------------------------------------------------------- #
 
 MARKER_TABLE = (
-    # Portal entry (NETWORK --PROVISIONING_STARTED--> PROVISIONING).
-    ("ENTER", "No saved station credential; entering Wi-Fi provisioning (portal)"),
-    # Portal startup succeeded (both listeners bound).
-    ("RUN", "Provisioning portal running; waiting for the station to submit a credential"),
-    # Portal startup failed (bind refusal / shared process not running).
-    ("START_FAILED", "Provisioning portal start failed"),
-    # Provisioning success: station connected, grace honored, portal retired.
-    ("SUCCESS", "Provisioning succeeded and portal retired"),
-    # Provisioning failure: wait window elapsed without a station connection.
-    ("WAIT_TIMEOUT", "No station connection within"),
-    # Portal listeners closed (adapter stop).
+    # Provisioning entry (NETWORK --PROVISIONING_STARTED--> PROVISIONING):
+    # the supervisor delivering the controller's fallback STARTED event.
+    ("ENTER", "Provisioning flow started by the controller; entering Wi-Fi provisioning"),
+    # Provisioning success: the controller retired the portal; the machine
+    # returns to the NETWORK gate (-> TLS).
+    ("SUCCESS", "Provisioning succeeded; portal retired by the controller"),
+    # Provisioning failure: the machine parks degraded (bounded retry).
+    ("FAILED", "Provisioning failed; machine parks degraded"),
+    # Explicit adapter stop (OTA entry / FATAL): controller lifecycle ended,
+    # portal listeners closed.
     ("PORTAL_STOPPED", "[prov_mgr] provisioning portal stopped"),
     # The machine parked degraded (SAFE_OFF) waiting for provisioning/reset/OTA.
     ("PARK", "waiting for provisioning / reset / OTA"),
@@ -92,87 +93,62 @@ MARKER_TABLE = (
 
 # State machine (normative view of app_state.h, provisioning stage only).
 #
-#   START      - no provisioning marker seen yet (may be a credentialed
-#                pass-through boot)
-#   ENTERED    - NETWORK emitted PROVISIONING_STARTED, portal start pending
-#   RUNNING    - portal up, waiting for the station to connect
-#   RETIRING   - portal listeners closed, success log pending
-#   SUCCEEDED  - PROVISIONING_SUCCEEDED observed; terminal for the
-#                provisioning stage (a credentialed device never re-enters)
-#   FAILED_WAIT  - wait window expired without a connection; parked (retry)
-#   FAILED_START - portal start failed; parked (retry)
+#   START       - no provisioning marker seen yet (may be a credentialed
+#                 pass-through boot)
+#   ENTERED     - PROVISIONING_STARTED delivered; machine in PROVISIONING
+#                 while the controller keeps the portal up
+#   SUCCEEDED   - PROVISIONING_SUCCEEDED observed; terminal for the
+#                 provisioning stage (a credentialed device never re-enters)
+#   FAILED_PARK - PROVISIONING_FAILED observed; machine parked (bounded
+#                 retry); a later fallback cycle may legally re-enter
+#   RETIRED     - explicit adapter stop (OTA entry / FATAL) ended the
+#                 controller lifecycle; no further provisioning activity
 #
 # Every recognized marker not listed for the current state is an illegal
-# transition and fails the check.
+# transition and fails the check.  On a successful provisioning the portal
+# is retired by the controller without an adapter stop line, so SUCCESS is
+# not followed by PORTAL_STOPPED in the normal boot.
 TRANSITIONS = {
     "START": {
         "ENTER": "ENTERED",
-        "RUN": None,
-        "START_FAILED": None,
         "SUCCESS": None,
-        "WAIT_TIMEOUT": None,
-        "PORTAL_STOPPED": None,
+        "FAILED": None,
         # Tolerated in START: a credentialed pass-through device may park in
         # SAFE_OFF (e.g. a later TLS failure) without ever entering
         # provisioning for this boot episode.
+        "PORTAL_STOPPED": "RETIRED",
         "PARK": "START",
     },
     "ENTERED": {
         "ENTER": None,
-        "RUN": "RUNNING",
-        "START_FAILED": "FAILED_START",
-        "SUCCESS": None,
-        "WAIT_TIMEOUT": None,
-        "PORTAL_STOPPED": None,
-        "PARK": None,
-    },
-    "RUNNING": {
-        "ENTER": None,
-        "RUN": None,
-        "START_FAILED": None,
         "SUCCESS": "SUCCEEDED",
-        "WAIT_TIMEOUT": "FAILED_WAIT",
-        "PORTAL_STOPPED": "RETIRING",
-        "PARK": None,
-    },
-    "RETIRING": {
-        "ENTER": None,
-        "RUN": None,
-        "START_FAILED": None,
-        "SUCCESS": "SUCCEEDED",
-        "WAIT_TIMEOUT": None,
-        "PORTAL_STOPPED": None,
+        "FAILED": "FAILED_PARK",
+        "PORTAL_STOPPED": "RETIRED",
         "PARK": None,
     },
     "SUCCEEDED": {
         # Provisioning is complete; later PARK (a post-TLS failure) and a
-        # duplicate adapter stop line are tolerated.  A fresh ENTER/RUN or
-        # a second outcome after SUCCESS is illegal for this boot episode.
+        # duplicate adapter stop line are tolerated.  A fresh ENTER or a
+        # second outcome after SUCCESS is illegal for this boot episode.
         "ENTER": None,
-        "RUN": None,
-        "START_FAILED": None,
         "SUCCESS": None,
-        "WAIT_TIMEOUT": None,
+        "FAILED": None,
         "PORTAL_STOPPED": "SUCCEEDED",
         "PARK": "SUCCEEDED",
     },
-    "FAILED_WAIT": {
-        "ENTER": "ENTERED",  # bounded retry legally re-enters provisioning
-        "RUN": None,
-        "START_FAILED": None,
+    "FAILED_PARK": {
+        "ENTER": "ENTERED",  # bounded retry / next fallback cycle legally re-enters
         "SUCCESS": None,
-        "WAIT_TIMEOUT": None,
-        "PORTAL_STOPPED": "FAILED_WAIT",
-        "PARK": "FAILED_WAIT",
+        "FAILED": None,
+        "PORTAL_STOPPED": "FAILED_PARK",
+        "PARK": "FAILED_PARK",
     },
-    "FAILED_START": {
-        "ENTER": "ENTERED",  # bounded retry legally re-enters provisioning
-        "RUN": None,
-        "START_FAILED": None,
+    "RETIRED": {
+        "ENTER": None,
         "SUCCESS": None,
-        "WAIT_TIMEOUT": None,
-        "PORTAL_STOPPED": None,
-        "PARK": "FAILED_START",
+        "FAILED": None,
+        "PORTAL_STOPPED": "RETIRED",
+        "PARK": "RETIRED",
     },
 }
 

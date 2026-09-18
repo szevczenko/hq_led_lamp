@@ -13,12 +13,17 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static wifi_provisioning_controller_mock_counters_t s_counters;
 static bool s_init_result = true;
+static bool s_stop_result = true;
+static wifi_provisioning_controller_state_t s_state =
+    WIFI_PROVISIONING_CONTROLLER_DISABLED;
 
 void wifi_provisioning_controller_mock_reset(void)
 {
   pthread_mutex_lock(&s_lock);
   memset(&s_counters, 0, sizeof(s_counters));
   s_init_result = true;
+  s_stop_result = true;
+  s_state       = WIFI_PROVISIONING_CONTROLLER_DISABLED;
   pthread_mutex_unlock(&s_lock);
 }
 
@@ -26,6 +31,21 @@ void wifi_provisioning_controller_mock_set_init_result(bool ok)
 {
   pthread_mutex_lock(&s_lock);
   s_init_result = ok;
+  pthread_mutex_unlock(&s_lock);
+}
+
+void wifi_provisioning_controller_mock_set_stop_result(bool ok)
+{
+  pthread_mutex_lock(&s_lock);
+  s_stop_result = ok;
+  pthread_mutex_unlock(&s_lock);
+}
+
+void wifi_provisioning_controller_mock_set_state(
+    wifi_provisioning_controller_state_t state)
+{
+  pthread_mutex_lock(&s_lock);
+  s_state = state;
   pthread_mutex_unlock(&s_lock);
 }
 
@@ -97,5 +117,31 @@ void wifi_provisioning_controller_deinit(void)
   ++s_counters.deinit_calls;
   s_counters.registered_cb       = NULL;
   s_counters.registered_user_ctx = NULL;
+  s_state                        = WIFI_PROVISIONING_CONTROLLER_DISABLED;
   pthread_mutex_unlock(&s_lock);
+}
+
+bool wifi_provisioning_controller_stop(void)
+{
+  bool result;
+
+  pthread_mutex_lock(&s_lock);
+  ++s_counters.stop_calls;
+  result = s_stop_result;
+  if (result)
+  {
+    s_state = WIFI_PROVISIONING_CONTROLLER_DISABLED;
+  }
+  pthread_mutex_unlock(&s_lock);
+  return result;
+}
+
+wifi_provisioning_controller_state_t wifi_provisioning_controller_get_state(void)
+{
+  wifi_provisioning_controller_state_t state;
+
+  pthread_mutex_lock(&s_lock);
+  state = s_state;
+  pthread_mutex_unlock(&s_lock);
+  return state;
 }

@@ -594,6 +594,7 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void)
 
 wifi_provisioning_manager_status_t wifi_provisioning_manager_stop(void)
 {
+    bool controller_ok;
     bool platform_ok;
 
     if (!wifi_provisioning_manager_ensure_lock())
@@ -615,8 +616,38 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_stop(void)
         return WIFI_PROVISIONING_MANAGER_ERR_NOT_INITIALIZED;
     }
 
-    /* Closes only the provisioning listeners; the shared Mongoose process
-     * (and with it MQTT/TLS) is left untouched. */
+    wifi_provisioning_manager_unlock();
+
+    /* End the controller's portal lifecycle OUTSIDE the adapter lock
+     * (TASK-133): wifi_provisioning_controller_stop() cancels any pending
+     * success-grace timer, stops the HTTP/DNS listeners and requests the
+     * STA-only temporary-AP retirement, and it delivers its final
+     * state-change notification synchronously on this thread — the
+     * notification handler takes the adapter lock, so holding it across the
+     * call would deadlock (the same pattern as deinit()/controller_deinit()).
+     * A controller that is already disabled (e.g. a credentialed device with
+     * no active portal) reports false as a safe no-op, which is not an
+     * adapter failure; a real retirement failure leaves the controller
+     * recoverable and is reported by the listener close below. */
+    controller_ok = wifi_provisioning_controller_stop();
+    if (!controller_ok)
+    {
+        osal_log_warning("[prov_mgr] controller stop reported the portal "
+                         "still recoverable (state=%d); closing listeners",
+                         (int)wifi_provisioning_controller_get_state());
+    }
+
+    /* Belt-and-braces listener close (idempotent): guarantees no
+     * provisioning listener is left on the shared Mongoose process even if
+     * the controller path could not complete.  It runs UNDER the adapter
+     * lock again so the platform start/stop transactions stay serialized
+     * (the controller stop above is outside the lock by contract).  The
+     * shared process (and with it MQTT/TLS) is never deinitialized. */
+    if (!wifi_provisioning_manager_lock())
+    {
+        osal_log_error("[prov_mgr] adapter lock unavailable");
+        return WIFI_PROVISIONING_MANAGER_ERR_STOP_FAILED;
+    }
     platform_ok = wifi_http_provisioning_stop();
     if (!platform_ok)
     {
@@ -628,9 +659,10 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_stop(void)
                        (int)platform_state);
         return WIFI_PROVISIONING_MANAGER_ERR_STOP_FAILED;
     }
-
     wifi_provisioning_manager_unlock();
-    osal_log_info("[prov_mgr] provisioning portal stopped");
+
+    osal_log_info("[prov_mgr] provisioning portal stopped "
+                  "(controller lifecycle ended)");
     return WIFI_PROVISIONING_MANAGER_OK;
 }
 

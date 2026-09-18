@@ -10,7 +10,8 @@
  *   2. The application state machine (app_state, TASK-115) is started
  *      next: it is the explicit owner of the sequence
  *      boot -> safe-off -> filesystem -> configuration -> Wi-Fi ->
- *      provisioning (only when no saved station credential exists) ->
+ *      provisioning (entered from NETWORK on the controller's fallback
+ *      decision — fresh device or exhausted-credential device) ->
  *      verified MQTT/TLS -> state sync -> online, of every legal
  *      transition (with an explicit transition owner per event), of the
  *      stale-callback (generation/session) rejection, of the bounded
@@ -46,32 +47,32 @@
  *      to fail the lamp off synchronously; the supervisor converts the
  *      disconnect into the machine's DISCONNECTED event within one
  *      supervisor cadence.
- *   7b. Wi-Fi provisioning (TASK-127) sits between the Wi-Fi gate and TLS,
- *      entered ONLY when the adapter reports no saved station credential
- *      (wifi_provisioning_manager_has_saved_credentials()): the machine
- *      enters PROVISIONING on PROVISIONING_STARTED, the supervisor starts
- *      the provisioning portal (HTTP portal + captive DNS on the shared
- *      Mongoose process) and waits for the station to connect while
- *      feeding the watchdog in-loop.  On success the portal stays up for
- *      a bounded success-grace interval
- *      (CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS — the single grace
- *      source of truth since TASK-131; the duplicate KLC knob was dropped),
- *      is stopped through the adapter (listeners closed; the shared Mongoose
- *      process and MQTT/TLS untouched), and PROVISIONING_SUCCEEDED hands
- *      control back to the NETWORK gate, which then passes the now
- *      credentialed station to TLS.  A credentialed device never enters
+ *   7b. Wi-Fi provisioning (TASK-127) sits between the Wi-Fi gate and TLS.
+ *      The platform fallback controller (TASK-131/132,
+ *      CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y with a bounded
+ *      CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS budget) owns the
+ *      portal policy: it opens the provisioning portal (HTTP + captive DNS
+ *      on the shared Mongoose process) on its own decision — a fresh device
+ *      (no saved station credential) at init, or a credentialed device
+ *      whose saved credentials exhausted the CONNECT_FAILED budget — keeps
+ *      the temporary AP up for the bounded success-grace interval
+ *      (CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS, the single grace
+ *      source of truth since TASK-131; the duplicate KLC knob was dropped)
+ *      and retires it on success.  The supervisor (TASK-133) is a pure
+ *      consumer of the adapter's outcome events
+ *      (wifi_provisioning_manager_poll_event()): PROVISIONING is entered
+ *      from NETWORK on the controller's fallback decision — fresh device or
+ *      exhausted-credential device — when the supervisor delivers
+ *      PROVISIONING_STARTED (owner APP_OWNER_NETWORK), and
+ *      PROVISIONING_SUCCEEDED hands control back to the NETWORK gate (which
+ *      passes the now credentialed station to TLS) or PROVISIONING_FAILED
+ *      parks the machine degraded (SAFE_OFF with the existing bounded
+ *      retry).  The supervisor never starts or restarts the portal.  A
+ *      credentialed device that connects on the first try never enters
  *      provisioning — it passes the NETWORK gate straight to TLS.
  *      ThingsBoard STILL never starts before a verified network
  *      connection: provisioning only ever hands control back to the
  *      NETWORK gate, never past it.
- *   7c. Platform fallback controller (TASK-131): the automatic fallback
- *      controller (wifi_provisioning_controller.c) is COMPILED IN
- *      (CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y, bounded
- *      FALLBACK_ATTEMPTS budget) but NOT yet wired — app_main does not
- *      register its notification hook or start it (wiring is TASK-132/133).
- *      While half-wired the controller is inert and the product decision in
- *      7b remains the only provisioning driver; the intermediate,
- *      half-wired state is deliberate and explicit.
  *   8. The single re-enable transition for the lamp fail-off barrier is a
  *      successful verified MQTT/TLS connection (mqtt_cfg_connect(),
  *      TASK-110), consumed at the TLS gate.  A Wi-Fi connection alone, an
@@ -92,10 +93,13 @@
  *        application watchdog window (60 s): the network gate polls every
  *        NETWORK_WAIT_POLL_INTERVAL_MS (50 ms) and calls app_state_poll()
  *        in each iteration (same task — the single owner),
- *      - the provisioning gate waits in the same in-loop, feed-every-
- *        iteration pattern (no single blocking call spans the watchdog
- *        window), and never blocks from a Mongoose/Wi-Fi callback context
- *        (all of it runs in the supervisor task),
+ *      - the provisioning outcome pump
+ *        (wifi_provisioning_manager_poll_event()) is non-blocking and runs
+ *        in the same supervisor task, one iteration per poll — the portal is
+ *        owned by the platform fallback controller, and the adapter's
+ *        notification path only STORES events (never blocks on the Mongoose
+ *        /Wi-Fi callback contexts); the supervisor DELIVERS them
+ *        (TASK-133),
  *      - the verified-TLS connect is bounded by mqtt_cfg_connect()'s own
  *        30 s window, which is below the 60 s watchdog,
  *      - app_state_poll() is never called from a worker callback context.
@@ -140,17 +144,6 @@ static const char *TAG = "klc";
  * app_state.h).
  */
 #define APP_SUPERVISE_WATCHDOG_MS 60000u
-
-/**
- * @brief Bounded window [ms] the PROVISIONING gate waits for the station to
- *        connect while the provisioning portal is up.
- *
- * Bounded so a provisioning failure always parks the machine degraded with
- * the existing bounded backoff (never a restart storm).  The wait feeds the
- * watchdog in-loop, so this window never trips the 60 s watchdog; it bounds
- * only the user's window to submit a credential at the portal.
- */
-#define PROVISIONING_WAIT_TIMEOUT_MS 180000u
 
 /* --------------------------------------------------------------------- */
 /* Network adapter wiring (TASK-109)                                       */
@@ -246,136 +239,113 @@ static bool supervise_network_gate(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* Provisioning portal (TASK-127)                                          */
+/* Provisioning outcome events (TASK-132/133)                              */
 /* --------------------------------------------------------------------- */
 
 /**
- * @brief Bounded wait for the station to connect while the provisioning
- *        portal is up.
+ * @brief Stop the provisioning flow through the adapter (idempotent).
  *
- * The user drives the captive portal (HTTP portal + captive DNS on the
- * shared Mongoose process) to submit a credential; once the station connects
- * the portal's job is done.  This bounded wait polls
- * network_manager_is_connected() at NETWORK_WAIT_POLL_INTERVAL_MS and feeds
- * the watchdog through app_state_poll() in every iteration — the same
- * single-owner feed pattern as the NETWORK gate, so no blocking call ever
- * spans the watchdog window.
- *
- * @return true when the station connected; false when the provisioning wait
- *         window elapsed without a connection.
- */
-static bool wait_station_connected_while_provisioning(void)
-{
-    uint32_t waited_ms = 0U;
-
-    while (!network_manager_is_connected() &&
-           (waited_ms < PROVISIONING_WAIT_TIMEOUT_MS))
-    {
-        app_state_poll(); /* feed — this task is the single watchdog owner */
-        (void)osal_task_delay_ms(NETWORK_WAIT_POLL_INTERVAL_MS);
-        waited_ms += NETWORK_WAIT_POLL_INTERVAL_MS;
-    }
-
-    return network_manager_is_connected();
-}
-
-/**
- * @brief Keep the provisioning portal up for the bounded success-grace
- *        interval after the station connects, feeding the watchdog in-loop.
- *
- * Mirrors the platform controller's grace/retire pattern: keep the AP (and
- * its HTTP/DNS listeners) available briefly so the freshly provisioned
- * station settles, then stop the portal.  The interval is bounded and
- * Kconfig-configurable (CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS —
- * the platform knob is the single grace source of truth since TASK-131; the
- * product duplicate CONFIG_KLC_PROVISIONING_GRACE_MS was dropped); a value
- * of 0 retires immediately.  Every iteration feeds the watchdog so the
- * grace wait never spans the watchdog window.
- */
-static void honor_provisioning_success_grace(void)
-{
-    uint32_t grace_ms = (uint32_t)CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS;
-    uint32_t waited_ms = 0U;
-
-    while (waited_ms < grace_ms)
-    {
-        app_state_poll(); /* feed — this task is the single watchdog owner */
-        (void)osal_task_delay_ms(NETWORK_WAIT_POLL_INTERVAL_MS);
-        waited_ms += NETWORK_WAIT_POLL_INTERVAL_MS;
-    }
-}
-
-/**
- * @brief Stop the provisioning portal through the adapter if it is active.
- *
- * Closes only the portal's HTTP/DNS listeners; the shared Mongoose process
- * (and with it MQTT/TLS) is never torn down.  Safe to call at any time —
+ * Ends the controller's portal lifecycle (any pending success-grace timer is
+ * cancelled and the temporary AP retirement is requested —
+ * wifi_provisioning_controller_stop() inside the adapter) and closes any
+ * remaining portal listeners.  The shared Mongoose process (and with it
+ * MQTT/TLS) is never torn down.  Safe to call at any time — the adapter
  * stop() is idempotent and a no-op when the portal is already stopped.  Used
- * to guarantee the portal never strands a listener on success, failure, OTA
- * entry or FATAL.
+ * to guarantee the portal never strands a listener or a pending grace timer
+ * on OTA entry or FATAL.
  */
-static void stop_provisioning_if_active(void)
+static void stop_provisioning(void)
 {
-    if (wifi_provisioning_manager_is_active())
-    {
-        (void)wifi_provisioning_manager_stop();
-    }
+    (void)wifi_provisioning_manager_stop();
 }
 
 /**
- * @brief The machine's PROVISIONING gate: run the portal until the station
- *        connects (bounded), honor the success-grace interval, then stop the
- *        portal.
+ * @brief Deliver pending provisioning outcome events (TASK-133).
  *
- * Called only in the machine's PROVISIONING state (entered from NETWORK on
- * PROVISIONING_STARTED when the adapter reported no saved station
- * credential).  All blocking work runs in the supervisor task and feeds the
- * watchdog in-loop.  The portal is ALWAYS stopped before returning: on
- * success after the grace interval, on failure immediately.  A start failure
- * or a wait-window expiry returns false and the supervisor delivers
- * PROVISIONING_FAILED, parking the machine in SAFE_OFF with the existing
- * bounded retry — never a restart storm.
+ * The platform fallback controller owns the portal policy (TASK-131/132);
+ * the adapter's notification path only STORES the controller's state-change
+ * notifications (never blocks on a Mongoose/Wi-Fi callback context), and
+ * this supervisor task DELIVERS them into the state machine with the current
+ * session identity:
  *
- * @return true when the station connected and the portal was retired;
- *         false when startup failed or the wait window expired.
+ *   - STARTED   -> APP_EVENT_PROVISIONING_STARTED   (owner NETWORK),
+ *   - SUCCEEDED -> APP_EVENT_PROVISIONING_SUCCEEDED (owner NETWORK),
+ *   - FAILED    -> APP_EVENT_PROVISIONING_FAILED    (owner NETWORK).
+ *
+ * The machine may enter PROVISIONING ONLY from NETWORK, and the
+ * SUCCEEDED/FAILED outcomes are only meaningful from PROVISIONING.
+ * wifi_provisioning_manager_poll_event() CONSUMES the head of the adapter's
+ * FIFO, so this pump polls ONLY while the machine is at the NETWORK or
+ * PROVISIONING gate and holds the event otherwise: a fresh device's
+ * controller fires STARTED at init while the machine is still in
+ * FILESYSTEM/CONFIGURATION, and polling from there would drain and drop it
+ * before the machine ever reaches the NETWORK gate (permanently wedging the
+ * device outside the portal flow).  Holding the head (by not polling)
+ * preserves the adapter's FIFO order with any following SUCCEEDED/FAILED.
+ * SUCCEEDED/FAILED only ever sit behind a consumed STARTED (the controller
+ * opens the portal before it can report an outcome), so gating on these two
+ * states cannot strand them, and a delivery from any other state is
+ * rejected (dropped and counted) by the machine itself as stale/illegal —
+ * the machine owns that decision.
+ *
+ * Non-blocking: no wait loop and no blocking call, so the single watchdog
+ * owner is preserved and the loop never blocks from a callback context.
  */
-static bool supervise_provisioning(void)
+static void deliver_provisioning_events(void)
 {
-    bool connected;
-
-    /* Start the portal (HTTP + captive DNS on the shared Mongoose process).
-     * A clean refusal here (e.g. the shared process is not running) is a
-     * provisioning failure that parks degraded — we never retry the portal
-     * from within this gate. */
-    if (wifi_provisioning_manager_start() != WIFI_PROVISIONING_MANAGER_OK)
+    for (;;)
     {
-        ESP_LOGE(TAG, "Provisioning portal start failed; "
-                      "machine parks degraded (bounded retry)");
-        return false;
+        const app_state_t state = app_state_current();
+
+        /* Deliver STARTED only at the NETWORK gate and the outcomes only at
+         * the PROVISIONING gate: poll_event() CONSUMES the event, so the
+         * machine-state check must happen FIRST — a poll from any other
+         * state (BOOT/FILESYSTEM/CONFIGURATION/SAFE_OFF/...) would drop the
+         * head STARTED permanently. */
+        if ((state != APP_STATE_NETWORK) && (state != APP_STATE_PROVISIONING))
+        {
+            return;
+        }
+
+        wifi_provisioning_manager_event_t event =
+            wifi_provisioning_manager_poll_event();
+
+        switch (event)
+        {
+        case WIFI_PROVISIONING_MANAGER_EVENT_STARTED:
+            if (state != APP_STATE_NETWORK)
+            {
+                /* A STARTED at the PROVISIONING gate is a stale duplicate
+                 * (the machine is already provisionable): drop it — the
+                 * machine rejects PROVISIONING_STARTED from any non-NETWORK
+                 * state as illegal, so consuming here is safe. */
+                continue;
+            }
+            ESP_LOGI(TAG, "Provisioning flow started by the controller; "
+                          "entering Wi-Fi provisioning");
+            (void)app_state_deliver(APP_EVENT_PROVISIONING_STARTED,
+                                    APP_OWNER_NETWORK);
+            continue;
+
+        case WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED:
+            ESP_LOGI(TAG, "Provisioning succeeded; portal retired by the "
+                          "controller; NETWORK gate resumes");
+            (void)app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                                    APP_OWNER_NETWORK);
+            continue;
+
+        case WIFI_PROVISIONING_MANAGER_EVENT_FAILED:
+            ESP_LOGW(TAG, "Provisioning failed; machine parks degraded "
+                          "(bounded retry)");
+            (void)app_state_deliver(APP_EVENT_PROVISIONING_FAILED,
+                                    APP_OWNER_NETWORK);
+            continue;
+
+        case WIFI_PROVISIONING_MANAGER_EVENT_NONE:
+        default:
+            return;
+        }
     }
-
-    ESP_LOGI(TAG, "Provisioning portal running; waiting for the station to "
-                  "submit a credential and connect (bounded wait, "
-                  "watchdog fed)");
-
-    connected = wait_station_connected_while_provisioning();
-    if (!connected)
-    {
-        ESP_LOGW(TAG, "No station connection within %u ms; stopping the "
-                      "portal and parking degraded",
-                 (unsigned)PROVISIONING_WAIT_TIMEOUT_MS);
-        stop_provisioning_if_active();
-        return false;
-    }
-
-    /* Station connected while the portal was up: keep the AP up briefly for
-     * the success-grace interval, then retire the portal cleanly (listeners
-     * closed; the shared Mongoose process and MQTT/TLS untouched). */
-    honor_provisioning_success_grace();
-    stop_provisioning_if_active();
-    ESP_LOGI(TAG, "Provisioning succeeded and portal retired; "
-                  "continuing to the NETWORK gate -> TLS");
-    return true;
 }
 
 /* --------------------------------------------------------------------- */
@@ -620,6 +590,13 @@ static void supervise_iteration(void)
 
     (void)app_state_poll(); /* feed + drive bounded retries (single owner) */
 
+    /* Provisioning outcome events (TASK-132/133): the platform fallback
+     * controller owns the portal, the adapter stores its notifications and
+     * the supervisor DELIVERS them here (current session identity, machine
+     * owns the stale/illegal rejection).  Non-blocking; same task as the
+     * feed. */
+    deliver_provisioning_events();
+
     app_state_t current = app_state_current();
     bool report_entry = (current != s_last_reported);
 
@@ -650,49 +627,42 @@ static void supervise_iteration(void)
         break;
 
     case APP_STATE_NETWORK:
-        /* The network gate branches on the provisioning adapter's
-         * saved-credential query (TASK-127):
-         *   - credentialed device: keep the connect-only path (poll for the
-         *     station, then NETWORK_CONNECTED -> TLS),
-         *   - fresh device: enter PROVISIONING (PROVISIONING_STARTED ->
-         *     PROVISIONING) so the portal can capture a credential. */
-        if (wifi_provisioning_manager_has_saved_credentials())
+        /* The network gate keeps ONLY the credentialed connect path
+         * (TASK-133): poll for the station within the bounded window, then
+         * NETWORK_CONNECTED -> TLS (or NETWORK_FAILED -> SAFE_OFF with the
+         * bounded retry).  A device without a usable saved credential never
+         * starts provisioning from here — the platform fallback controller
+         * owns that decision (fresh device at init, or exhausted
+         * CONNECT_FAILED budget) and the supervisor delivers its STARTED
+         * event above while the machine is in NETWORK. */
         {
-            if (supervise_network_gate())
+            const bool credentialed =
+                wifi_provisioning_manager_has_saved_credentials();
+            if (credentialed && supervise_network_gate())
             {
                 (void)app_state_deliver(APP_EVENT_NETWORK_CONNECTED,
                                         APP_OWNER_NETWORK);
             }
-            else
+            else if (credentialed)
             {
                 (void)app_state_deliver(APP_EVENT_NETWORK_FAILED,
                                         APP_OWNER_NETWORK);
             }
         }
-        else
-        {
-            ESP_LOGI(TAG, "No saved station credential; entering Wi-Fi "
-                          "provisioning (portal)");
-            (void)app_state_deliver(APP_EVENT_PROVISIONING_STARTED,
-                                    APP_OWNER_NETWORK);
-        }
         break;
 
     case APP_STATE_PROVISIONING:
-        /* Run the portal until the station connects (bounded), honor the
-         * success-grace interval, then stop the portal.  On success the
-         * machine returns to NETWORK, which now sees the saved credential
-         * and passes to TLS; on failure it parks degraded with the bounded
-         * retry (never a portal restart storm). */
-        if (supervise_provisioning())
+        /* The controller owns the portal (TASK-131/132/133): the machine
+         * parks in this bookkeeping state while the controller keeps the
+         * temporary AP / HTTP / DNS up.  No portal-driving work happens
+         * here — the pump above delivers SUCCEEDED (-> NETWORK) or FAILED
+         * (-> SAFE_OFF, bounded retry) when the controller reports the
+         * outcome, and the portal is never restarted from the supervisor.
+         * The watchdog is fed every iteration by the loop above. */
+        if (report_entry)
         {
-            (void)app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
-                                    APP_OWNER_NETWORK);
-        }
-        else
-        {
-            (void)app_state_deliver(APP_EVENT_PROVISIONING_FAILED,
-                                    APP_OWNER_NETWORK);
+            ESP_LOGI(TAG, "Provisioning gate: portal owned by the "
+                          "controller; waiting for its outcome events");
         }
         break;
 
@@ -760,9 +730,11 @@ static void supervise_iteration(void)
         break;
 
     case APP_STATE_FATAL:
-        /* Never strand a provisioning listener on the shared Mongoose
-         * process: retire the portal immediately on FATAL. */
-        stop_provisioning_if_active();
+        /* Never strand the provisioning flow on FATAL: the adapter stop
+         * ends the controller lifecycle (grace timer cancelled, temporary AP
+         * retired) and closes any portal listeners on the shared Mongoose
+         * process. */
+        stop_provisioning();
         ESP_LOGE(TAG, "Fatal: application watchdog or unrecoverable "
                       "failure; an explicit reset is required");
         /* Leave the supervisor; a platform-level reset/OTA path reboots
@@ -770,10 +742,14 @@ static void supervise_iteration(void)
         return;
 
     case APP_STATE_OTA:
-        /* OTA entry: retire the provisioning portal immediately so no portal
-         * listener is left on the shared Mongoose process during the update.
-         * (OTA itself is driven by a later task's OTA supervisor.) */
-        stop_provisioning_if_active();
+        /* OTA entry: end the provisioning flow immediately so no portal
+         * listener or pending grace timer is left during the update.
+         * (OTA itself is driven by a later task's OTA supervisor.)  The
+         * adapter stop is idempotent; this runs once per OTA entry. */
+        if (report_entry)
+        {
+            stop_provisioning();
+        }
         break;
 
     case APP_STATE_BOOT:
@@ -844,9 +820,13 @@ void app_main(void)
     /* Provisioning infrastructure (TASK-127).  The portal rides the shared
      * Mongoose process that also hosts MQTT/TLS; the process is initialized
      * once here and NEVER torn down by provisioning (the adapter's stop()
-     * closes only the portal listeners).  The adapter itself is idempotent;
-     * a failure here only disables the fresh-device portal, never the
-     * credentialed boot path. */
+     * ends the controller lifecycle and closes only the portal listeners).
+     * init() registers the product notification hook with the platform
+     * fallback controller (TASK-132), which owns the portal decision: a
+     * fresh device gets the portal opened right here (its STARTED outcome
+     * is delivered by the supervisor once the machine reaches the NETWORK
+     * gate).  The adapter itself is idempotent; a failure here only disables
+     * the fresh-device portal, never the credentialed boot path. */
     MongooseProcess_Init();
     if (!MongooseProcess_IsRunning())
     {

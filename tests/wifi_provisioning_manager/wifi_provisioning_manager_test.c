@@ -164,7 +164,9 @@ static void test_start_stop_lifecycle_and_idempotency(void)
     TEST_ASSERT_EQUAL_UINT(2u,
                            wifi_provisioning_mock_get_counters().start_calls);
 
-    /* Stop brings the portal down. */
+    /* Stop brings the portal down.  The stop also ends the controller's
+     * portal lifecycle (TASK-133: grace timer cancelled, AP retirement
+     * requested) before the belt-and-braces listener close. */
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
                           wifi_provisioning_manager_stop());
     TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
@@ -172,17 +174,23 @@ static void test_start_stop_lifecycle_and_idempotency(void)
                           wifi_provisioning_manager_get_state());
     TEST_ASSERT_EQUAL_UINT(1u,
                            wifi_provisioning_mock_get_counters().stop_calls);
+    wifi_provisioning_controller_mock_counters_t ctrl_after_stop =
+        wifi_provisioning_controller_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(1u, ctrl_after_stop.stop_calls);
 
     /* Still not initialized/deinitialized the process even after stop. */
     mg = mongoose_process_mock_get_counters();
     TEST_ASSERT_EQUAL_UINT(0u, mg.init_calls);
     TEST_ASSERT_EQUAL_UINT(0u, mg.deinit_calls);
 
-    /* Second stop while stopped: idempotent no-op. */
+    /* Second stop while stopped: idempotent no-op (controller and listeners
+     * are both already down). */
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
                           wifi_provisioning_manager_stop());
     TEST_ASSERT_EQUAL_UINT(2u,
                            wifi_provisioning_mock_get_counters().stop_calls);
+    ctrl_after_stop = wifi_provisioning_controller_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT(2u, ctrl_after_stop.stop_calls);
     TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
 }
 
@@ -192,16 +200,63 @@ static void test_stop_with_portal_already_stopped(void)
                           wifi_provisioning_manager_init());
 
     /* A stop on a portal that never started and a repeat stop are both
-     * successful no-ops. */
+     * successful no-ops.  The controller stop is likewise a safe no-op for
+     * a disabled controller (credentialed device with no active portal). */
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
                           wifi_provisioning_manager_stop());
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
                           wifi_provisioning_manager_stop());
     TEST_ASSERT_EQUAL_UINT(2u,
                            wifi_provisioning_mock_get_counters().stop_calls);
+    TEST_ASSERT_EQUAL_UINT(2u,
+        wifi_provisioning_controller_mock_get_counters().stop_calls);
     TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
     TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_STOPPED,
                           wifi_provisioning_manager_get_state());
+}
+
+static void test_stop_ends_controller_lifecycle_and_closes_listeners(void)
+{
+    /* TASK-133 stop path: on OTA entry / FATAL the adapter stop must end
+     * the controller's portal lifecycle (grace timer cancelled, AP retired)
+     * in addition to closing the portal listeners. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+
+    /* Even with no portal listeners up the controller stop is always
+     * issued: a pending grace timer or a recoverable portal must never
+     * survive an explicit stop. */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_stop());
+    TEST_ASSERT_EQUAL_UINT(1u,
+        wifi_provisioning_controller_mock_get_counters().stop_calls);
+    TEST_ASSERT_EQUAL_UINT(1u,
+                           wifi_provisioning_mock_get_counters().stop_calls);
+
+    /* A controller that cannot complete the retirement (reports false,
+     * stays recoverable) does not fail the adapter stop: the belt-and-
+     * braces listener close still guarantees no portal listener is left
+     * on the shared Mongoose process. */
+    wifi_provisioning_controller_mock_set_state(
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING);
+    wifi_provisioning_controller_mock_set_stop_result(false);
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_stop());
+    TEST_ASSERT_EQUAL_UINT(2u,
+        wifi_provisioning_controller_mock_get_counters().stop_calls);
+    TEST_ASSERT_EQUAL_UINT(2u,
+                           wifi_provisioning_mock_get_counters().stop_calls);
+    TEST_ASSERT_FALSE(wifi_provisioning_manager_is_active());
+
+    /* The controller stop never stores a provisioning outcome (DISABLED is
+     * not a product event), and it does not disturb the notification hook
+     * (a later deinit still ends the lifecycle). */
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_deinit());
+    TEST_ASSERT_EQUAL_UINT(1u,
+        wifi_provisioning_controller_mock_get_counters().deinit_calls);
 }
 
 /* --------------------------------------------------------------------- */
@@ -796,6 +851,7 @@ int main(void)
     RUN_TEST(test_init_deinit_lifecycle);
     RUN_TEST(test_start_stop_lifecycle_and_idempotency);
     RUN_TEST(test_stop_with_portal_already_stopped);
+    RUN_TEST(test_stop_ends_controller_lifecycle_and_closes_listeners);
     RUN_TEST(test_start_before_mongoose_running);
     RUN_TEST(test_start_failure_propagates_and_recovers);
     RUN_TEST(test_stop_failure_propagates);

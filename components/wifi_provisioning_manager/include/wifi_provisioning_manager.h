@@ -213,10 +213,18 @@ wifi_provisioning_manager_status_t wifi_provisioning_manager_start(void);
 /**
  * @brief   Stop the Wi-Fi provisioning portal (idempotent, serialized).
  *
- * @details Closes only the listeners owned by the provisioning portal and
- *          never tears down the shared Mongoose process (MQTT/TLS stay
- *          untouched).  Requires the adapter to be initialized; a stop
- *          with the portal already stopped is a safe no-op.
+ * @details Ends the provisioning flow through the automatic fallback
+ *          controller: any pending success-grace timer is cancelled, the
+ *          temporary access point retirement is requested
+ *          (wifi_provisioning_controller_stop()) and the portal's HTTP/DNS
+ *          listeners are closed (belt-and-braces, idempotent).  The shared
+ *          Mongoose process (MQTT/TLS) is never torn down.  The controller
+ *          stop is issued OUTSIDE the adapter lock because the controller
+ *          delivers its final state-change notification synchronously on
+ *          the caller's thread and the notification handler takes the
+ *          adapter lock.  Requires the adapter to be initialized; a stop
+ *          with the portal already stopped (or with the controller already
+ *          disabled) is a safe no-op.
  *
  * @return  #WIFI_PROVISIONING_MANAGER_OK when the portal is (or already
  *          was) stopped,

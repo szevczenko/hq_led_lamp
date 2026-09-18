@@ -13,26 +13,34 @@ counterpart:
 - the **automated monitor-log smoke check** wired into the standard
   flash/monitor loop (`on_target_smoke_check.py`),
 - the **expected log signatures** for every provisioning transition
-  (portal startup, portal stop, provisioning success, provisioning
-  failure/park),
+  (provisioning entry via the controller's STARTED event, provisioning
+  success, provisioning failure/park, explicit portal stop),
 - the **failure-mode matrix** with the state each failure leaves the device
   in and how it recovers.
 
 ## Context: the provisioning stage in the boot flow
 
-The boot order contract (see `main/app_main.c` file header, TASK-127) places
-Wi-Fi provisioning between the Wi-Fi gate and TLS:
+The boot order contract (see `main/app_main.c` file header, TASK-127/133)
+places Wi-Fi provisioning between the Wi-Fi gate and TLS:
 
 ```
 boot -> safe-off -> filesystem -> configuration -> Wi-Fi
-     -> provisioning (ONLY when no saved station credential exists)
+     -> provisioning (controller fallback decision: fresh device or
+        exhausted-credential device)
      -> verified MQTT/TLS -> state sync -> online
 ```
 
-`main/app_main.c` owns the decision through the adapter's
-`wifi_provisioning_manager_has_saved_credentials()` query.  A fresh device
-(no saved credential) enters `PROVISIONING`; a credentialed device passes
-the network gate straight to TLS and never enters the portal.
+The **platform fallback controller** (TASK-131/132,
+`CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y`) owns the provisioning
+decision: it opens the portal at init when no saved station credential
+exists (fresh device), or after the saved credential exhausted the bounded
+`CONNECT_FAILED` budget (`CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS`,
+default 2 in this product).  The supervisor (TASK-133) is a *consumer*: it
+polls the adapter's outcome events
+(`wifi_provisioning_manager_poll_event()`) and delivers STARTED/SUCCEEDED/
+FAILED to the state machine (owner NETWORK).  A credentialed device that
+connects on the first try passes the network gate straight to TLS and never
+enters the portal.
 
 Device-side portal facts used by the procedure (platform defaults):
 
@@ -44,7 +52,8 @@ Device-side portal facts used by the procedure (platform defaults):
 | Captive DNS listen URL  | `udp://0.0.0.0:53` (captures every DNS query and redirects to the portal) |
 | Portal API              | `POST /api/v1/wifi/credentials` (JSON `{"ssid":…,"password":…}`), `GET /api/v1/wifi/status`, `GET /api/v1/wifi/networks` |
 | Success grace interval  | `CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default `2000` ms in this product's `sdkconfig.defaults` (0 retires immediately, max 60000; single grace source of truth since TASK-131 — the duplicate `CONFIG_KLC_PROVISIONING_GRACE_MS` was dropped) |
-| Provisioning wait window| `PROVISIONING_WAIT_TIMEOUT_MS` = `180000` ms (bounded station connect window) |
+| Fallback budget         | `CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS` = `2` consecutive `CONNECT_FAILED` events before the portal opens on a credentialed device (fresh devices open at init) |
+| Provisioning wait window| none in the product — the controller keeps the portal up until success/stop (TASK-133 removed the supervisor's `PROVISIONING_WAIT_TIMEOUT_MS`) |
 | Network gate timeout    | `NETWORK_CONNECT_TIMEOUT_MS` = `30000` ms          |
 
 ---
@@ -145,16 +154,17 @@ timeout 1m idf.py -p /dev/ttyUSB1 monitor | tee /tmp/hq_led_lamp_esp.log
 ```
 
 Within the first seconds of boot the fresh device must show the portal
-startup signatures (full wording in the [log signatures](#expected-log-signatures)
+entry signature (full wording in the [log signatures](#expected-log-signatures)
 section):
 
 ```
-… klc: No saved station credential; entering Wi-Fi provisioning (portal)
-[INFO]: [prov_mgr] provisioning portal running (listeners bound)
-… klc: Provisioning portal running; waiting for the station to submit a credential and connect …
+… klc: Provisioning flow started by the controller; entering Wi-Fi provisioning
+   (the machine delivers PROVISIONING_STARTED once it reaches the NETWORK gate)
+… klc: Provisioning gate: portal owned by the controller; waiting for its outcome events
 ```
 
-The device is now broadcasting `Bimbrownik:<MAC>` on `10.10.0.1/24`.
+The controller opened the portal at adapter init (fresh device); the device
+is now broadcasting `Bimbrownik:<MAC>` on `10.10.0.1/24`.
 
 ### 3. Join the provisioning AP
 
@@ -189,20 +199,21 @@ to the smoke check via `--test-ssid` / `--test-password`.)
 
 Watch the monitor session.  Once the device connects to the lab WLAN the
 portal stays up for `CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`
-(default 2 s in `sdkconfig.defaults`), then
-retires and the boot chain continues:
+(default 2 s in `sdkconfig.defaults`), then the controller retires it and
+the supervisor delivers the success outcome:
 
 ```
-[INFO]: [prov_mgr] provisioning portal stopped
-… klc: Provisioning succeeded and portal retired; continuing to the NETWORK gate -> TLS
+… klc: Provisioning succeeded; portal retired by the controller; NETWORK gate resumes
 … klc: Network connected; verified MQTT/TLS connect is now allowed …
 … klc: Verified TLS connected with validated identity; …
 ```
 
-The `Bimbrownik:<MAC>` network disappears from the Wi-Fi scan list (the AP
-is retired).  The device now has a saved credential: a reflash without an
-`erase-flash` boots straight through the network gate to TLS
-(pass-through; the portal never starts — verify with the smoke check in
+(The portal listeners are retired by the controller itself — the adapter's
+`[prov_mgr] provisioning portal stopped` line appears only on an explicit
+OTA/FATAL stop.)  The `Bimbrownik:<MAC>` network disappears from the Wi-Fi
+scan list (the AP is retired).  The device now has a saved credential: a
+reflash without an `erase-flash` boots straight through the network gate to
+TLS (pass-through; the portal never starts — verify with the smoke check in
 `--expect pass-through` mode).
 
 **Reproducibility check:** repeat steps 1–5 on a second fresh device (or
@@ -219,8 +230,9 @@ flash/monitor loop.  Given a captured monitor log it asserts:
 - **(b)** the provisioning state transitions observed in the log match the
   legal state-machine sequence (see the automaton in the script; it mirrors
   `app_state.h` — `NETWORK --PROVISIONING_STARTED--> PROVISIONING
-  --PROVISIONING_SUCCEEDED/FAILED--> NETWORK | SAFE_OFF`, with the
-  bounded-retry re-entry after a provisioning failure being legal),
+  --PROVISIONING_SUCCEEDED/FAILED--> NETWORK | SAFE_OFF`, driven by the
+  controller's outcome events since TASK-133, with the bounded-retry
+  re-entry after a provisioning failure being legal),
 - **(c)** no SSID or password substring of the test credential appears
   anywhere in the captured log (secrecy rule, TASK-120/126).
 
@@ -252,10 +264,10 @@ python3 tests/wifi_provisioning_manager/on_target_smoke_check.py \
     --expect provisioning
 ```
 
-Within the 1-minute window the fresh device shows
-`ENTER -> RUN` (portal entered and running; the wait window is 180 s, so the
-outcome is not expected inside the standard window).  The check accepts the
-legal *prefix*.
+Within the 1-minute window the fresh device shows `ENTER` (the
+supervisor delivered the controller's STARTED outcome; the portal stays up
+under the controller's policy until success/stop — there is no product-side
+wait window anymore).  The check accepts the legal *prefix*.
 
 The script can also run the loop itself (app flash + bounded monitor;
 the configured-fresh-device preparation from step 1 is a prerequisite):
@@ -302,39 +314,34 @@ statuses — never an SSID, a password, a token or a URL with embedded
 credentials.  `klc:` lines are `ESP_LOG` from `main/app_main.c`; `[prov_mgr]`
 lines are the adapter's OSAL logs (printed raw to the UART).
 
-### Portal startup
+### Provisioning entry (controller fallback)
 
 | Log line | Meaning |
 |----------|---------|
-| `… klc: No saved station credential; entering Wi-Fi provisioning (portal)` | NETWORK gate observed no saved credential; `PROVISIONING_STARTED` delivered (NETWORK → PROVISIONING) |
-| `[INFO]: [prov_mgr] provisioning portal running (listeners bound)` | Adapter `start()` succeeded: HTTP portal + captive DNS listeners bound |
-| `… klc: Provisioning portal running; waiting for the station to submit a credential and connect (bounded wait, watchdog fed)` | Supervisor entered the bounded station wait |
+| `… klc: Provisioning flow started by the controller; entering Wi-Fi provisioning` | Supervisor delivered the controller's STARTED outcome while the machine was at the NETWORK gate (fresh device, or exhausted `CONNECT_FAILED` budget); `PROVISIONING_STARTED` delivered (NETWORK → PROVISIONING) |
+| `… klc: Provisioning gate: portal owned by the controller; waiting for its outcome events` | Machine entered `PROVISIONING` (bookkeeping only; the controller keeps the portal up) |
 
-### Portal stop
-
-| Log line | Meaning |
-|----------|---------|
-| `[INFO]: [prov_mgr] provisioning portal stopped` | Adapter `stop()` closed the portal listeners (every stop; the shared Mongoose process/MQTT/TLS untouched) |
-| `… klc: Provisioning succeeded and portal retired; continuing to the NETWORK gate -> TLS` | Success path: grace honored, portal retired, `PROVISIONING_SUCCEEDED` delivered (PROVISIONING → NETWORK) |
-| `… klc: No station connection within 180000 ms; stopping the portal and parking degraded` | Failure path: wait window elapsed, portal being stopped, `PROVISIONING_FAILED` pending |
+The portal listeners are opened by the platform controller itself (TASK-132
+notification translation), so no `[prov_mgr] provisioning portal running`
+line appears on the fresh-device boot.
 
 ### Provisioning success
 
-The full success signature is (the adapter logs the portal stop *before*
-the supervisor logs the success line — `stop_provisioning_if_active()`
-runs first, then `PROVISIONING_SUCCEEDED` is logged):
+The full success signature is (the controller retires the portal after the
+success-grace interval; the adapter has nothing to log on that path):
 
 ```
-[INFO]: [prov_mgr] provisioning portal stopped
-… klc: Provisioning succeeded and portal retired; continuing to the NETWORK gate -> TLS
+… klc: Provisioning succeeded; portal retired by the controller; NETWORK gate resumes
 … klc: Network connected; verified MQTT/TLS connect is now allowed …
 … klc: Verified TLS connected with validated identity; …
 ```
 
-`Network connected` is the NETWORK gate passing after the provision
-(saved credential present); `Verified TLS connected with validated identity`
-is the TLS gate.  If the lab WLAN cannot reach the ThingsBoard broker the
-TLS line is replaced by
+`Provisioning succeeded …` is the supervisor delivering the controller's
+SUCCEEDED outcome after the temporary AP was retired
+(PROVISIONING → NETWORK).  `Network connected` is the NETWORK gate passing
+after the provision (saved credential present); `Verified TLS connected with
+validated identity` is the TLS gate.  If the lab WLAN cannot reach the
+ThingsBoard broker the TLS line is replaced by
 `… klc: Verified TLS connect failed: … (output forced off, …)` — the
 provisioning stage itself still succeeded (this is a post-provisioning
 network/broker condition, not a provisioning failure).
@@ -343,16 +350,16 @@ network/broker condition, not a provisioning failure).
 
 | Log line | Meaning |
 |----------|---------|
-| `… klc: Provisioning portal start failed; machine parks degraded (bounded retry)` (plus `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d)`) | Portal start refused (bind/Mongoose); `PROVISIONING_FAILED` delivered |
-| `… klc: No station connection within 180000 ms; stopping the portal and parking degraded` | No station connected inside the wait window (no client, or a wrong credential); `PROVISIONING_FAILED` delivered |
-| `[INFO]: [prov_mgr] provisioning portal stopped` | Portal listeners closed on the failure path |
+| `… klc: Provisioning failed; machine parks degraded (bounded retry)` | Supervisor delivered the adapter's FAILED outcome (portal start failure observed by the adapter); `PROVISIONING_FAILED` delivered, machine parks SAFE_OFF |
+| `[INFO]: [prov_mgr] provisioning portal stopped` | Explicit adapter stop (OTA entry / FATAL): controller lifecycle ended and portal listeners closed |
 | `… klc: Safe-off (degraded): no retry scheduled; waiting for provisioning / reset / OTA` | Final park (non-retryable) |
 | `… klc: Safe-off (degraded): retry budget exhausted; waiting for provisioning / reset / OTA` | Park after the bounded retry budget (5 attempts) is spent |
 
 A provisioning failure parks the machine **degraded** (SAFE_OFF) with the
 existing bounded retry/backoff — never a portal restart storm.  The retry
-returns to the NETWORK stage, which re-enters provisioning only while no
-saved credential exists (`ENTER -> RUN -> …` again in the same log).
+returns to the NETWORK stage; the portal is never restarted by the
+supervisor (a later fallback cycle may legally re-enter provisioning
+through the controller — `ENTER -> …` again in the same log).
 
 ---
 
@@ -365,41 +372,40 @@ device ends in, and the recovery path.
 
 | | |
 |---|---|
-| **Trigger** | `wifi_provisioning_manager_start()` refuses: shared Mongoose process not running, or an HTTP/DNS listener cannot bind (port taken, resource exhaustion). |
-| **Log** | `… klc: Provisioning portal start failed; machine parks degraded (bounded retry)` and `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d)`; no `portal running` line. |
+| **Trigger** | The platform controller opens the provisioning application (fresh device at init, or exhausted `CONNECT_FAILED` budget) and the listeners cannot bind (shared Mongoose process not running, port taken, resource exhaustion). |
+| **Log** | `[ERROR]: [prov_mgr] provisioning portal start failed (platform_state=%d)` and (when the adapter observes the start failure) `… klc: Provisioning failed; machine parks degraded (bounded retry)`; no `portal running` line. |
 | **End state** | `SAFE_OFF` (degraded); `PROVISIONING_FAILED` scheduled a bounded retry to NETWORK. |
-| **Recovery** | The bounded retry re-attempts the portal; once the binding condition clears it succeeds. If the retry budget exhausts, the device parks (no storm) and waits for provisioning / reset / OTA. |
-| **Verification** | Host unit tests (`wifi_provisioning_mock` failure injection + Mongoose-not-running precondition); on-target signature as above. |
+| **Recovery** | The bounded retry returns to the NETWORK gate; a later fallback cycle re-opens the portal once the binding condition clears. If the retry budget exhausts, the device parks (no storm) and waits for provisioning / reset / OTA. |
+| **Verification** | Host unit tests (`wifi_provisioning_mock` failure injection + Mongoose-not-running precondition, and the TASK-133 adapter-stop controller-lifecycle tests); on-target signature as above. |
 
-### 2. No client within the wait window
+### 2. No client ever connects
 
 | | |
 |---|---|
-| **Trigger** | The portal runs `PROVISIONING_WAIT_TIMEOUT_MS` (180 s) and no station ever connects (nobody joined the AP / nobody submitted). |
-| **Log** | `… klc: No station connection within 180000 ms; stopping the portal and parking degraded`, `[INFO]: [prov_mgr] provisioning portal stopped`, then the park/retry lines of the failure signature. |
-| **End state** | `SAFE_OFF` (degraded) with a bounded retry; the retry re-enters NETWORK → PROVISIONING (fresh device), so the portal comes back up after the backoff and the user gets another window. |
-| **Recovery** | Join `Bimbrownik:<MAC>` and submit a valid credential while the next window is open, or reset the device. |
-| **Verification** | **On target (TASK-128 task notes):** configured fresh device left untouched >180 s → `No station connection within 180000 ms; …`, `[prov_mgr] provisioning portal stopped`, `provisioning --provisioning-failed--> safe-off`, then `safe-off --retry-due--> network` re-enters the portal (`ENTER -> RUN` repeats).  Smoke check accepts `ENTER -> RUN -> WAIT_TIMEOUT -> PORTAL_STOPPED -> ENTER -> RUN`. |
+| **Trigger** | Nobody joins the AP / submits a credential.  Since TASK-133 removed the supervisor's `PROVISIONING_WAIT_TIMEOUT_MS`, the product has **no wait window**: the controller keeps the portal up indefinitely (until success/stop/OTA/FATAL), so an idle user simply takes as long as needed. |
+| **Log** | `… klc: Provisioning flow started by the controller; …` + `… klc: Provisioning gate: portal owned by the controller; …`, then nothing further while the portal idles. |
+| **End state** | `PROVISIONING` (portal up). |
+| **Recovery** | Join `Bimbrownik:<MAC>` and submit a valid credential at any time. |
 
 ### 3. Wrong submitted credential
 
 | | |
 |---|---|
-| **Trigger** | A client submits an SSID/password the device cannot use (typo, wrong key, out-of-range AP).  The device switches to STA mode, the connect attempt fails, and `network_manager_is_connected()` never turns true. |
-| **Log** | Identical product signature to row 2 — the device **never learns or logs the submitted value** (secrecy rule), so it only observes "no station connection within the window", then `… klc: No station connection within 180000 ms; … parking degraded` + `[prov_mgr] provisioning portal stopped`. |
-| **End state** | `SAFE_OFF` (degraded) with bounded retry, same as row 2. |
-| **Recovery** | Rejoin the (re-started) AP and submit the correct credential, or reset. |
-| **Verification** | The device-observable half is the same on-target run as row 2 (the wait window expires with no connection; no submitted value is ever learned or logged — secrecy rule).  On target: join the AP, submit a deliberately wrong credential, watch the window expire into the timeout/park signature.  The portal-side "connect failed" status is visible to the client in `GET /api/v1/wifi/status`, never in the device log. |
+| **Trigger** | A client submits an SSID/password the device cannot use (typo, wrong key, out-of-range AP).  The connect attempt fails and the controller stays provisionable (its grace-abort path returns to PROVISIONING), so the portal remains up for another attempt. |
+| **Log** | No failure is logged on this path — the device **never learns or logs the submitted value** (secrecy rule); the portal-side "connect failed" status is visible to the client in `GET /api/v1/wifi/status`, never in the device log.  The `[prov_mgr] controller transition …` lines carry state codes only. |
+| **End state** | `PROVISIONING` (portal up). |
+| **Recovery** | Resubmit the correct credential through the still-open portal, or reset. |
+| **Verification** | On target: join the AP, submit a deliberately wrong credential, confirm the portal stays up and no submitted value ever appears in the log. |
 
-### 4. AP retirement race (success path race / grace expiry)
+### 4. AP retirement (success path / explicit stop)
 
 | | |
 |---|---|
-| **Trigger** | Station connects, the success-grace interval (`CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default 2 s in `sdkconfig.defaults`) elapses and the portal retires while a client is still attached or a repeat submission races the teardown. |
-| **Log** | `[INFO]: [prov_mgr] provisioning portal stopped`, `… klc: Provisioning succeeded and portal retired; continuing to the NETWORK gate -> TLS`, then the NETWORK/TLS gate lines. |
-| **End state** | `NETWORK` → `TLS` — the credential is saved, so the retry/`DISCONNECTED` path reconnects through the network gate with the saved credential; the machine never re-enters provisioning. |
-| **Recovery** | None required.  If the station drop happens during teardown, the network gate's bounded retry reconnects with the saved credential.  A client submitting twice inside the grace window gets a retry/idempotent response — the portal's second `stop()` is a safe no-op. |
-| **Verification** | **Pending: requires a lab WLAN** — the interactive success path (join AP → submit → grace retire → NETWORK/TLS handoff) was **not** exercised on target during this milestone (no lab WLAN available; see the task notes).  The success signature set and the automaton are documented above and asserted mechanically by the smoke check whenever the path is exercised; teardown idempotency (double stop) is covered by the adapter host unit tests. |
+| **Trigger** | Station connects, the success-grace interval (`CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS`, default 2 s in `sdkconfig.defaults`) elapses and the controller retires the portal; a client submitting twice inside the grace window races the teardown.  An explicit adapter stop (OTA entry / FATAL) ends the controller lifecycle and cancels any pending grace timer. |
+| **Log** | Success: `… klc: Provisioning succeeded; portal retired by the controller; NETWORK gate resumes`, then the NETWORK/TLS gate lines.  Explicit stop: `[INFO]: [prov_mgr] provisioning portal stopped (controller lifecycle ended)`. |
+| **End state** | Success: `NETWORK` → `TLS` — the credential is saved, so the retry/`DISCONNECTED` path reconnects through the network gate with the saved credential; the machine never re-enters provisioning.  OTA/FATAL: the controller lifecycle is ended and no listener or grace timer is left. |
+| **Recovery** | None required.  If the station drop happens during teardown, the network gate's bounded retry reconnects with the saved credential.  A client submitting twice inside the grace window gets a retry/idempotent response — the controller's retirement is a safe no-op on a stop-while-stopping. |
+| **Verification** | **Pending: requires a lab WLAN** — the interactive success path (join AP → submit → grace retire → NETWORK/TLS handoff) was **not** exercised on target during this milestone (no lab WLAN available; see the task notes).  The success signature set and the automaton are documented above and asserted mechanically by the smoke check whenever the path is exercised; teardown idempotency and the controller-lifecycle stop are covered by the adapter host unit tests (TASK-133). |
 
 ---
 
