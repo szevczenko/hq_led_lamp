@@ -3,7 +3,7 @@
 #
 # REQUIRES the documented DNS SAN: the script parses the Subject Alternative
 # Name out of server.csr and refuses to sign unless it is exactly
-# DNS:<endpoint> (default DNS:thingsboard.home.arpa). This is the "require
+# DNS:<endpoint> (default DNS:home-assistance.local). This is the "require
 # the documented DNS SAN" enforcement point of the development PKI.
 #
 # Produces in server/certs/:
@@ -94,9 +94,25 @@ keyUsage=digitalSignature,keyEncipherment
 basicConstraints=critical,CA:FALSE
 EOF
 
+# Never issue a leaf that outlives the retained development CA.  This matters
+# during hostname migrations and routine renewal when the CA has less than the
+# default leaf lifetime remaining.
+ca_not_after="$(openssl x509 -in ca.crt -noout -enddate | cut -d= -f2-)"
+ca_not_after_epoch="$(date -d "$ca_not_after" +%s)"
+now_epoch="$(date +%s)"
+remaining_days=$(( (ca_not_after_epoch - now_epoch) / 86400 - 1 ))
+if [ "$remaining_days" -le 0 ]; then
+    echo "gen_server_cert.sh: CA certificate is expired or has no safe leaf lifetime remaining" >&2
+    exit 1
+fi
+server_days="$KLC_SERVER_DAYS"
+if [ "$server_days" -gt "$remaining_days" ]; then
+    server_days="$remaining_days"
+fi
+
 openssl x509 -req -in server.csr \
     -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -out server.crt -days "$KLC_SERVER_DAYS" -"$KLC_HASH" -extfile server.ext
+    -out server.crt -days "$server_days" -"$KLC_HASH" -extfile server.ext
 
 # Convenience artifacts for the compose stack (see server/README.md):
 #   server.pem      = leaf + CA chain, served by ThingsBoard MQTT TLS :8883
@@ -113,7 +129,7 @@ chmod 644 server_key.pem
 chmod 644 ca.crt server.crt server.pem server.ext
 
 echo "Server certificate issued in $CERT_DIR:"
-echo "  server.crt     SAN DNS:${DNS_NAME}, $KLC_SERVER_DAYS days (signed by ca.crt)"
+echo "  server.crt     SAN DNS:${DNS_NAME}, $server_days days (signed by ca.crt)"
 echo "  server.pem     leaf + CA chain for ThingsBoard :8883"
 echo "  server_key.pem private key copy for the containers (mode 644)"
 echo "  server.ext     signing profile (audit)"

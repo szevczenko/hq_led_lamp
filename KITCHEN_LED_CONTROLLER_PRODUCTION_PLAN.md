@@ -348,7 +348,7 @@ flowchart LR
 Use a stable DNS name, not a raw changing IP. Recommended local name:
 
 ```text
-thingsboard.home.arpa
+home-assistance.local
 ```
 
 Do not use `.local` unless mDNS behavior is intentionally configured. The
@@ -358,7 +358,7 @@ Do not use `.local` unless mDNS behavior is intentionally configured. The
 
 1. Assign the Ubuntu server a DHCP reservation, for example `192.168.1.20`.
 2. Add a local DNS record:
-   `thingsboard.home.arpa -> 192.168.1.20`.
+   `home-assistance.local -> 192.168.1.20`.
 3. If the router cannot add local DNS records, run AdGuard Home, Pi-hole, or
    `dnsmasq` on Ubuntu and configure DHCP clients to use it.
 4. Keep ThingsBoard LAN-only initially. Do not configure Internet port
@@ -389,10 +389,10 @@ Public ACME certificates generally cannot validate a private `home.arpa` name.
 Use a private CA:
 
 1. Create an offline or carefully protected local root CA.
-2. Issue a server certificate with SAN `DNS:thingsboard.home.arpa`.
+2. Issue a server certificate with SAN `DNS:home-assistance.local`.
 3. Configure the MQTT TLS listener with the server certificate and key.
 4. Install only the root CA certificate on each device as `/cert/ca.crt`.
-5. Configure MQTT URL as `mqtts://thingsboard.home.arpa:8883`.
+5. Configure MQTT URL as `mqtts://home-assistance.local:8883`.
 6. Enable certificate and hostname verification; never enable skip-verify.
 7. Set certificate lifetimes and document renewal before expiry.
 8. Keep the CA private key off the ThingsBoard runtime host when possible.
@@ -404,7 +404,7 @@ embed or trust development roots.
 
 A ThingsBoard tenant already exists on a separate, already-running development
 instance at `http://home-assistance.local:8080`, distinct from the
-`thingsboard.home.arpa:8883` MQTT/TLS endpoint described above:
+`home-assistance.local:8883` MQTT/TLS endpoint described above:
 
 - The tenant is reachable today over plain HTTPS/HTTP admin/REST access and is
   used only for tenant administration, device provisioning, and REST-API-based
@@ -419,7 +419,7 @@ instance at `http://home-assistance.local:8080`, distinct from the
   to issues/PRs. Rotate/revoke any key that was ever pasted into a chat log,
   ticket, or shared document.
 - Once the LAN deployment (TASK-116) exists, the same test-device and
-  functional-test scripts should be re-pointed at `thingsboard.home.arpa` by
+  functional-test scripts should be re-pointed at `home-assistance.local` by
   configuration only, without code changes.
 
 ## 10. Authentication and Manufacturing Options

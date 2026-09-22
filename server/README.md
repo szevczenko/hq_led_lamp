@@ -6,13 +6,13 @@ directory; all runtime material is generated and git-ignored, nothing
 private is committed.
 
 ```
-controller --- Wi-Fi LAN ---> mqtts thingsboard.home.arpa:8883 -> ThingsBoard
-admin browser       ------> https thingsboard.home.arpa         -> Caddy -> ThingsBoard
+controller --- Wi-Fi LAN ---> mqtts home-assistance.local:8883 -> ThingsBoard
+admin browser       ------> https home-assistance.local         -> Caddy -> ThingsBoard
 ```
 
-- **MQTT TLS** for devices: `thingsboard.home.arpa:8883` (verified TLS,
+- **MQTT TLS** for devices: `home-assistance.local:8883` (verified TLS,
   development CA).
-- **HTTPS** for administration: `thingsboard.home.arpa:443` (Caddy reverse
+- **HTTPS** for administration: `home-assistance.local:443` (Caddy reverse
   proxy -> ThingsBoard web UI/API).
 - **Plaintext MQTT** (1883) and the raw admin port (9090) are bound to
   localhost only, for development/troubleshooting.
@@ -60,18 +60,18 @@ generated or stored here). This stack is development-only.
 2. Add a local DNS record:
 
    ```text
-   thingsboard.home.arpa -> 192.168.1.20
+  home-assistance.local -> 192.168.1.20
    ```
 
-   `home.arpa` is the RFC 8375 reserved home-network domain — do not use
-   `.local` (mDNS) for this endpoint, and do not register the name in public
-   DNS.
+  Ensure `home-assistance.local` resolves for the ESP32 and server. If the
+  network uses mDNS for `.local`, verify that the ESP32 resolver supports the
+  corresponding name before relying on it for MQTT TLS.
 3. If your router cannot add local DNS records, run `dnsmasq`/AdGuard Home on
    the Ubuntu server itself and point DHCP clients at it.
 4. Keep the stack LAN-only: **do not** configure Internet port forwarding for
    `443` or `8883`.
 5. Fallback for quick testing on a single machine: add
-   `192.168.1.20 thingsboard.home.arpa` to `/etc/hosts` on the server and on
+  `192.168.1.20 home-assistance.local` to `/etc/hosts` on the server and on
    machines that need the name. The firmware still needs the real name
    resolvable over Wi-Fi DNS — `/etc/hosts` is not enough for devices.
 
@@ -87,7 +87,7 @@ This creates (all git-ignored):
 - `server/.env` — environment copied from `.env.example` with a generated
   PostgreSQL password;
 - `server/certs/` — development root CA (`ca.crt`, `ca.key`), server private
-  key + CSR (`server.key`, `server.csr`, SAN `DNS:thingsboard.home.arpa`),
+  key + CSR (`server.key`, `server.csr`, SAN `DNS:home-assistance.local`),
   server certificate (`server.crt`), and the PEM credentials for the
   ThingsBoard MQTT TLS listener (`server.pem`, `server_key.pem`);
 - `server/data/postgres` — durable PostgreSQL storage directory.
@@ -113,13 +113,13 @@ issues a new CA and invalidates every previously distributed copy of
 
 ### 1.3 Trust the development CA (admin browsers / REST tooling)
 
-Browsers and scripts that talk to `https://thingsboard.home.arpa` must trust
+Browsers and scripts that talk to `https://home-assistance.local` must trust
 `server/certs/ca.crt`:
 
 - Browser: import `server/certs/ca.crt` into the OS/browser trust store
   (marked *trusted for identifying websites*).
 - Host scripts: add it to the system CA bundle, or pass it explicitly, e.g.
-  `curl --cacert server/certs/ca.crt https://thingsboard.home.arpa/login`.
+  `curl --cacert server/certs/ca.crt https://home-assistance.local/login`.
 
 ### 1.4 Start the stack
 
@@ -145,8 +145,8 @@ python3 server/scripts/check_endpoints.py --wait 600
 Expected output (exact status/CONNACK codes may vary by ThingsBoard version):
 
 ```text
-PASS  HTTPS thingsboard.home.arpa:443 -> HTTP/1.1 200 OK ...
-PASS  MQTT TLS thingsboard.home.arpa:8883 -> CONNACK rc=2 ... (or rc=5 ...)
+PASS  HTTPS home-assistance.local:443 -> HTTP/1.1 200 OK ...
+PASS  MQTT TLS home-assistance.local:8883 -> CONNACK rc=2 ... (or rc=5 ...)
 ```
 
 (The exact MQTT CONNACK return code does not matter: any rc from an
@@ -157,7 +157,7 @@ access token.)
 
 ### 1.5 First login
 
-Open `https://thingsboard.home.arpa` and log in with the default
+Open `https://home-assistance.local` and log in with the default
 system administrator:
 
 - user: `sysadmin@thingsboard.org`
@@ -171,14 +171,14 @@ harness.
 
 | Protocol | Address                        | Scope                  |
 |----------|--------------------------------|------------------------|
-| HTTPS    | `thingsboard.home.arpa:443`    | LAN — admin/web UI/REST via Caddy |
-| MQTT TLS | `thingsboard.home.arpa:8883`   | LAN — verified device traffic |
+| HTTPS    | `home-assistance.local:443`    | LAN — admin/web UI/REST via Caddy |
+| MQTT TLS | `home-assistance.local:8883`   | LAN — verified device traffic |
 | MQTT     | `127.0.0.1:1883` (host)        | loopback only — migration/testing |
 | HTTP     | `127.0.0.1:9090` (host)        | loopback only — direct admin/REST |
 | Edge RPC | `127.0.0.1:7070` (host)        | loopback only             |
 
 The MQTT TLS listener uses the development server certificate; clients must
-verify both the chain (`ca.crt`) and the hostname (`thingsboard.home.arpa`),
+verify both the chain (`ca.crt`) and the hostname (`home-assistance.local`),
 exactly like the firmware's `mqtt_cfg` (`mqtts://...:8883`, skip-verify
 forbidden).
 
@@ -234,7 +234,7 @@ data.
    python3 -m unittest discover -s tests/thingsboard -v
    ```
 
-   The same harness can run over HTTPS with `TB_BASE_URL=https://thingsboard.home.arpa`
+  The same harness can run over HTTPS with `TB_BASE_URL=https://home-assistance.local`
    once the development CA is trusted system-wide (see 1.3).
 3. To provision a named test device for firmware-style access-token tests:
 
@@ -250,7 +250,7 @@ data.
 
 Devices connect with verified TLS — no plaintext MQTT is exposed on the LAN:
 
-- broker: `mqtts://thingsboard.home.arpa:8883`
+- broker: `mqtts://home-assistance.local:8883`
 - trust anchor: `server/certs/ca.crt` (installed as `/cert/ca.crt` on the
   firmware; also the CA this repo's `mqtt_cfg` tests expect)
 - device auth: per-device access token (Option A) or X.509 once mTLS arrives
@@ -261,7 +261,7 @@ Firmware-side config example (`/config/mqtt.json`, see
 ```json
 {
   "schema_version": 1,
-  "hostname": "thingsboard.home.arpa",
+  "hostname": "home-assistance.local",
   "port": 8883,
   "tls_mode": "mqtts",
   "ca_path": "/cert/ca.crt",
@@ -275,13 +275,13 @@ Manual endpoint probes (no credentials needed):
 
 ```bash
 # MQTT TLS listener
-openssl s_client -connect thingsboard.home.arpa:8883 \
-  -CAfile server/certs/ca.crt -verify_hostname thingsboard.home.arpa \
+openssl s_client -connect home-assistance.local:8883 \
+  -CAfile server/certs/ca.crt -verify_hostname home-assistance.local \
   < /dev/null
 
 # HTTPS listener through Caddy
-openssl s_client -connect thingsboard.home.arpa:443 \
-  -CAfile server/certs/ca.crt -verify_hostname thingsboard.home.arpa \
+openssl s_client -connect home-assistance.local:443 \
+  -CAfile server/certs/ca.crt -verify_hostname home-assistance.local \
   < /dev/null
 ```
 
@@ -334,7 +334,7 @@ python3 server/scripts/check_endpoints.py --wait 600 # poll until ready
 | Symptom                              | Likely cause / fix                                          |
 |--------------------------------------|--------------------------------------------------------------|
 | `check_endpoints.py` fails on HTTPS  | Caddy not healthy yet; run with `--wait 600`, or trust `certs/ca.crt` in the client |
-| MQTT TLS check fails with cert error | Run `./scripts/gen_dev_tls.sh`; verify `--host` matches the SAN (`thingsboard.home.arpa`) |
+| MQTT TLS check fails with cert error | Run `./scripts/gen_dev_tls.sh`; verify `--host` matches the SAN (`home-assistance.local`) |
 | ThingsBoard crash-loops: `Unable to find resource: /certs/server_key.pem` | `server_key.pem` lost its container-readable mode (the container cannot read host 600 files over the bind mount). Run `chmod 644 certs/server_key.pem`, or re-run `./scripts/gen_dev_tls.sh --regenerate`, then `docker compose restart thingsboard` |
 | Name does not resolve                | Router DNS record or `/etc/hosts` missing (section 1.1)      |
 | `docker compose up` stops at postgres password | `.env` missing/incomplete — run `./scripts/gen_dev_tls.sh` |

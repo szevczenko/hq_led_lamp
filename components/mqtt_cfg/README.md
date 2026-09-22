@@ -9,7 +9,7 @@ existing `mqtt_config` API (never direct sockets).
 ```json
 {
   "schema_version": 1,
-  "hostname": "thingsboard.home.arpa",
+  "hostname": "home-assistance.local",
   "port": 8883,
   "tls_mode": "mqtts",
   "ca_path": "/cert/ca.crt",
@@ -23,7 +23,7 @@ existing `mqtt_config` API (never direct sockets).
 
 - `hostname` — broker DNS name (1..128 chars); **IP literals are rejected** —
   the endpoint is a stable DNS name, never a changing raw IP.
-- `port` — 1..65535 (the development endpoint is `mqtts://thingsboard.home.arpa:8883`).
+- `port` — 1..65535 (the development endpoint is `mqtts://home-assistance.local:8883`).
 - `tls_mode` — only `"mqtts"` is accepted; plaintext MQTT is rejected.
 - `ca_path` — mandatory, under the logical `/cert` directory.
 - `client_cert_path` / `client_key_path` — optional, under `/cert`; both

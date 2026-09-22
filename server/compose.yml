@@ -61,7 +61,7 @@ services:
       MQTT_ENABLED: "true"
       MQTT_BIND_ADDRESS: "127.0.0.1"
       MQTT_BIND_PORT: "1883"
-      # MQTT TLS for the LAN, development CA, SAN DNS:thingsboard.home.arpa.
+      # MQTT TLS for the LAN, development CA, SAN DNS:home-assistance.local.
       MQTT_SSL_ENABLED: "true"
       MQTT_SSL_BIND_ADDRESS: "0.0.0.0"
       MQTT_SSL_BIND_PORT: "${TB_MQTT_TLS_PORT:-8883}"
@@ -73,7 +73,7 @@ services:
       COAP_ENABLED: "false"
       LWM2M_ENABLED: "false"
     ports:
-      - "${TB_MQTT_TLS_PORT:-8883}:8883" # LAN MQTT TLS (thingsboard.home.arpa:8883)
+      - "${TB_MQTT_TLS_PORT:-8883}:8883" # LAN MQTT TLS (home-assistance.local:8883)
       - "127.0.0.1:1883:1883"            # dev-only plaintext MQTT, loopback
       - "127.0.0.1:9090:9090"            # direct admin UI/API, loopback
       - "127.0.0.1:7070:7070"            # edge/transport RPC, loopback

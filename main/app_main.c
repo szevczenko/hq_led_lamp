@@ -119,6 +119,7 @@
  */
 
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #include "esp_log.h"
 
@@ -133,9 +134,60 @@
 #include "network_manager.h"
 #include "osal_task.h"
 #include "sdkconfig.h"
+#include "tb_application.h"
+#include "tb_client.h"
 #include "wifi_provisioning_manager.h"
 
 static const char *TAG = "klc";
+
+static tb_client_t *s_tb_client;
+static atomic_bool s_tb_connected_pending;
+
+static void thingsboard_on_connected(tb_client_t *client, void *user_data)
+{
+    (void)client;
+    (void)user_data;
+    /* Synchronization performs synchronous SUBSCRIBE calls.  Defer it to
+     * the supervisor task so the Mongoose event thread can process SUBACK. */
+    atomic_store_explicit(&s_tb_connected_pending, true,
+                          memory_order_release);
+}
+
+static void thingsboard_on_disconnected(tb_client_t *client,
+                                        tb_client_disconnect_reason_t reason,
+                                        void *user_data)
+{
+    (void)reason;
+    (void)user_data;
+    atomic_store_explicit(&s_tb_connected_pending, false,
+                          memory_order_release);
+    tb_application_on_disconnected(client);
+}
+
+static void thingsboard_on_connect_failure(
+    tb_client_t *client, tb_client_connect_failure_reason_t reason,
+    void *user_data)
+{
+    (void)reason;
+    (void)user_data;
+    atomic_store_explicit(&s_tb_connected_pending, false,
+                          memory_order_release);
+    tb_application_on_disconnected(client);
+}
+
+static void service_thingsboard_connection(void)
+{
+    if (!atomic_exchange_explicit(&s_tb_connected_pending, false,
+                                  memory_order_acq_rel))
+    {
+        return;
+    }
+
+    if (s_tb_client != NULL && tb_client_is_connected(s_tb_client))
+    {
+        tb_application_on_connected(s_tb_client);
+    }
+}
 
 /** @brief Supervisor cadence: the watchdog feed interval. */
 #define APP_SUPERVISE_PERIOD_MS 50u
@@ -571,9 +623,58 @@ static bool load_device_identity(void)
  */
 static bool load_configuration(void)
 {
-    return load_product_configuration() &&
-           load_broker_tls_configuration() &&
-           load_device_identity();
+    if (!load_product_configuration() ||
+        !load_device_identity() ||
+        !load_broker_tls_configuration())
+    {
+        return false;
+    }
+
+    const char *token = NULL;
+    const char *client_id = NULL;
+    if (device_identity_token(&token) != DEVICE_IDENTITY_OK ||
+        device_identity_client_id(&client_id) != DEVICE_IDENTITY_OK ||
+        token == NULL || client_id == NULL || token[0] == '\0' ||
+        client_id[0] == '\0')
+    {
+        ESP_LOGE(TAG, "Validated ThingsBoard identity unavailable");
+        return false;
+    }
+
+    tb_client_config_t configured = {
+        .server_url = "mqtts://home-assistance.local:8883",
+        .on_connect = thingsboard_on_connected,
+        .on_disconnect = thingsboard_on_disconnected,
+        .on_connect_failure = thingsboard_on_connect_failure,
+    };
+    (void)snprintf(configured.access_token, sizeof(configured.access_token),
+                   "%s", token);
+    (void)snprintf(configured.client_id, sizeof(configured.client_id),
+                   "%s", client_id);
+    (void)snprintf(configured.device_name, sizeof(configured.device_name),
+                   "%s", client_id);
+
+    if (tb_client_init(&s_tb_client, &configured) != 0)
+    {
+        ESP_LOGE(TAG, "ThingsBoard client initialization failed");
+        return false;
+    }
+
+    const tb_application_config_t application_config = {
+        .client = s_tb_client,
+        .sync_timeout_ms = CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS,
+        .fw_version = "kitchen_led_controller",
+        .hardware = "ESP32",
+    };
+    if (tb_application_init(&application_config) != TB_APPLICATION_OK)
+    {
+        ESP_LOGE(TAG, "ThingsBoard application initialization failed");
+        tb_client_deinit(s_tb_client);
+        s_tb_client = NULL;
+        return false;
+    }
+
+    return true;
 }
 
 /* --------------------------------------------------------------------- */
@@ -645,6 +746,8 @@ static void supervise_iteration(void)
     static bool s_last_exhausted = false;
 
     (void)app_state_poll(); /* feed + drive bounded retries (single owner) */
+
+    service_thingsboard_connection();
 
     /* Provisioning outcome events (TASK-132/133): the platform fallback
      * controller owns the portal, the adapter stores its notifications and
@@ -806,27 +909,20 @@ static void supervise_iteration(void)
         break;
 
     case APP_STATE_SYNC:
-        /* No ThingsBoard desired-state synchronization is wired into the
-         * product yet (TASK-112/113/114 delivered the tb_application module;
-         * the transport glue and the sync gate are integrated by a later
-         * task).  Until then the machine parks at the sync gate: output
-         * off by the fail-off invariant and the watchdog fed.  The next
-         * task calls tb_application_poll() here and delivers
-         * APP_EVENT_SYNC_COMPLETE (owner APP_OWNER_THINGSBOARD) once
-         * tb_application_is_synchronized() turns true. */
-        if (report_entry)
+        tb_application_poll(s_tb_client);
+        if (tb_application_is_synchronized(s_tb_client))
         {
-            ESP_LOGW(TAG, "Sync gate: no ThingsBoard client wired yet; "
-                          "output off, watchdog fed");
+            (void)app_state_deliver(APP_EVENT_SYNC_COMPLETE,
+                                    APP_OWNER_THINGSBOARD);
+        }
+        else if (report_entry)
+        {
+            ESP_LOGI(TAG, "ThingsBoard state synchronization in progress");
         }
         break;
 
     case APP_STATE_ONLINE:
-        /* All gates passed.  ThingsBoard owns the lamp state and the
-         * telemetry loop from here (later task); the supervisor keeps the
-         * watchdog fed and converts a Wi-Fi loss into the machine's
-         * DISCONNECTED event within one cadence (the adapter already
-         * forced the output off synchronously). */
+        tb_application_poll(s_tb_client);
         if (!network_manager_is_connected())
         {
             (void)app_state_deliver(APP_EVENT_DISCONNECTED,

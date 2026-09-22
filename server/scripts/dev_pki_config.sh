@@ -19,9 +19,9 @@ KLC_SERVER_DIR="$(dirname "$KLC_SCRIPT_DIR")"
 
 # --- Documented endpoint identity -------------------------------------------
 # The LAN name the development server certificate MUST carry in its DNS SAN.
-# Public ACME cannot validate private home.arpa names (RFC 8375 reserved
-# home-network domain), so the development CA signs for this name directly.
-KLC_DEV_DNS_NAME="thingsboard.home.arpa"
+# Public ACME cannot validate private LAN names, so the development CA signs
+# for this name directly.
+KLC_DEV_DNS_NAME="home-assistance.local"
 
 # --- Certificate profile (documented in server/PKI.md) ----------------------
 KLC_CA_RSA_BITS=4096          # dev root CA key size
@@ -43,7 +43,7 @@ dev_cert_dir() {
 # Resolution order:
 #   1. an explicit name passed to the phase script,
 #   2. TB_DNS_NAME from server/.env,
-#   3. the documented default (thingsboard.home.arpa).
+#   3. the documented default (home-assistance.local).
 # The server certificate is REQUIRED to carry exactly this name in its DNS SAN.
 dev_dns_name() {
     local explicit="${1:-}"

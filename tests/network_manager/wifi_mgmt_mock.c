@@ -331,6 +331,12 @@ bool wifi_mgmt_connect(void)
   return ok;
 }
 
+bool wifi_mgmt_is_read_data(void)
+{
+  /* Network-manager host tests model a provisioned device by default. */
+  return true;
+}
+
 bool wifi_mgmt_disconnect(void)
 {
   pthread_mutex_lock(&s_mock_lock);

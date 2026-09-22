@@ -18,6 +18,11 @@ include(${HQ_REPO_ROOT}/cmake/configure.cmake)
 include(${HQ_REPO_ROOT}/cmake/esp.cmake)
 include(${HQ_REPO_ROOT}/cmake/modules.cmake)
 
+add_compile_definitions(
+    WIFI_AP_NAME="Kitchen_LED"
+    WIFI_AP_PASSWORD="SuperTrudne1!-_"
+)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(kitchen_led_controller)
 

@@ -21,5 +21,5 @@
 idf_component_register(
     SRCS "mqtt_cfg.c"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES mongoose osal json lamp_control
+    PRIV_REQUIRES mongoose osal json lamp_control device_identity
 )

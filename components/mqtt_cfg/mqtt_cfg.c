@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "device_identity.h"
 #include "lamp_control.h"
 #include "mqtt_app.h"
 #include "mqtt_config.h"
@@ -1171,6 +1172,29 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
     /* The transport configuration service must be initialized before its
      * setters are used (idempotent; mqtt_app_init() also calls it). */
     mqtt_config_init();
+
+    if (cfg->auth_mode == MQTT_CFG_AUTH_ACCESS_TOKEN)
+    {
+        const char *access_token = NULL;
+
+        if (device_identity_token(&access_token) != DEVICE_IDENTITY_OK ||
+            access_token == NULL || access_token[0] == '\0' ||
+            !mqtt_config_set_string(access_token,
+                                    MQTT_CONFIG_VALUE_USERNAME) ||
+            !mqtt_config_set_string("", MQTT_CONFIG_VALUE_PASSWORD))
+        {
+            mqtt_cfg_unlock();
+            mqtt_cfg_fail_off();
+            return MQTT_CFG_ERR_APPLY;
+        }
+    }
+    else if (!mqtt_config_set_string("", MQTT_CONFIG_VALUE_USERNAME) ||
+             !mqtt_config_set_string("", MQTT_CONFIG_VALUE_PASSWORD))
+    {
+        mqtt_cfg_unlock();
+        mqtt_cfg_fail_off();
+        return MQTT_CFG_ERR_APPLY;
+    }
 
     if (snprintf(address, sizeof(address), MQTT_CFG_ADDRESS_FMT,
                  cfg->hostname, (unsigned)cfg->port) < 0)

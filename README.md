@@ -4,6 +4,9 @@ Single-channel kitchen LED controller firmware for ESP32-WROOM-32D.
 Drives an external MOSFET with PWM. Connects to a local ThingsBoard instance
 over MQTT with verified TLS and a per-device access token.
 
+ThingsBoard setup, shared attributes, dashboard controls, and troubleshooting
+are documented in [docs/THINGSBOARD_USER_MANUAL.md](docs/THINGSBOARD_USER_MANUAL.md).
+
 ## Prerequisites
 
 - [ESP-IDF v5.5.4](https://github.com/espressif/esp-idf/releases/tag/v5.5.4)

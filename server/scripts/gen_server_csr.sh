@@ -4,7 +4,7 @@
 #
 # The CSR is created for the documented LAN endpoint only. Its DNS SAN names
 # exactly the endpoint resolved by dev_pki_config.sh (default
-# thingsboard.home.arpa; override with --dns-name or TB_DNS_NAME in
+# home-assistance.local; override with --dns-name or TB_DNS_NAME in
 # server/.env). gen_server_cert.sh refuses to sign a CSR that carries any
 # other name, so the documented SAN requirement is enforced end to end.
 #

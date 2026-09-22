@@ -35,7 +35,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / "server" / "scripts"
-DEFAULT_HOST = "thingsboard.home.arpa"
+DEFAULT_HOST = "home-assistance.local"
 WRONG_HOST = "kdc-other.example.com"
 
 GEN_CA = SCRIPTS / "gen_dev_ca.sh"

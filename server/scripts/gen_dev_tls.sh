@@ -19,7 +19,7 @@
 #   server/scripts/gen_dev_ca.sh        development root CA (ca.key/ca.crt)
 #   server/scripts/gen_server_csr.sh    server key + CSR (server.key/server.csr)
 #   server/scripts/gen_server_cert.sh   sign the CSR (server.crt, SAN required)
-# The certificate is REQUIRED to carry SAN DNS:thingsboard.home.arpa.
+# The certificate is REQUIRED to carry SAN DNS:home-assistance.local.
 #
 # Usage:
 #   server/scripts/gen_dev_tls.sh                  # idempotent setup

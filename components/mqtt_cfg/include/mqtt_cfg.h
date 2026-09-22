@@ -55,7 +55,7 @@
  *
  *     {
  *       "schema_version": 1,
- *       "hostname": "thingsboard.home.arpa",
+ *       "hostname": "home-assistance.local",
  *       "port": 8883,
  *       "tls_mode": "mqtts",
  *       "ca_path": "/cert/ca.crt",

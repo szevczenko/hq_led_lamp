@@ -445,13 +445,10 @@ int network_manager_start(const network_callbacks_t *callbacks)
         return NETWORK_ERR_START_FAILED;
     }
 
-    /* Explicit connect request.  The manager also auto-connects when it
-     * loaded persisted credentials; requesting here keeps the product
-     * behavior independent of that internal detail.  A synchronously
-     * rejected request is a startup failure: the same rollback/error path
-     * applies, plus the disconnect-class transition (fail-off first, then
-     * the application is informed) while the callbacks are still armed. */
-    if (!wifi_mgmt_connect())
+    /* Only request station connection when init loaded saved credentials.
+     * A fresh device must remain idle here so the provisioning controller can
+     * own the AP without a concurrent empty-SSID station attempt. */
+    if (wifi_mgmt_is_read_data() && !wifi_mgmt_connect())
     {
         osal_log_error("[net] Wi-Fi connect request rejected");
 

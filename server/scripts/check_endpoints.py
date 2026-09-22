@@ -4,7 +4,7 @@
 Verifies, without any API key, device token, or login:
 
   1. HTTPS (port 443): TLS handshake validates the server chain against
-     server/certs/ca.crt and the hostname thingsboard.home.arpa, then an
+      server/certs/ca.crt and the hostname home-assistance.local, then an
      HTTP GET / must answer 2xx/3xx (ThingsBoard login page through Caddy).
   2. MQTT TLS (port 8883): TLS handshake validated the same way, then an
      anonymous MQTT 3.1.1 CONNECT must be answered with a CONNACK. Any
@@ -16,7 +16,7 @@ Usage:
 
 Options:
   --host NAME      hostname to verify in the certificates
-                   (default: TB_DNS_NAME from server/.env, else thingsboard.home.arpa)
+                   (default: TB_DNS_NAME from server/.env, else home-assistance.local)
   --ip ADDR        address to connect to while still verifying --host
                    (default: resolve --host via DNS; use for /etc/hosts or
                    loopback smoke tests, e.g. --ip 127.0.0.1)
@@ -72,7 +72,7 @@ def load_env_defaults() -> dict:
 def parse_args() -> argparse.Namespace:
     env = load_env_defaults()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default=env.get("TB_DNS_NAME", "thingsboard.home.arpa"))
+    parser.add_argument("--host", default=env.get("TB_DNS_NAME", "home-assistance.local"))
     parser.add_argument("--ip", default=None, help="connect address override (see docstring)")
     parser.add_argument("--https-port", type=int, default=int(env.get("TB_HTTPS_PORT", "443")))
     parser.add_argument("--mqtt-port", type=int, default=int(env.get("TB_MQTT_TLS_PORT", "8883")))

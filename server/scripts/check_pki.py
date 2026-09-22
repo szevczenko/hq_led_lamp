@@ -36,7 +36,7 @@ Options:
                       (default: server/certs)
   --host NAME         documented endpoint hostname to verify
                       (default: TB_DNS_NAME from server/.env, else
-                      thingsboard.home.arpa)
+                      home-assistance.local)
   --ca PATH           CA certificate to verify against (default: <cert-dir>/ca.crt)
   --server-cert PATH  server certificate under test (default: <cert-dir>/server.crt)
   --unknown-ca PATH   unrelated CA to prove unknown-CA failure with
@@ -56,7 +56,7 @@ from pathlib import Path
 
 SERVER_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CERT_DIR = SERVER_DIR / "certs"
-DEFAULT_HOST = "thingsboard.home.arpa"
+DEFAULT_HOST = "home-assistance.local"
 ENV_FILE = SERVER_DIR / ".env"
 
 # Documented development lifetime policy (must match dev_pki_config.sh).
