@@ -136,12 +136,15 @@
 #include "sdkconfig.h"
 #include "tb_application.h"
 #include "tb_client.h"
+#include "tb_provisioning.h"
 #include "wifi_provisioning_manager.h"
 
 static const char *TAG = "klc";
 
 static tb_client_t *s_tb_client;
 static atomic_bool s_tb_connected_pending;
+static bool s_tb_needs_provisioning;
+static tb_provisioning_config_t s_provisioning_config;
 
 static void thingsboard_on_connected(tb_client_t *client, void *user_data)
 {
@@ -613,6 +616,49 @@ static bool load_device_identity(void)
     return true;
 }
 
+static bool initialize_thingsboard_client(const char *access_token,
+                                          const char *client_id,
+                                          const char *device_name)
+{
+    tb_client_config_t configured = {
+        .server_url = "mqtts://home-assistance.local:8883",
+        .on_connect = thingsboard_on_connected,
+        .on_disconnect = thingsboard_on_disconnected,
+        .on_connect_failure = thingsboard_on_connect_failure,
+    };
+
+    (void)snprintf(configured.access_token, sizeof(configured.access_token),
+                   "%s", access_token);
+    (void)snprintf(configured.client_id, sizeof(configured.client_id),
+                   "%s", client_id);
+    (void)snprintf(configured.device_name, sizeof(configured.device_name),
+                   "%s", device_name);
+
+    const int client_status = tb_client_init(&s_tb_client, &configured);
+    if (client_status != 0) {
+        ESP_LOGE(TAG, "ThingsBoard client initialization failed: %d",
+                 client_status);
+        return false;
+    }
+
+    const tb_application_config_t application_config = {
+        .client = s_tb_client,
+        .sync_timeout_ms = CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS,
+        .fw_version = "kitchen_led_controller",
+        .hardware = "ESP32",
+    };
+    tb_application_status_t application_status =
+        tb_application_init(&application_config);
+    if (application_status != TB_APPLICATION_OK) {
+        ESP_LOGE(TAG, "ThingsBoard application initialization failed: %d",
+                 (int)application_status);
+        tb_client_deinit(s_tb_client);
+        s_tb_client = NULL;
+        return false;
+    }
+    return true;
+}
+
 /**
  * @brief Run the ordered configuration gates.
  *
@@ -623,11 +669,38 @@ static bool load_device_identity(void)
  */
 static bool load_configuration(void)
 {
-    if (!load_product_configuration() ||
-        !load_device_identity() ||
-        !load_broker_tls_configuration())
+    if (!load_product_configuration())
     {
         return false;
+    }
+
+    s_tb_needs_provisioning = false;
+    device_identity_status_t identity_status = device_identity_load();
+    if (identity_status != DEVICE_IDENTITY_OK) {
+        tb_provisioning_status_t provisioning_status =
+            tb_provisioning_load(&s_provisioning_config);
+        if (provisioning_status != TB_PROVISIONING_OK) {
+            ESP_LOGE(TAG, "Device identity and bootstrap provisioning are "
+                          "unavailable (%s)",
+                     tb_provisioning_status_name(provisioning_status));
+            return false;
+        }
+        s_tb_needs_provisioning = true;
+        if (!initialize_thingsboard_client("provision",
+                           "tb_provision_bootstrap",
+                           s_provisioning_config.device_name)) {
+            ESP_LOGE(TAG, "Bootstrap ThingsBoard client initialization failed");
+            return false;
+        }
+        if (!load_broker_tls_configuration()) {
+            tb_application_deinit();
+            tb_client_deinit(s_tb_client);
+            s_tb_client = NULL;
+            return false;
+        }
+        ESP_LOGI(TAG, "Bootstrap provisioning required before ThingsBoard "
+                      "session initialization");
+        return true;
     }
 
     const char *token = NULL;
@@ -641,39 +714,15 @@ static bool load_configuration(void)
         return false;
     }
 
-    tb_client_config_t configured = {
-        .server_url = "mqtts://home-assistance.local:8883",
-        .on_connect = thingsboard_on_connected,
-        .on_disconnect = thingsboard_on_disconnected,
-        .on_connect_failure = thingsboard_on_connect_failure,
-    };
-    (void)snprintf(configured.access_token, sizeof(configured.access_token),
-                   "%s", token);
-    (void)snprintf(configured.client_id, sizeof(configured.client_id),
-                   "%s", client_id);
-    (void)snprintf(configured.device_name, sizeof(configured.device_name),
-                   "%s", client_id);
-
-    if (tb_client_init(&s_tb_client, &configured) != 0)
-    {
-        ESP_LOGE(TAG, "ThingsBoard client initialization failed");
+    if (!initialize_thingsboard_client(token, client_id, client_id)) {
         return false;
     }
-
-    const tb_application_config_t application_config = {
-        .client = s_tb_client,
-        .sync_timeout_ms = CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS,
-        .fw_version = "kitchen_led_controller",
-        .hardware = "ESP32",
-    };
-    if (tb_application_init(&application_config) != TB_APPLICATION_OK)
-    {
-        ESP_LOGE(TAG, "ThingsBoard application initialization failed");
+    if (!load_broker_tls_configuration()) {
+        tb_application_deinit();
         tb_client_deinit(s_tb_client);
         s_tb_client = NULL;
         return false;
     }
-
     return true;
 }
 
@@ -699,8 +748,8 @@ static bool load_configuration(void)
  */
 static bool connect_verified_tls(void)
 {
-    if (!device_identity_is_loaded())
-    {
+    if (s_tb_needs_provisioning) {
+    } else if (!device_identity_is_loaded()) {
         ESP_LOGE(TAG, "Device identity unavailable; ThingsBoard session "
                       "blocked, output stays off");
         return false;
@@ -709,15 +758,50 @@ static bool connect_verified_tls(void)
     mqtt_cfg_status_t status = mqtt_cfg_connect(NETWORK_CONNECT_TIMEOUT_MS);
     if (status != MQTT_CFG_OK)
     {
+        if (s_tb_needs_provisioning && s_tb_client != NULL) {
+            tb_application_deinit();
+            tb_client_disconnect(s_tb_client);
+            tb_client_deinit(s_tb_client);
+            s_tb_client = NULL;
+        }
         ESP_LOGE(TAG, "Verified TLS connect failed: %d (%s)"
                       " (output forced off, ThingsBoard session blocked)",
                  (int)status, mqtt_cfg_status_name(status));
         return false;
     }
 
-    /* Valid identity + verified TLS: the ThingsBoard session is now allowed
-     * to initialize (TASK-112) with the access token from the token
-     * provider and the stable client ID. */
+    if (s_tb_needs_provisioning) {
+        tb_provisioning_status_t provisioning_status = tb_provisioning_enroll(
+            s_tb_client, &s_provisioning_config,
+            CONFIG_KLC_THINGSBOARD_PROVISION_TIMEOUT_MS);
+        if (provisioning_status != TB_PROVISIONING_OK ||
+            !load_device_identity()) {
+            ESP_LOGE(TAG, "Bootstrap ThingsBoard enrollment failed: %s",
+                     tb_provisioning_status_name(provisioning_status));
+            return false;
+        }
+        const char *token = NULL;
+        const char *client_id = NULL;
+        if (device_identity_token(&token) != DEVICE_IDENTITY_OK ||
+            device_identity_client_id(&client_id) != DEVICE_IDENTITY_OK ||
+            tb_client_update_credentials(s_tb_client, token, client_id) != 0) {
+            return false;
+        }
+        if (!load_broker_tls_configuration()) {
+            tb_application_deinit();
+            tb_client_deinit(s_tb_client);
+            s_tb_client = NULL;
+            return false;
+        }
+        s_tb_needs_provisioning = false;
+        status = mqtt_cfg_connect(NETWORK_CONNECT_TIMEOUT_MS);
+        if (status != MQTT_CFG_OK) {
+            return false;
+        }
+    }
+
+    /* Valid identity + verified TLS: the ThingsBoard session is now ready
+     * to enter the existing synchronization state. */
     ESP_LOGI(TAG, "Verified TLS connected with validated identity; "
                   "ThingsBoard session initialization allowed");
     return true;

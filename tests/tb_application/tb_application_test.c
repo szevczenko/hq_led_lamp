@@ -543,6 +543,22 @@ static void test_valid_sync_via_attribute_response(void)
     TEST_ASSERT_EQUAL_UINT(80u, state.brightness_percent);
 }
 
+static void test_empty_sync_response_uses_safe_initial_state(void)
+{
+    uint32_t request_id;
+
+    app_init(10000u);
+    connect_client();
+    request_id = last_request_id();
+
+    deliver_response(request_id, "{}");
+
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_FALSE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_applied_brightness());
+}
+
 /**
  * Valid path via a shared-attribute update: a complete valid update applies
  * immediately and the (older) attribute response that arrives afterwards is
@@ -1735,6 +1751,7 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_valid_sync_via_attribute_response);
+    RUN_TEST(test_empty_sync_response_uses_safe_initial_state);
     RUN_TEST(test_valid_sync_via_shared_update);
     RUN_TEST(test_partial_data_rejected_then_retry);
     RUN_TEST(test_invalid_power_type_rejected);

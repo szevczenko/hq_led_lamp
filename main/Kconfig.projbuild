@@ -82,6 +82,17 @@ menu "Kitchen LED Controller"
             state after MQTT connection. If the timeout expires the output
             stays off and the device retries after reconnect backoff.
 
+    config KLC_THINGSBOARD_PROVISION_TIMEOUT_MS
+        int "ThingsBoard bootstrap provisioning response timeout (ms)"
+        range 5000 60000
+        default 20000
+        help
+            Maximum time to wait for the ThingsBoard /provision/response
+            reply during one-shot bootstrap enrollment. This is a separate,
+            longer budget than KLC_THINGSBOARD_SYNC_TIMEOUT_MS because
+            first-time device creation can take longer than routine state
+            sync round trips.
+
     config KLC_TELEMETRY_PERIOD_MS
         int "Periodic telemetry publish interval (ms)"
         range 1000 3600000

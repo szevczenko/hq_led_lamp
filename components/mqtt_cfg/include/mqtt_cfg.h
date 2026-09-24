@@ -174,7 +174,8 @@ typedef enum mqtt_cfg_tls_mode {
 typedef enum mqtt_cfg_auth_mode {
     MQTT_CFG_AUTH_NONE         = 0, /**< No client authentication (server TLS only). */
     MQTT_CFG_AUTH_ACCESS_TOKEN = 1, /**< ThingsBoard access token (MQTT username). */
-    MQTT_CFG_AUTH_MTLS         = 2  /**< Device certificate + private key. */
+    MQTT_CFG_AUTH_MTLS         = 2, /**< Device certificate + private key. */
+    MQTT_CFG_AUTH_RUNTIME      = 3  /**< Credentials supplied by the client runtime. */
 } mqtt_cfg_auth_mode_t;
 
 /**

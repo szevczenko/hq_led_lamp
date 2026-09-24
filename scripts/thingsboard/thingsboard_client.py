@@ -97,6 +97,9 @@ class ThingsBoardRestClient:
     def get_device_credentials(self, device_id: str) -> dict:
         return self._call("GET", f"/api/device/{device_id}/credentials")
 
+    def delete_device(self, device_id: str) -> None:
+        self._call("DELETE", f"/api/device/{device_id}")
+
     def save_attributes(self, device_id: str, scope: str, attributes: Mapping[str, Any]) -> None:
         self._call(
             "POST",

@@ -612,6 +612,40 @@ done:
     return ok;
 }
 
+static bool tb_app_parse_initial_state(const char *json, lamp_state_t *out)
+{
+    cJSON *root;
+    cJSON *attrs;
+
+    if ((json == NULL) || (out == NULL))
+    {
+        return false;
+    }
+
+    root = cJSON_Parse(json);
+    if (!cJSON_IsObject(root))
+    {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    attrs = cJSON_GetObjectItemCaseSensitive(root, "shared");
+    if (attrs == NULL)
+    {
+        attrs = root;
+    }
+    if (!cJSON_IsObject(attrs) || (cJSON_GetArraySize(attrs) != 0))
+    {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    out->power = false;
+    out->brightness_percent = 0U;
+    cJSON_Delete(root);
+    return true;
+}
+
 /* --------------------------------------------------------------------- */
 /* Transport callbacks (run on the transport thread)                      */
 /* --------------------------------------------------------------------- */
@@ -773,7 +807,8 @@ static void tb_app_on_attr_response(tb_request_result_t result,
         return;
     }
 
-    if (!tb_app_parse_state(json_response, &desired))
+    if (!tb_app_parse_state(json_response, &desired) &&
+        !tb_app_parse_initial_state(json_response, &desired))
     {
         osal_log_warning("[tb_app] rejected invalid/partial sync response");
         tb_app_fail_attempt();

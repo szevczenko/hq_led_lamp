@@ -52,6 +52,7 @@ __pycache__/
 
 # Manufacturing secrets
 /config/manufacturing.json
+/device/device_credentials.sh
 
 # ThingsBoard test-harness device tokens — never commit
 /scripts/thingsboard/*.token

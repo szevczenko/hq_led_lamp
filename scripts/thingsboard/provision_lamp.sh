@@ -7,6 +7,7 @@ PORT="${TB_DEVICE_PORT:-/dev/ttyUSB1}"
 PAYLOAD_DIR="${TB_PAYLOAD_DIR:-/tmp/klc_payload}"
 IMAGE_PATH="${TB_STORAGE_IMAGE:-/tmp/klc_storage.littlefs}"
 LITTLEFS_TOOL="${TB_LITTLEFS_TOOL:-/tmp/littlefs_util}"
+SKIP_FLASH="${TB_SKIP_FLASH:-0}"
 
 if fuser -s "$PORT"; then
   echo "Serial port $PORT is busy. Stop idf.py monitor before provisioning." >&2
@@ -18,17 +19,23 @@ if [[ ! -f "$PROJECT_DIR/server/certs/ca.crt" ]]; then
   exit 1
 fi
 
-read -rsp "ThingsBoard device access token: " TB_DEVICE_TOKEN
-printf '\n'
-if [[ -z "$TB_DEVICE_TOKEN" ]]; then
-  echo "The device access token cannot be empty." >&2
+required_vars=(WIFI_SSID WIFI_PASSWORD TB_DEVICE_NAME TB_PROVISION_DEVICE_KEY TB_PROVISION_DEVICE_SECRET)
+for variable in "${required_vars[@]}"; do
+  if [[ -z "${!variable:-}" ]]; then
+    echo "$variable must be exported before provisioning." >&2
+    echo "Example: source device/device_credentials.sh" >&2
+    exit 1
+  fi
+done
+
+if [[ "$TB_DEVICE_NAME" =~ [[:cntrl:]] || "$TB_PROVISION_DEVICE_KEY" =~ [[:space:]] ||
+      "$TB_PROVISION_DEVICE_SECRET" =~ [[:space:]] || "$WIFI_SSID" =~ [[:cntrl:]] ||
+      "$WIFI_PASSWORD" =~ [[:cntrl:]] ]]; then
+  echo "Provisioning values must not contain invalid whitespace/control characters." >&2
+  echo "Example: source device/device_credentials.sh" >&2
   exit 1
 fi
-if [[ "$TB_DEVICE_TOKEN" =~ [[:space:]] ]]; then
-  echo "The device access token must not contain whitespace." >&2
-  exit 1
-fi
-export TB_DEVICE_TOKEN
+export WIFI_SSID WIFI_PASSWORD TB_DEVICE_NAME TB_PROVISION_DEVICE_KEY TB_PROVISION_DEVICE_SECRET
 
 rm -rf "$PAYLOAD_DIR" "$IMAGE_PATH"
 mkdir -p "$PAYLOAD_DIR/config" "$PAYLOAD_DIR/cert"
@@ -41,15 +48,19 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-token = os.environ["TB_DEVICE_TOKEN"]
+device_name = os.environ["TB_DEVICE_NAME"]
+provision_key = os.environ["TB_PROVISION_DEVICE_KEY"]
+provision_secret = os.environ["TB_PROVISION_DEVICE_SECRET"]
+wifi_ssid = os.environ["WIFI_SSID"]
+wifi_password = os.environ["WIFI_PASSWORD"]
 
 documents = {
     "config/device.json": {
         "schema_version": 1,
         "product": "HQ Lamp",
         "hardware_revision": "B",
-        "serial": "klc-kitchen-01",
-        "thingsboard_name": "klc-kitchen-01",
+        "serial": device_name,
+        "thingsboard_name": device_name,
     },
     "config/manufacturing.json": {
         "schema_version": 1,
@@ -62,14 +73,21 @@ documents = {
         "port": 8883,
         "tls_mode": "mqtts",
         "ca_path": "/cert/ca.crt",
-        "client_id": "klc-kitchen-01",
-        "auth_mode": "access_token",
+        "client_id": device_name,
+        "auth_mode": "runtime",
         "skip_verify": False,
     },
-    "config/identity.json": {
+      "config/provisioning.json": {
         "schema_version": 1,
-        "client_id": "klc-kitchen-01",
-        "access_token": token,
+        "device_name": device_name,
+        "provision_device_key": provision_key,
+        "provision_device_secret": provision_secret,
+    },
+    "wifi_ap.json": {
+      "last_use": 0,
+      "credentials": [
+        {"nb": 0, "ssid": wifi_ssid, "password": wifi_password},
+      ],
     },
 }
 
@@ -93,10 +111,13 @@ gcc -std=gnu99 -o "$LITTLEFS_TOOL" littlefs_util.c \
 "$LITTLEFS_TOOL" --tree / --in "$IMAGE_PATH"
 
 cd "$PROJECT_DIR"
-python3 -m esptool --chip esp32 -p "$PORT" -b 460800 \
-  --before default_reset --after hard_reset write_flash \
-  --flash_mode dio --flash_size 4MB --flash_freq 40m \
-  0x3A0000 "$IMAGE_PATH"
+if [[ "$SKIP_FLASH" == "1" ]]; then
+  echo "LittleFS image generated at $IMAGE_PATH (flash skipped)."
+else
+  python3 -m esptool --chip esp32 -p "$PORT" -b 460800 \
+    --before default_reset --after hard_reset write_flash \
+    --flash_mode dio --flash_size 4MB --flash_freq 40m \
+    0x3A0000 "$IMAGE_PATH"
+fi
 
-unset TB_DEVICE_TOKEN
-echo "Lamp storage provisioned at 0x3A0000. Reset the device and monitor its MQTT connection."
+echo "Lamp bootstrap storage provisioned at 0x3A0000. Reset the device and monitor enrollment."

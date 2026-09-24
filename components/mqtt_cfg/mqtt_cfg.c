@@ -696,6 +696,10 @@ static mqtt_cfg_status_t mqtt_cfg_parse_root(const cJSON *root,
     {
         out->auth_mode = MQTT_CFG_AUTH_ACCESS_TOKEN;
     }
+    else if (strcmp(item->valuestring, "runtime") == 0)
+    {
+        out->auth_mode = MQTT_CFG_AUTH_RUNTIME;
+    }
     else if (strcmp(item->valuestring, "mtls") == 0)
     {
         out->auth_mode = MQTT_CFG_AUTH_MTLS;
@@ -744,7 +748,8 @@ static mqtt_cfg_status_t mqtt_cfg_validate_fields(const mqtt_cfg_t *cfg)
     }
     if (cfg->auth_mode != MQTT_CFG_AUTH_NONE &&
         cfg->auth_mode != MQTT_CFG_AUTH_ACCESS_TOKEN &&
-        cfg->auth_mode != MQTT_CFG_AUTH_MTLS)
+        cfg->auth_mode != MQTT_CFG_AUTH_MTLS &&
+        cfg->auth_mode != MQTT_CFG_AUTH_RUNTIME)
     {
         /* A hand-built struct with an unknown authentication enum is a
          * malformed configuration (the parse path already maps unknown
@@ -1188,8 +1193,10 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
             return MQTT_CFG_ERR_APPLY;
         }
     }
-    else if (!mqtt_config_set_string("", MQTT_CONFIG_VALUE_USERNAME) ||
+    else if (cfg->auth_mode == MQTT_CFG_AUTH_NONE &&
+             (!mqtt_config_set_string("", MQTT_CONFIG_VALUE_USERNAME) ||
              !mqtt_config_set_string("", MQTT_CONFIG_VALUE_PASSWORD))
+    )
     {
         mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
