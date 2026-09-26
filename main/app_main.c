@@ -121,7 +121,10 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 
+#include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
 
 #include "app_config.h"
 #include "app_state.h"
@@ -133,6 +136,7 @@
 #include "mqtt_cfg.h"
 #include "network_manager.h"
 #include "osal_task.h"
+#include "ota_manager.h"
 #include "sdkconfig.h"
 #include "tb_application.h"
 #include "tb_client.h"
@@ -164,6 +168,7 @@ static void thingsboard_on_disconnected(tb_client_t *client,
     (void)user_data;
     atomic_store_explicit(&s_tb_connected_pending, false,
                           memory_order_release);
+    ota_manager_on_disconnected();
     tb_application_on_disconnected(client);
 }
 
@@ -189,6 +194,76 @@ static void service_thingsboard_connection(void)
     if (s_tb_client != NULL && tb_client_is_connected(s_tb_client))
     {
         tb_application_on_connected(s_tb_client);
+        if (!s_tb_needs_provisioning)
+        {
+            ota_manager_on_connected(s_tb_client);
+        }
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* ThingsBoard OTA glue                                                   */
+/* --------------------------------------------------------------------- */
+
+static void ota_on_event(ota_manager_event_t event, void *ctx)
+{
+    (void)ctx;
+    switch (event)
+    {
+    case OTA_MANAGER_EVENT_STARTED:
+        tb_application_set_output_suspended(true);
+        (void)app_state_deliver(APP_EVENT_OTA_BEGIN, APP_OWNER_OTA);
+        break;
+    case OTA_MANAGER_EVENT_FAILED:
+        (void)app_state_deliver(APP_EVENT_OTA_FAILED, APP_OWNER_OTA);
+        tb_application_set_output_suspended(false);
+        break;
+    case OTA_MANAGER_EVENT_RESTARTING:
+        (void)app_state_deliver(APP_EVENT_OTA_END, APP_OWNER_OTA);
+        break;
+    default:
+        break;
+    }
+}
+
+static void ota_on_indicator(bool on, void *ctx)
+{
+    const lamp_state_t indicator = {
+        .power = on,
+        .brightness_percent = CONFIG_KLC_OTA_BLINK_BRIGHTNESS_PERCENT,
+    };
+
+    (void)ctx;
+    /* app_state latched fail-off on OTA entry; the indicator owns the
+     * output until the OTA ends. */
+    (void)lamp_control_release_fail_off();
+    (void)lamp_control_apply_state(&indicator, NULL);
+}
+
+static void ota_restart(void)
+{
+    esp_restart();
+}
+
+static void init_ota_manager(const esp_app_desc_t *app)
+{
+    const ota_manager_config_t cfg = {
+        .title = app->project_name,
+        .version = app->version,
+        .chunk_size = CONFIG_KLC_OTA_CHUNK_SIZE,
+        .chunk_timeout_ms = CONFIG_KLC_OTA_CHUNK_TIMEOUT_MS,
+        .chunk_retries = CONFIG_KLC_OTA_CHUNK_RETRIES,
+        .check_period_ms = CONFIG_KLC_OTA_CHECK_PERIOD_MS,
+        .reboot_delay_ms = CONFIG_KLC_OTA_REBOOT_DELAY_MS,
+        .blink_period_ms = CONFIG_KLC_OTA_BLINK_PERIOD_MS,
+        .on_event = ota_on_event,
+        .on_indicator = ota_on_indicator,
+        .restart = ota_restart,
+    };
+
+    if (ota_manager_init(&cfg) != OTA_MANAGER_OK)
+    {
+        ESP_LOGE(TAG, "OTA manager init failed; firmware updates disabled");
     }
 }
 
@@ -644,7 +719,6 @@ static bool initialize_thingsboard_client(const char *access_token,
     const tb_application_config_t application_config = {
         .client = s_tb_client,
         .sync_timeout_ms = CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS,
-        .fw_version = "kitchen_led_controller",
         .hardware = "ESP32",
     };
     tb_application_status_t application_status =
@@ -998,6 +1072,7 @@ static void supervise_iteration(void)
         {
             (void)app_state_deliver(APP_EVENT_SYNC_COMPLETE,
                                     APP_OWNER_THINGSBOARD);
+            ota_manager_request_check();
         }
         else if (report_entry)
         {
@@ -1007,6 +1082,15 @@ static void supervise_iteration(void)
 
     case APP_STATE_ONLINE:
         tb_application_poll(s_tb_client);
+        if (tb_application_take_firmware_hint())
+        {
+            ota_manager_request_check();
+        }
+        ota_manager_poll();
+        if (app_state_current() != APP_STATE_ONLINE)
+        {
+            break;
+        }
         if (!network_manager_is_connected())
         {
             (void)app_state_deliver(APP_EVENT_DISCONNECTED,
@@ -1051,13 +1135,15 @@ static void supervise_iteration(void)
 
     case APP_STATE_OTA:
         /* OTA entry: end the provisioning flow immediately so no portal
-         * listener or pending grace timer is left during the update.
-         * (OTA itself is driven by a later task's OTA supervisor.)  The
+         * listener or pending grace timer is left during the update.  The
          * adapter stop is idempotent; this runs once per OTA entry. */
         if (report_entry)
         {
             stop_provisioning();
         }
+        tb_application_poll(s_tb_client);
+        (void)tb_application_take_firmware_hint();
+        ota_manager_poll();
         break;
 
     case APP_STATE_BOOT:
@@ -1091,8 +1177,16 @@ void app_main(void)
         .observer            = NULL,
     };
 
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+
     ESP_LOGI(TAG, "Kitchen LED Controller starting (state-machine "
                   "supervisor)");
+    ESP_LOGI(TAG, "Firmware: title=%s version=%s partition=%s built=%s %s "
+                  "idf=%s",
+             app->project_name, app->version,
+             (running != NULL) ? running->label : "?",
+             app->date, app->time, app->idf_ver);
 
     if (!init_lamp_output())
     {
@@ -1114,6 +1208,8 @@ void app_main(void)
         ESP_LOGE(TAG, "State machine start failed; running with output off");
         return;
     }
+
+    init_ota_manager(app);
 
     /* Wi-Fi onboarding (TASK-109) and the provisioning infrastructure
      * (TASK-127) are brought up lazily by the NETWORK gate on its first

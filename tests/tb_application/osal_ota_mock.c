@@ -62,6 +62,13 @@ osal_status_t osal_ota_finish(bool apply_update)
     return OSAL_ERR_NOT_IMPLEMENTED;
 }
 
+osal_status_t osal_ota_finish_ex(bool apply_update, bool restart)
+{
+    (void)apply_update;
+    (void)restart;
+    return OSAL_ERR_NOT_IMPLEMENTED;
+}
+
 osal_status_t osal_ota_abort(void)
 {
     return OSAL_ERR_NOT_IMPLEMENTED;

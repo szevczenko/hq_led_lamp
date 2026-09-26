@@ -68,7 +68,7 @@
  *   - getState reports the desired and applied state.
  *
  * Coverage per the TASK-114 definition of done (telemetry & health):
- *   - one full documented seven-field record is published on connect, on
+ *   - one full documented six-field record is published on connect, on
  *     every successful state change (sync response, shared update, RPC set)
  *     and periodically while connected,
  *   - `pwm_duty` reports the APPLIED duty derived from the applied state
@@ -81,7 +81,7 @@
  *     reconnect publishes exactly the connect record),
  *   - secrets never leak: hostile config values (paths, JSON quotes,
  *     certificates, tokens) are sanitized to the safe charset, the payload
- *     carries exactly the seven documented fields and the JSON stays valid.
+ *     carries exactly the six documented fields and the JSON stays valid.
  */
 
 #include <stdio.h>
@@ -166,7 +166,6 @@ static tb_application_config_t make_app_config(uint32_t sync_timeout_ms,
      * periodic interval for deterministic rate-limit tests and the
      * documented identity strings carried in every record. */
     cfg.telemetry_period_ms = 30000u;
-    cfg.fw_version = "0.0.0-test";
     cfg.hardware = "esp32-wroom-32d";
     return cfg;
 }
@@ -1491,8 +1490,6 @@ static void telemetry_assert_shape(const cJSON *telemetry)
         cJSON_GetObjectItemCaseSensitive(telemetry, "pwm_duty");
     cJSON *state_item =
         cJSON_GetObjectItemCaseSensitive(telemetry, "connection_state");
-    cJSON *fw_item =
-        cJSON_GetObjectItemCaseSensitive(telemetry, "fw_version");
     cJSON *hw_item =
         cJSON_GetObjectItemCaseSensitive(telemetry, "hardware");
     cJSON *uptime_item =
@@ -1504,14 +1501,13 @@ static void telemetry_assert_shape(const cJSON *telemetry)
     TEST_ASSERT_TRUE(cJSON_IsString(state_item));
     TEST_ASSERT_EQUAL_STRING(TB_APPLICATION_CONNECTION_STATE_ONLINE,
                              state_item->valuestring);
-    TEST_ASSERT_TRUE(cJSON_IsString(fw_item));
     TEST_ASSERT_TRUE(cJSON_IsString(hw_item));
     TEST_ASSERT_TRUE(cJSON_IsNumber(uptime_item));
     TEST_ASSERT_TRUE(uptime_item->valueint >= 0);
 }
 
 /**
- * @brief Assert a telemetry record contains EXACTLY the seven documented
+ * @brief Assert a telemetry record contains EXACTLY the six documented
  *        fields — no extra members, so no secret/credential/diagnostic dump
  *        can ever be smuggled into the payload.
  */
@@ -1519,7 +1515,7 @@ static void telemetry_assert_only_documented_fields(const cJSON *telemetry)
 {
     static const char *keys[] = {
         "power", "brightness", "pwm_duty", "connection_state",
-        "fw_version", "hardware", "uptime_ms",
+        "hardware", "uptime_ms",
     };
     const cJSON *child;
     int count = 0;
@@ -1529,8 +1525,8 @@ static void telemetry_assert_only_documented_fields(const cJSON *telemetry)
     {
         count++;
     }
-    TEST_ASSERT_EQUAL_INT(7, count);
-    for (int i = 0; i < 7; i++)
+    TEST_ASSERT_EQUAL_INT(6, count);
+    for (int i = 0; i < 6; i++)
     {
         TEST_ASSERT_NOT_NULL(
             cJSON_GetObjectItemCaseSensitive(telemetry, keys[i]));
@@ -1566,8 +1562,7 @@ static void test_telemetry_published_on_connect(void)
                                   telemetry, "brightness")->valueint);
     TEST_ASSERT_EQUAL_INT(0, cJSON_GetObjectItemCaseSensitive(
                                   telemetry, "pwm_duty")->valueint);
-    TEST_ASSERT_EQUAL_STRING("0.0.0-test",
-        cJSON_GetObjectItemCaseSensitive(telemetry, "fw_version")->valuestring);
+    TEST_ASSERT_NULL(cJSON_GetObjectItemCaseSensitive(telemetry, "fw_version"));
     TEST_ASSERT_EQUAL_STRING("esp32-wroom-32d",
         cJSON_GetObjectItemCaseSensitive(telemetry, "hardware")->valuestring);
     uptime = cJSON_GetObjectItemCaseSensitive(telemetry, "uptime_ms");
@@ -1699,20 +1694,18 @@ static void test_telemetry_suppressed_while_disconnected(void)
  * Secrecy: hostile configuration values (path fragments, JSON quotes,
  * certificate text and token-like strings) never reach a published record
  * and never break the JSON framing.  The module keeps only the safe-charset
- * prefix of each value, and the payload carries exactly the seven documented
+ * prefix of each value, and the payload carries exactly the six documented
  * fields.
  */
 static void test_telemetry_excludes_secrets_and_unsafe_strings(void)
 {
     tb_application_config_t cfg;
     cJSON *telemetry;
-    cJSON *fw_item;
     cJSON *hw_item;
     const char *raw;
 
     cfg = make_app_config(10000u, 5u);
-    cfg.fw_version = "1.2.3\"/config/identity.json";
-    cfg.hardware = "esp32-wroom-32d BEGIN CERTIFICATE";
+    cfg.hardware = "esp32-wroom-32d\"/config/identity.json BEGIN CERTIFICATE";
     app_init_cfg(&cfg);
     connect_client();
 
@@ -1727,20 +1720,120 @@ static void test_telemetry_excludes_secrets_and_unsafe_strings(void)
     TEST_ASSERT_NULL(strstr(raw, "test_token"));
     TEST_ASSERT_NULL(strstr(raw, "password"));
 
-    /* The payload still parses as one clean object with exactly the seven
+    /* The payload still parses as one clean object with exactly the six
      * documented fields and only the safe-charset prefixes of the values. */
     telemetry = cJSON_Parse(raw);
     TEST_ASSERT_NOT_NULL(telemetry);
     telemetry_assert_shape(telemetry);
     telemetry_assert_only_documented_fields(telemetry);
 
-    fw_item = cJSON_GetObjectItemCaseSensitive(telemetry, "fw_version");
-    TEST_ASSERT_TRUE(cJSON_IsString(fw_item));
-    TEST_ASSERT_EQUAL_STRING("1.2.3", fw_item->valuestring);
     hw_item = cJSON_GetObjectItemCaseSensitive(telemetry, "hardware");
     TEST_ASSERT_TRUE(cJSON_IsString(hw_item));
     TEST_ASSERT_EQUAL_STRING("esp32-wroom-32d", hw_item->valuestring);
     cJSON_Delete(telemetry);
+}
+
+/* --------------------------------------------------------------------- */
+/* Firmware update cooperation                                            */
+/* --------------------------------------------------------------------- */
+
+static void test_firmware_only_update_does_not_fail_lamp(void)
+{
+    rpc_sync_state(true, 70u);
+    const unsigned force_before = lamp_mock_force_inactive_calls();
+    const unsigned apply_before = lamp_mock_apply_calls();
+    TEST_ASSERT_FALSE(tb_application_take_firmware_hint());
+
+    deliver_update("{\"fw_title\":\"kitchen_led_controller\","
+                   "\"fw_version\":\"1.0.1\",\"fw_tag\":\"x\","
+                   "\"fw_size\":123,\"fw_checksum_algorithm\":\"SHA256\","
+                   "\"fw_checksum\":\"00\"}");
+
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_UINT(force_before, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL_UINT(apply_before, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(tb_application_take_firmware_hint());
+    TEST_ASSERT_FALSE(tb_application_take_firmware_hint());
+
+    /* Unassignment deletes the keys: still no lamp impact. */
+    deliver_update("{\"deleted\":[\"fw_title\",\"fw_version\"]}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_UINT(force_before, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_TRUE(tb_application_take_firmware_hint());
+
+    /* Software keys are ignored without a firmware hint. */
+    deliver_update("{\"sw_title\":\"x\"}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_FALSE(tb_application_take_firmware_hint());
+}
+
+static void test_firmware_keys_during_initial_sync_ignored(void)
+{
+    app_init(10000u);
+    connect_client();
+    const uint32_t request_id = last_request_id();
+
+    deliver_update("{\"fw_version\":\"1.0.1\"}");
+    TEST_ASSERT_EQUAL_INT(1, request_publish_count());
+    TEST_ASSERT_TRUE(tb_application_take_firmware_hint());
+
+    deliver_response(request_id,
+                     "{\"shared\":{\"power\":true,\"brightness\":40}}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_UINT(40u, lamp_mock_applied_brightness());
+}
+
+static void test_mixed_update_applies_lamp_state_and_raises_hint(void)
+{
+    rpc_sync_state(false, 10u);
+
+    deliver_update("{\"power\":true,\"brightness\":90,\"fw_version\":\"2\"}");
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(90u, lamp_mock_applied_brightness());
+    TEST_ASSERT_TRUE(tb_application_take_firmware_hint());
+}
+
+static void test_output_suspended_stores_then_resume_reapplies(void)
+{
+    tb_application_desired_state_t state;
+    bool has_state = false;
+
+    rpc_sync_state(true, 30u);
+    tb_application_set_output_suspended(true);
+    const unsigned apply_before = lamp_mock_apply_calls();
+
+    deliver_update("{\"power\":true,\"brightness\":55}");
+    deliver_rpc(7u, "setBrightness", "{\"brightness\":65}");
+    TEST_ASSERT_EQUAL_UINT(apply_before, lamp_mock_apply_calls());
+    cJSON *response = rpc_assert_success(7u);
+    cJSON_Delete(response);
+    TEST_ASSERT_EQUAL(TB_APPLICATION_OK,
+                      tb_application_get_desired_state(s_client, &has_state,
+                                                       &state));
+    TEST_ASSERT_TRUE(has_state);
+    TEST_ASSERT_EQUAL_UINT(65u, state.brightness_percent);
+
+    tb_application_set_output_suspended(false);
+    TEST_ASSERT_EQUAL_UINT(apply_before + 1u, lamp_mock_apply_calls());
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(65u, lamp_mock_applied_brightness());
+
+    /* Idempotent resume: no second apply. */
+    tb_application_set_output_suspended(false);
+    TEST_ASSERT_EQUAL_UINT(apply_before + 1u, lamp_mock_apply_calls());
+}
+
+static void test_resume_without_sync_forces_off(void)
+{
+    app_init(10000u);
+    connect_client();
+    tb_application_set_output_suspended(true);
+    const unsigned force_before = lamp_mock_force_inactive_calls();
+
+    tb_application_set_output_suspended(false);
+    TEST_ASSERT_EQUAL_UINT(force_before + 1u,
+                           lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_apply_calls());
 }
 
 /* --------------------------------------------------------------------- */
@@ -1750,6 +1843,11 @@ static void test_telemetry_excludes_secrets_and_unsafe_strings(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_firmware_only_update_does_not_fail_lamp);
+    RUN_TEST(test_firmware_keys_during_initial_sync_ignored);
+    RUN_TEST(test_mixed_update_applies_lamp_state_and_raises_hint);
+    RUN_TEST(test_output_suspended_stores_then_resume_reapplies);
+    RUN_TEST(test_resume_without_sync_forces_off);
     RUN_TEST(test_valid_sync_via_attribute_response);
     RUN_TEST(test_empty_sync_response_uses_safe_initial_state);
     RUN_TEST(test_valid_sync_via_shared_update);

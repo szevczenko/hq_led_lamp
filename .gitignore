@@ -49,6 +49,7 @@ __pycache__/
 /server/.env
 /server/certs/
 /server/data/
+/caredentials/**
 
 # Manufacturing secrets
 /config/manufacturing.json

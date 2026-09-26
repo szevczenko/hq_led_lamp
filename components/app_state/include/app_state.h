@@ -33,8 +33,10 @@
  *                                 here; output is off; bounded retry only.
  *   - #APP_STATE_FATAL          — unrecoverable; output off; only an external
  *                                 reset returns to boot.
- *   - #APP_STATE_OTA            — OTA in progress; output off; completion
- *                                 returns to boot; failure degrades.
+ *   - #APP_STATE_OTA            — OTA in progress; output forced off on
+ *                                 entry (the OTA owner may then drive a
+ *                                 progress blink); completion returns to
+ *                                 boot; failure returns online.
  *
  * The only legal path into #APP_STATE_ONLINE requires a successful
  * filesystem, configuration, Wi-Fi (including Wi-Fi provisioning when no
@@ -79,7 +81,7 @@
  *   ONLINE      -- OTA_BEGIN (OTA) ---------------> OTA
  *   SAFE_OFF    -- OTA_BEGIN (OTA) ---------------> OTA
  *   OTA         -- OTA_END (OTA) -----------------> BOOT
- *   OTA         -- OTA_FAILED (OTA) --------------> SAFE_OFF      (degraded)
+ *   OTA         -- OTA_FAILED (OTA) --------------> ONLINE        (desired state re-applied by the owner)
  *   SAFE_OFF    -- RETRY_DUE (TIMER, internal) ---> NETWORK|TLS|SYNC (see Retry)
  *   any         -- RESET (EXTERNAL) --------------> BOOT
  *   any         -- FATAL (any owner) -------------> FATAL
@@ -110,7 +112,7 @@
  * because the provisioning adapter is owned by the network stage — TLS or
  * sync) so a stage that already passed is never repeated
  * (no filesystem re-mount storms, no Wi-Fi re-scan storms).  Non-retryable
- * failures (FS_FAIL, CONFIG_FAIL, OTA_FAILED) park degraded WITHOUT an
+ * failures (FS_FAIL, CONFIG_FAIL) park degraded WITHOUT an
  * automatic retry: recovery is an explicit RESET/provisioning/OTA action.
  * When the retry budget is exhausted the machine parks in SAFE_OFF and
  * stays silent — no retry storm is possible.  The budget resets to zero on
@@ -277,7 +279,7 @@ typedef enum app_state {
     APP_STATE_ONLINE,            /**< All gates passed; output may be active. */
     APP_STATE_SAFE_OFF,          /**< Degraded; output off; bounded retry only. */
     APP_STATE_FATAL,             /**< Unrecoverable; output off; reset required. */
-    APP_STATE_OTA                /**< OTA in progress; output off. */
+    APP_STATE_OTA                /**< OTA in progress; output off on entry. */
 } app_state_t;
 
 /* --------------------------------------------------------------------- */
@@ -306,7 +308,7 @@ typedef enum app_state_event {
     APP_EVENT_INVALID_STATE,     /**< Invalid/partial desired-state data (retryable). */
     APP_EVENT_OTA_BEGIN,         /**< OTA session starts (online update). */
     APP_EVENT_OTA_END,           /**< OTA completed; reboot back to boot. */
-    APP_EVENT_OTA_FAILED,        /**< OTA aborted/failed (degraded). */
+    APP_EVENT_OTA_FAILED,        /**< OTA aborted/failed (back online). */
     APP_EVENT_RETRY_DUE,         /**< internal: backoff retry fires (poll). */
     APP_EVENT_RESET,             /**< External reset/provisioning/recovery. */
     APP_EVENT_FATAL              /**< Unrecoverable failure report. */

@@ -364,13 +364,13 @@ static void test_every_non_online_state_forbids_output(void)
         app_state_deliver(APP_EVENT_SYNC_COMPLETE, APP_OWNER_THINGSBOARD));
     TEST_ASSERT_TRUE(app_state_is_online());
 
-    /* OTA and SAFE_OFF and FATAL forbid output. */
+    /* OTA and FATAL forbid output; a failed OTA returns online. */
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_OTA_BEGIN, APP_OWNER_OTA));
     TEST_ASSERT_FALSE(app_state_is_online());
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_OTA_FAILED, APP_OWNER_OTA));
-    TEST_ASSERT_FALSE(app_state_is_online());
+    TEST_ASSERT_TRUE(app_state_is_online());
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_FATAL, APP_OWNER_BOOTSTRAP));
     TEST_ASSERT_FALSE(app_state_is_online());
@@ -1569,19 +1569,20 @@ static void test_ota_entry_and_exit_to_boot_then_online(void)
     TEST_ASSERT_EQUAL(session_after_ota + 1u, app_state_session());
 }
 
-static void test_ota_failure_degrades_to_safe_off(void)
+static void test_ota_failure_returns_online(void)
 {
     drive_online();
+    uint32_t session_online = app_state_session();
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_OTA_BEGIN, APP_OWNER_OTA));
     TEST_ASSERT_EQUAL(APP_STATE_OK,
         app_state_deliver(APP_EVENT_OTA_FAILED, APP_OWNER_OTA));
 
-    /* OTA failure is an error path: the output stays off, the device
-     * degrades (no automatic retry of the OTA). */
-    TEST_ASSERT_EQUAL(APP_STATE_SAFE_OFF, app_state_current());
-    TEST_ASSERT_FALSE(app_state_is_online());
-    TEST_ASSERT_EQUAL(7u, lamp_mock_force_inactive_calls());
+    /* No extra fail-off on the way back; no retry is scheduled. */
+    TEST_ASSERT_EQUAL(APP_STATE_ONLINE, app_state_current());
+    TEST_ASSERT_TRUE(app_state_is_online());
+    TEST_ASSERT_EQUAL(6u, lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL(session_online + 2u, app_state_session());
     TEST_ASSERT_FALSE(app_state_retry_pending());
     TEST_ASSERT_FALSE(app_state_retry_exhausted());
 }
@@ -1706,7 +1707,7 @@ int main(void)
 
     /* 7. OTA entry/exit */
     RUN_TEST(test_ota_entry_and_exit_to_boot_then_online);
-    RUN_TEST(test_ota_failure_degrades_to_safe_off);
+    RUN_TEST(test_ota_failure_returns_online);
     RUN_TEST(test_ota_begin_allowed_from_safe_off);
 
     /* 8. Session identity */

@@ -58,7 +58,6 @@ class ThingsBoardFunctionalTests(unittest.TestCase):
             "brightness": 77,
             "pwm_duty": 1965,
             "connection_state": "online",
-            "fw_version": "0.0.0-test",
             "hardware": "esp32-wroom-32d",
             "uptime_ms": 12345,
         }

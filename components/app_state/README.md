@@ -54,8 +54,9 @@ provisioning adapter is owned by the network stage), TLS or sync.  Default
 schedule: 2 s first delay, exponential 2x growth, 30 s cap, at most 5
 retries per recovery episode; the budget resets when `ONLINE` is reached
 again.  Exhaustion parks the machine silently — no retry storm is possible.
-Non-retryable failures (filesystem, configuration, OTA) park degraded until
-an explicit reset/provisioning/OTA action.
+Non-retryable failures (filesystem, configuration) park degraded until
+an explicit reset/provisioning/OTA action.  A failed OTA returns to `ONLINE`
+(the OTA owner re-applies the synchronized desired state).
 
 ## Watchdog
 

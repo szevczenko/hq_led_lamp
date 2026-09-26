@@ -102,6 +102,53 @@ menu "Kitchen LED Controller"
             is also published on connect and on every state change. This value
             is not a credential or token.
 
+    menu "ThingsBoard OTA"
+
+        config KLC_OTA_CHUNK_SIZE
+            int "Firmware chunk size requested from ThingsBoard (bytes)"
+            range 512 16384
+            default 4096
+            help
+                Size of each v2/fw chunk. Larger chunks download faster but
+                need more RAM in the MQTT receive path.
+
+        config KLC_OTA_CHUNK_TIMEOUT_MS
+            int "Chunk response timeout (ms)"
+            range 1000 120000
+            default 10000
+
+        config KLC_OTA_CHUNK_RETRIES
+            int "Chunk re-requests before the update fails"
+            range 1 20
+            default 3
+
+        config KLC_OTA_CHECK_PERIOD_MS
+            int "Periodic firmware check interval (ms, 0 = disabled)"
+            range 0 86400000
+            default 3600000
+            help
+                The device also checks after every ThingsBoard
+                synchronization and whenever fw_* shared attributes change.
+
+        config KLC_OTA_REBOOT_DELAY_MS
+            int "Delay between image activation and restart (ms)"
+            range 500 30000
+            default 2000
+            help
+                Lets the UPDATING telemetry reach ThingsBoard before restart.
+
+        config KLC_OTA_BLINK_PERIOD_MS
+            int "Progress blink half period (ms)"
+            range 100 10000
+            default 1000
+
+        config KLC_OTA_BLINK_BRIGHTNESS_PERCENT
+            int "Progress blink brightness (%)"
+            range 1 100
+            default 100
+
+    endmenu
+
     choice KLC_WIFI_DEFAULT_MODE
         prompt "Default Wi-Fi start mode"
         default KLC_WIFI_DEFAULT_MODE_APSTA

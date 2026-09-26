@@ -17,6 +17,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Mapping, Optional, Sequence
 
 DEFAULT_TIMEOUT_S = 10.0
@@ -34,17 +35,20 @@ def _request(
     headers: Mapping[str, str],
     query: Optional[Mapping[str, Any]] = None,
     body: Any = None,
+    raw_body: Optional[bytes] = None,
+    content_type: Optional[str] = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> Any:
     url = f"{base_url.rstrip('/')}{path}"
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
-    data = json.dumps(body).encode("utf-8") if body is not None else None
+    data = raw_body if raw_body is not None else (
+        json.dumps(body).encode("utf-8") if body is not None else None)
     request = urllib.request.Request(url, data=data, method=method)
     for key, value in headers.items():
         request.add_header(key, value)
     if data is not None:
-        request.add_header("Content-Type", "application/json")
+        request.add_header("Content-Type", content_type or "application/json")
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             raw = response.read()
@@ -69,7 +73,8 @@ class ThingsBoardRestClient:
         self._api_key = api_key
         self._timeout_s = timeout_s
 
-    def _call(self, method: str, path: str, *, query=None, body=None, timeout_s=None) -> Any:
+    def _call(self, method: str, path: str, *, query=None, body=None, timeout_s=None,
+              raw_body=None, content_type=None) -> Any:
         return _request(
             self._base_url,
             method,
@@ -77,6 +82,8 @@ class ThingsBoardRestClient:
             headers={"X-Authorization": f"ApiKey {self._api_key}"},
             query=query,
             body=body,
+            raw_body=raw_body,
+            content_type=content_type,
             timeout_s=timeout_s if timeout_s is not None else self._timeout_s,
         )
 
@@ -123,6 +130,19 @@ class ThingsBoardRestClient:
         )
         return {key: points[0]["value"] for key, points in (series or {}).items() if points}
 
+    def get_latest_timeseries_with_ts(self, device_id: str, keys: Sequence[str]) -> dict:
+        """Returns {key: (ts_ms, value)} for keys that have a latest value."""
+        series = self._call(
+            "GET",
+            f"/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries",
+            query={"keys": ",".join(keys)},
+        )
+        return {
+            key: (int(points[0]["ts"]), points[0]["value"])
+            for key, points in (series or {}).items()
+            if points and points[0].get("value") is not None
+        }
+
     def send_rpc_oneway(self, device_id: str, method: str, params: Mapping[str, Any]) -> None:
         self._call(
             "POST",
@@ -139,6 +159,60 @@ class ThingsBoardRestClient:
             body={"method": method, "params": dict(params), "timeout": timeout_ms},
             timeout_s=(timeout_ms / 1000.0) + 5.0,
         )
+
+    # --- Device profiles / OTA packages -------------------------------
+
+    def get_device_profile(self, profile_id: str) -> dict:
+        return self._call("GET", f"/api/deviceProfile/{profile_id}")
+
+    def save_device_profile(self, profile: Mapping[str, Any]) -> dict:
+        return self._call("POST", "/api/deviceProfile", body=dict(profile))
+
+    def list_devices_by_profile_name(self, profile_name: str, page_size: int = 100) -> list:
+        page = self._call(
+            "GET",
+            "/api/tenant/devices",
+            query={"pageSize": page_size, "page": 0, "type": profile_name},
+        )
+        return (page or {}).get("data", [])
+
+    def list_ota_packages(self, page_size: int = 100) -> list:
+        page = self._call("GET", "/api/otaPackages", query={"pageSize": page_size, "page": 0})
+        return (page or {}).get("data", [])
+
+    def create_ota_package(self, title: str, version: str, device_profile_id: str,
+                           package_type: str = "FIRMWARE") -> dict:
+        return self._call(
+            "POST",
+            "/api/otaPackage",
+            body={
+                "title": title,
+                "version": version,
+                "type": package_type,
+                "deviceProfileId": {"entityType": "DEVICE_PROFILE", "id": device_profile_id},
+                "isURL": False,
+            },
+        )
+
+    def upload_ota_package_data(self, package_id: str, file_name: str, data: bytes,
+                                checksum_algorithm: str = "SHA256") -> dict:
+        boundary = f"----klc{uuid.uuid4().hex}"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        return self._call(
+            "POST",
+            f"/api/otaPackage/{package_id}",
+            query={"checksumAlgorithm": checksum_algorithm},
+            raw_body=body,
+            content_type=f"multipart/form-data; boundary={boundary}",
+            timeout_s=120.0,
+        )
+
+    def delete_ota_package(self, package_id: str) -> None:
+        self._call("DELETE", f"/api/otaPackage/{package_id}")
 
 
 class ThingsBoardDeviceClient:

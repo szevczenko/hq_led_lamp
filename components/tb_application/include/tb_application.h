@@ -152,10 +152,12 @@
  *       "brightness": <0..100>,       // applied brightness percent
  *       "pwm_duty": <0..10000>,       // applied PWM duty (LAMP_DUTY_SCALE units)
  *       "connection_state": "online",
- *       "fw_version": "<bounded>",    // config::fw_version (safe charset)
  *       "hardware": "<bounded>",      // config::hardware (safe charset)
  *       "uptime_ms": <uint32>         // OSAL monotonic uptime at publish
  *     }
+ *
+ * The firmware identity is reported by the OTA updater as `fw_title` /
+ * `fw_version` telemetry.
  *
  * `pwm_duty` is derived from the state actually applied to the PWM output
  * (lamp_control_get_applied_state()), never from the requested brightness
@@ -166,7 +168,7 @@
  * Secrecy and disconnection:
  *   - telemetry NEVER carries tokens, passwords, provisioning secrets,
  *     certificates, keys, or file paths.  The module only publishes the
- *     seven fields above; the two config strings are truncated to their
+ *     six fields above; the config string is truncated to its
  *     documented bounds and filtered to a conservative `[A-Za-z0-9._+-]`
  *     charset before being copied into module storage, so a misconfigured
  *     value containing `/`, quotes, whitespace or control characters cannot
@@ -261,12 +263,6 @@ typedef struct tb_client tb_client_t;
 #define TB_APPLICATION_TELEMETRY_PERIOD_MAX_MS     3600000u
 
 /**
- * @brief Maximum firmware/build version string length (excluding the NUL
- *        terminator) accepted in configuration and reported in telemetry.
- */
-#define TB_APPLICATION_FW_VERSION_MAX_LEN 32u
-
-/**
  * @brief Maximum hardware-target string length (excluding the NUL
  *        terminator) accepted in configuration and reported in telemetry.
  */
@@ -338,18 +334,11 @@ typedef struct tb_application_config {
      */
     uint32_t     telemetry_period_ms;
     /**
-     * @brief Firmware/build version reported in telemetry as `fw_version`
-     *        (may be NULL/empty).  Copied bounded to
-     *        #TB_APPLICATION_FW_VERSION_MAX_LEN characters and filtered to
-     *        the safe telemetry charset, so it can never smuggle JSON,
-     *        paths or secrets into a publish.
-     */
-    const char  *fw_version;
-    /**
      * @brief Hardware target reported in telemetry as `hardware` (may be
      *        NULL/empty).  Copied bounded to
      *        #TB_APPLICATION_HARDWARE_MAX_LEN characters and filtered to the
-     *        safe telemetry charset, exactly like @p fw_version.
+     *        safe telemetry charset, so it can never smuggle JSON, paths or
+     *        secrets into a publish.
      */
     const char  *hardware;
 } tb_application_config_t;
@@ -488,6 +477,31 @@ bool tb_application_is_synchronized(tb_client_t *client);
 tb_application_status_t tb_application_get_desired_state(
     tb_client_t *client, bool *has_state,
     tb_application_desired_state_t *out);
+
+/* --------------------------------------------------------------------- */
+/* Firmware update cooperation                                            */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Consume the "firmware attributes changed" hint.
+ *
+ * Shared-attribute updates that only carry ThingsBoard OTA keys (`fw_*`,
+ * `sw_*`, or their deletion) never touch the lamp state; a `fw_*` change
+ * raises this hint so the firmware updater can re-check.
+ *
+ * @return true once per raised hint (cleared by the call).
+ */
+bool tb_application_take_firmware_hint(void);
+
+/**
+ * @brief Suspend/resume applying desired states to the lamp output.
+ *
+ * While suspended (OTA progress indication owns the output), shared
+ * updates and RPC sets are validated and stored but not applied.  Resume
+ * re-applies the stored state when the session is synchronized, otherwise
+ * it forces the output inactive.
+ */
+void tb_application_set_output_suspended(bool suspended);
 
 #ifdef __cplusplus
 }

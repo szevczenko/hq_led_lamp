@@ -35,7 +35,7 @@
  *     response, publishes telemetry only after a successful change and
  *     returns structured success/error JSON.  RPC never writes shared
  *     attributes (transient control channel),
- *   - telemetry and health reporting (TASK-114): the documented seven-field
+ *   - telemetry and health reporting (TASK-114): the documented six-field
  *     record is published on connect, on every successful state change
  *     (synchronization apply, shared update apply, valid RPC set) and
  *     periodically while connected.  Records are serialized into a bounded
@@ -138,9 +138,12 @@ typedef struct tb_app_module {
 
     /* Telemetry / health reporting (TASK-114). */
     uint32_t           telemetry_period_ms; /**< Bounded periodic interval (0 = default). */
-    char               fw_version[TB_APPLICATION_FW_VERSION_MAX_LEN + 1u]; /**< Safe-charset copy. */
     char               hardware[TB_APPLICATION_HARDWARE_MAX_LEN + 1u];     /**< Safe-charset copy. */
     uint32_t           last_telemetry_ms;  /**< Last telemetry publish time (rate limit). */
+
+    /* Firmware update cooperation. */
+    bool               firmware_hint;      /**< fw_* shared attributes changed. */
+    bool               output_suspended;   /**< OTA indicator owns the output. */
 } tb_app_module_t;
 
 static tb_app_module_t s_tb;
@@ -245,7 +248,7 @@ static void tb_app_copy_telemetry_string(const char *src, char *dst,
 /**
  * @brief Publish the documented health telemetry record (TASK-114).
  *
- * Called with the module lock held.  Serializes the seven documented fields
+ * Called with the module lock held.  Serializes the six documented fields
  * into a bounded stack buffer and hands the payload to the platform
  * telemetry transport:
  *
@@ -256,7 +259,7 @@ static void tb_app_copy_telemetry_string(const char *src, char *dst,
  *   - `connection_state` is the documented "online" literal — publication is
  *     suppressed entirely while disconnected, so this record can only ever
  *     be published online,
- *   - `fw_version` / `hardware` are the safe-charset, bounded config copies,
+ *   - `hardware` is the safe-charset, bounded config copy,
  *   - `uptime_ms` is the OSAL monotonic clock (ms since boot).
  *
  * Suppression contract: while the transport is disconnected (or before
@@ -299,13 +302,12 @@ static void tb_app_publish_telemetry(void)
 
     n = snprintf(buf, sizeof(buf),
                  "{\"power\":%s,\"brightness\":%u,\"pwm_duty\":%u,"
-                 "\"connection_state\":\"%s\",\"fw_version\":\"%s\","
+                 "\"connection_state\":\"%s\","
                  "\"hardware\":\"%s\",\"uptime_ms\":%u}",
                  applied.power ? "true" : "false",
                  (unsigned)applied.brightness_percent,
                  (unsigned)duty,
                  TB_APPLICATION_CONNECTION_STATE_ONLINE,
-                 s_tb.fw_version,
                  s_tb.hardware,
                  (unsigned)osal_task_get_time_ms());
     if ((n < 0) || ((size_t)n >= sizeof(buf)))
@@ -354,6 +356,17 @@ static void tb_app_fail_off(void)
 static lamp_status_t tb_app_apply_state(const lamp_state_t *desired)
 {
     lamp_status_t status;
+
+    if (s_tb.output_suspended)
+    {
+        s_tb.applied = *desired;
+        s_tb.has_applied = true;
+        osal_log_info("[tb_app] desired state stored while output is "
+                      "suspended: power=%s brightness=%u",
+                      desired->power ? "on" : "off",
+                      (unsigned)desired->brightness_percent);
+        return LAMP_OK;
+    }
 
     (void)lamp_control_release_fail_off();
     status = lamp_control_apply_state(desired, NULL);
@@ -612,6 +625,81 @@ done:
     return ok;
 }
 
+static bool tb_app_is_ota_key(const char *key, bool *is_firmware)
+{
+    if ((key != NULL) && (strncmp(key, "fw_", 3) == 0))
+    {
+        *is_firmware = true;
+        return true;
+    }
+    return (key != NULL) && (strncmp(key, "sw_", 3) == 0);
+}
+
+/**
+ * @brief Does a shared update carry ONLY ThingsBoard OTA keys?
+ *
+ * Called with the lock held.  ThingsBoard pushes `fw_*`/`sw_*` (and
+ * `{"deleted":[...]}` on unassignment) through the same shared-attribute
+ * channel; those must never fail the lamp synchronization.  Any `fw_*`
+ * key raises the firmware hint, even when lamp keys are present too.
+ */
+static bool tb_app_is_ota_only_update(const char *json)
+{
+    cJSON *root;
+    cJSON *attrs;
+    cJSON *item;
+    bool is_firmware = false;
+    bool only_ota = true;
+    bool any = false;
+
+    if (strlen(json) > TB_APPLICATION_MAX_PAYLOAD_BYTES)
+    {
+        return false;
+    }
+    root = cJSON_Parse(json);
+    if (!cJSON_IsObject(root))
+    {
+        cJSON_Delete(root);
+        return false;
+    }
+    attrs = cJSON_GetObjectItemCaseSensitive(root, "shared");
+    if (!cJSON_IsObject(attrs))
+    {
+        attrs = root;
+    }
+
+    cJSON_ArrayForEach(item, attrs)
+    {
+        any = true;
+        if ((item->string != NULL) && (strcmp(item->string, "deleted") == 0) &&
+            cJSON_IsArray(item))
+        {
+            const cJSON *deleted;
+            cJSON_ArrayForEach(deleted, item)
+            {
+                if (!cJSON_IsString(deleted) ||
+                    !tb_app_is_ota_key(deleted->valuestring, &is_firmware))
+                {
+                    only_ota = false;
+                }
+            }
+        }
+        else if (!tb_app_is_ota_key(item->string, &is_firmware))
+        {
+            only_ota = false;
+        }
+    }
+    cJSON_Delete(root);
+
+    if (is_firmware)
+    {
+        s_tb.firmware_hint = true;
+        osal_log_info("[tb_app] firmware attributes changed; firmware "
+                      "check requested");
+    }
+    return any && only_ota;
+}
+
 static bool tb_app_parse_initial_state(const char *json, lamp_state_t *out)
 {
     cJSON *root;
@@ -694,6 +782,12 @@ static void tb_app_on_shared_update(const char *json_payload,
     if (json_payload == NULL)
     {
         tb_app_fail_attempt();
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+
+    if (tb_app_is_ota_only_update(json_payload))
+    {
         osal_mutex_give(s_tb.lock);
         return;
     }
@@ -979,6 +1073,14 @@ static void tb_app_rpc_apply_and_respond(uint32_t request_id,
     lamp_applied_state_t applied;
 
     memset(&applied, 0, sizeof(applied));
+    if (s_tb.output_suspended)
+    {
+        s_tb.applied = *desired;
+        s_tb.has_applied = true;
+        (void)lamp_control_get_applied_state(&applied);
+        tb_app_rpc_respond_success(request_id, desired, &applied);
+        return;
+    }
     if (lamp_control_apply_state(desired, &applied) != LAMP_OK)
     {
         osal_log_warning("[tb_app] RPC apply failed; hardware failure "
@@ -1421,8 +1523,6 @@ tb_application_status_t tb_application_init(
                          : config->telemetry_period_ms,
                      TB_APPLICATION_TELEMETRY_PERIOD_MIN_MS,
                      TB_APPLICATION_TELEMETRY_PERIOD_MAX_MS);
-    tb_app_copy_telemetry_string(config->fw_version, s_tb.fw_version,
-                                 sizeof(s_tb.fw_version));
     tb_app_copy_telemetry_string(config->hardware, s_tb.hardware,
                                  sizeof(s_tb.hardware));
 
@@ -1439,6 +1539,8 @@ tb_application_status_t tb_application_init(
     memset(&s_tb.applied, 0, sizeof(s_tb.applied));
     s_tb.has_applied = false;
     s_tb.last_telemetry_ms = 0u;
+    s_tb.firmware_hint = false;
+    s_tb.output_suspended = false;
 
     s_tb.initialized = true;
     osal_mutex_give(s_tb.lock);
@@ -1642,4 +1744,57 @@ tb_application_status_t tb_application_get_desired_state(
     osal_mutex_give(s_tb.lock);
 
     return status;
+}
+
+bool tb_application_take_firmware_hint(void)
+{
+    bool hint;
+
+    if (s_tb.lock == NULL)
+    {
+        return false;
+    }
+    osal_mutex_take(s_tb.lock);
+    hint = s_tb.initialized && s_tb.firmware_hint;
+    s_tb.firmware_hint = false;
+    osal_mutex_give(s_tb.lock);
+    return hint;
+}
+
+void tb_application_set_output_suspended(bool suspended)
+{
+    if (s_tb.lock == NULL)
+    {
+        return;
+    }
+    osal_mutex_take(s_tb.lock);
+    if (!s_tb.initialized || (s_tb.output_suspended == suspended))
+    {
+        osal_mutex_give(s_tb.lock);
+        return;
+    }
+
+    s_tb.output_suspended = suspended;
+    if (suspended)
+    {
+        osal_log_info("[tb_app] lamp output suspended (OTA indicator)");
+    }
+    else if ((s_tb.state == TB_APP_STATE_SYNCED) && s_tb.has_applied &&
+             tb_app_is_connected())
+    {
+        osal_log_info("[tb_app] lamp output resumed; re-applying desired "
+                      "state");
+        const lamp_state_t desired = s_tb.applied;
+        if (tb_app_apply_state(&desired) != LAMP_OK)
+        {
+            tb_app_fail_attempt();
+        }
+    }
+    else
+    {
+        osal_log_info("[tb_app] lamp output resumed without a synchronized "
+                      "state; output stays off");
+        tb_app_fail_off();
+    }
+    osal_mutex_give(s_tb.lock);
 }

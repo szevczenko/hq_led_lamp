@@ -101,7 +101,7 @@ static const app_state_transition_t APP_STATE_TRANSITIONS[] = {
     { APP_STATE_ONLINE,        APP_EVENT_OTA_BEGIN,         APP_STATE_OTA,           APP_OWNER_OTA,           APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          true  },
     { APP_STATE_SAFE_OFF,      APP_EVENT_OTA_BEGIN,         APP_STATE_OTA,           APP_OWNER_OTA,           APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          true  },
     { APP_STATE_OTA,           APP_EVENT_OTA_END,           APP_STATE_BOOT,          APP_OWNER_OTA,           APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          true  },
-    { APP_STATE_OTA,           APP_EVENT_OTA_FAILED,        APP_STATE_SAFE_OFF,      APP_OWNER_OTA,           APP_FAILURE_DEGRADED,  APP_STATE_NONE_SAFE,          true  },
+    { APP_STATE_OTA,           APP_EVENT_OTA_FAILED,        APP_STATE_ONLINE,        APP_OWNER_OTA,           APP_FAILURE_RETRYABLE, APP_STATE_NONE_SAFE,          true  },
 };
 
 /** @brief Resolved module configuration (immutable after init). */

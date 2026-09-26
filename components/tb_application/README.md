@@ -39,7 +39,6 @@ publishes one bounded JSON record:
   "brightness": 0,
   "pwm_duty": 0,
   "connection_state": "online",
-  "fw_version": "1.0.0",
   "hardware": "esp32-wroom-32d",
   "uptime_ms": 123456
 }
@@ -51,8 +50,8 @@ publishes one bounded JSON record:
 - records are serialized into a bounded stack buffer
   (`TB_APPLICATION_TELEMETRY_MAX_BYTES`); an overflow suppresses the publish
   instead of emitting truncated JSON,
-- `fw_version` / `hardware` come from the configuration, are truncated to
-  their documented bounds and filtered to the safe charset
+- `hardware` comes from the configuration, is truncated to
+  its documented bound and filtered to the safe charset
   `[A-Za-z0-9._+-]` before storage, so paths, quotes, whitespace, tokens and
   certificate payloads can never reach the wire,
 - publication is suppressed at the source while disconnected — nothing is
@@ -102,7 +101,6 @@ tb_application_config_t cfg = {
     /* retry_initial/retry_max/max_retries optional; 0 = bounded defaults */
     /* TASK-114 telemetry & health reporting: */
     .telemetry_period_ms = CONFIG_KLC_TELEMETRY_PERIOD_MS, /* 0 = default */
-    .fw_version = ESP_APP_DESC_PROJECT_VERSION,            /* e.g. "1.0.0" */
     .hardware = "esp32-wroom-32d",                         /* board target */
 };
 tb_application_init(&cfg);
