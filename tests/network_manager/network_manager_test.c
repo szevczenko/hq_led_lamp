@@ -138,11 +138,8 @@ static void test_connect_starts_wifi_and_reports_connected(void)
     TEST_ASSERT_TRUE(network_manager_is_connected() == false);
 
     counters = wifi_mgmt_mock_get_counters();
-    /* The default build requests AP+STA (T_WIFI_TYPE_CLI_SER): the mode
-     * policy (KLC_WIFI_DEFAULT_MODE) is a product decision, and the mode is
-     * requested BEFORE the manager is started (ordering, not just
-     * occurrence). */
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    /* A saved credential retries in STA mode without advertising a dead AP. */
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
     TEST_ASSERT_TRUE(counters.type_before_start);
     TEST_ASSERT_TRUE(counters.set_type_calls >= 1U);
     TEST_ASSERT_TRUE(counters.init_calls >= 1U);
@@ -197,15 +194,9 @@ static void test_wait_connected_blocks_until_connected(void)
 /* 2. Mode policy (TASK-129/TASK-130)                                     */
 /* --------------------------------------------------------------------- */
 
-/* The Wi-Fi start mode is a product policy decision owned by the adapter
- * (KLC_WIFI_DEFAULT_MODE, main/Kconfig.projbuild): the default build must
- * request AP+STA (T_WIFI_TYPE_CLI_SER) and it must do so BEFORE
- * wifi_mgmt_start() runs — the mode is selected inside the onboarding
- * transaction (set_wifi_type -> init -> subscribe -> start), not applied
- * afterwards.  The mock records this ordering explicitly
- * (type_before_start), so the assertion is order-based, not
- * occurrence-based. */
-static void test_default_build_requests_apsta_mode_before_start(void)
+/* Saved credentials use STA-only; fresh devices use AP+STA. Both modes are
+ * selected after init loaded storage and before wifi_mgmt_start(). */
+static void test_saved_credentials_request_sta_mode_before_start(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
     wifi_mock_counters_t counters;
@@ -213,19 +204,33 @@ static void test_default_build_requests_apsta_mode_before_start(void)
     TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
 
     counters = wifi_mgmt_mock_get_counters();
-    /* The default build requests AP+STA: the provisioning portal's soft-AP
-     * must be available when no usable credentials exist yet. */
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
     /* Ordering: the Kconfig-selected mode was requested BEFORE the manager
      * was started (not just requested at all). */
     TEST_ASSERT_TRUE(counters.type_before_start);
-    /* The default onboarding path selects the mode exactly once, before any
-     * other platform call. */
+    /* The onboarding path selects the mode exactly once, before start(). */
     TEST_ASSERT_EQUAL_UINT(1U, counters.set_type_calls);
     TEST_ASSERT_EQUAL_UINT(1U, counters.init_calls);
     TEST_ASSERT_EQUAL_UINT(1U, counters.start_calls);
     TEST_ASSERT_EQUAL_UINT(1U, counters.connect_calls);
     TEST_ASSERT_TRUE(counters.start_before_connect);
+}
+
+static void test_fresh_device_requests_apsta_mode_before_start(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    wifi_mock_counters_t counters;
+
+    wifi_mgmt_mock_set_saved_credentials(false);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+
+    counters = wifi_mgmt_mock_get_counters();
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_TRUE(counters.type_before_start);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.set_type_calls);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.init_calls);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.start_calls);
+    TEST_ASSERT_EQUAL_UINT(0U, counters.connect_calls);
 }
 
 /* The platform behaves differently in AP+STA mode (the AP interface is up
@@ -234,12 +239,13 @@ static void test_default_build_requests_apsta_mode_before_start(void)
  * mode, on_connected/on_disconnected fire exactly as before the mode policy
  * — CONNECTED delivers on_connected(context) once per event, DISCONNECTED
  * forces the lamp output inactive BEFORE on_disconnected(context) runs. */
-static void test_callbacks_fire_in_apsta_mode_as_before(void)
+static void test_callbacks_fire_in_fresh_apsta_mode_as_before(void)
 {
     static int ctx;
     network_callbacks_t cb = make_callbacks(&ctx);
     wifi_mock_counters_t counters;
 
+    wifi_mgmt_mock_set_saved_credentials(false);
     TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
 
     /* The session onboarded in AP+STA mode. */
@@ -279,26 +285,26 @@ static void test_callbacks_fire_in_apsta_mode_as_before(void)
 /* Start/stop transaction race regression for the mode policy (TASK-130): a
  * concurrent stop() that completes while a start() is still inside its
  * platform transaction must still disarm the session REGARDLESS of the
- * Kconfig-selected mode — with the default AP+STA request active, no
+ * Kconfig-selected mode — with saved-credential STA mode active, no
  * subscription survives the completed stop(), no application callback ever
  * fires and the racing start() reports a startup failure (never NETWORK_OK
  * for an adapter that was already stopped). */
-static void test_stop_during_start_disarms_apsta_session(void)
+static void test_stop_during_start_disarms_saved_sta_session(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
     wifi_mock_counters_t counters;
 
     /* Park the in-flight start() inside its transaction (after it subscribed
      * and started the manager), exactly like the generic race regression —
-     * but now with the AP+STA mode policy observable in the counters. */
+    * with the saved-credential STA policy observable in the counters. */
     wifi_mgmt_mock_block_wait_ready();
     TEST_ASSERT_EQUAL_INT(0, pthread_create(&s_tx_thread, NULL,
                                             tx_start_worker, NULL));
     wifi_mgmt_mock_wait_blocked_in_wait_ready();
 
-    /* The mode policy was applied before the manager was started. */
+    /* The saved-credential mode policy was applied before start(). */
     counters = wifi_mgmt_mock_get_counters();
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
     TEST_ASSERT_TRUE(counters.type_before_start);
 
     /* A complete stop() runs while the start() is still in flight: it must
@@ -315,7 +321,7 @@ static void test_stop_during_start_disarms_apsta_session(void)
     TEST_ASSERT_TRUE(atomic_load(&s_tx_result) != NETWORK_OK);
 
     /* Nothing survives the completed stop(): no subscription and no armed
-     * callback; a fresh AP+STA start works normally afterwards. */
+     * callback; a fresh saved-credential start works normally afterwards. */
     counters = wifi_mgmt_mock_get_counters();
     TEST_ASSERT_NULL(
         wifi_mgmt_mock_get_subscribed_cb(WIFI_MGMT_EVENT_CONNECTED));
@@ -329,7 +335,7 @@ static void test_stop_during_start_disarms_apsta_session(void)
     TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
     TEST_ASSERT_TRUE(network_manager_wait_connected(0));
     counters = wifi_mgmt_mock_get_counters();
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
 }
 
 /* --------------------------------------------------------------------- */
@@ -1070,12 +1076,12 @@ static void test_concurrent_first_start_race_is_safe(void)
     TEST_ASSERT_EQUAL_UINT(CONCURRENT_THREADS - 1U,
                            atomic_load(&s_conc.start_rejected));
 
-    /* The winner's onboarding ran: the default AP+STA mode selected (before
-     * the manager was started) and the three product events subscribed
+    /* The winner's onboarding ran: the saved-credential STA mode selected
+     * before the manager was started and the three product events subscribed
      * exactly once (the losers never subscribed: they were rejected under
      * the adapter lock before touching the manager). */
     counters = wifi_mgmt_mock_get_counters();
-    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER, counters.last_type);
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
     TEST_ASSERT_TRUE(counters.type_before_start);
     TEST_ASSERT_EQUAL_UINT(3U, counters.subscribe_calls);
 
@@ -1170,9 +1176,10 @@ int main(void)
     RUN_TEST(test_wait_connected_blocks_until_connected);
 
     /* 2. mode policy (TASK-129/TASK-130) */
-    RUN_TEST(test_default_build_requests_apsta_mode_before_start);
-    RUN_TEST(test_callbacks_fire_in_apsta_mode_as_before);
-    RUN_TEST(test_stop_during_start_disarms_apsta_session);
+    RUN_TEST(test_saved_credentials_request_sta_mode_before_start);
+    RUN_TEST(test_fresh_device_requests_apsta_mode_before_start);
+    RUN_TEST(test_callbacks_fire_in_fresh_apsta_mode_as_before);
+    RUN_TEST(test_stop_during_start_disarms_saved_sta_session);
 
     /* 3. disconnect */
     RUN_TEST(test_disconnect_forces_lamp_off_before_callback);

@@ -48,8 +48,9 @@ target_include_directories(network_manager_concurrency_tests PRIVATE
 )
 
 # Mirror the product default for the adapter's Kconfig-selected Wi-Fi start
-# mode (KLC_WIFI_DEFAULT_MODE, main/Kconfig.projbuild): the host build uses
-# AP+STA (T_WIFI_TYPE_CLI_SER), matching the main network-manager suite.
+# mode (KLC_WIFI_DEFAULT_MODE, main/Kconfig.projbuild): the host build enables
+# fresh-device AP+STA; the mock defaults to saved credentials and verifies
+# STA-only startup, matching the main network-manager suite.
 target_compile_definitions(network_manager_concurrency_tests PRIVATE
     CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA=1
 )

@@ -153,29 +153,25 @@ menu "Kitchen LED Controller"
         prompt "Default Wi-Fi start mode"
         default KLC_WIFI_DEFAULT_MODE_APSTA
         help
-            Wi-Fi mode the network stage (network_manager, TASK-109) selects
-            before starting the platform Wi-Fi manager. AP+STA is the default
-            because the provisioning portal needs the AP interface: a device
-            with no usable credentials must be reachable over its provisioning
-            soft-AP to be (re)provisioned, and a station-only start strands an
-            unprovisioned device (the portal's mode request cannot bring the
-            AP up after a client-only start). Select station-only only for
-            hardened production builds that are provisioned out-of-band.
+            Wi-Fi mode used by the network stage (network_manager, TASK-109)
+            for a fresh device. With this default, a fresh device starts in
+            AP+STA so its portal is immediately reachable. A device with a
+            saved credential starts station-only until the bounded fallback
+            controller opens the portal, preventing a visible but nonfunctional
+            provisioning AP during normal station retries.
 
         config KLC_WIFI_DEFAULT_MODE_APSTA
             bool "AP+STA (station plus provisioning access point)"
             help
-                Start the Wi-Fi manager in AP+STA mode (T_WIFI_TYPE_CLI_SER),
-                matching the provisioning demo's ownership order. The soft-AP
-                interface stays available for the provisioning portal when no
-                usable credentials exist yet.
+                Start a fresh device in AP+STA mode (T_WIFI_TYPE_CLI_SER). A
+                device with a saved credential begins station-only and is
+                promoted to AP+STA when the provisioning portal is started.
 
         config KLC_WIFI_DEFAULT_MODE_CLIENT
             bool "Station-only (client)"
             help
                 Start the Wi-Fi manager in station-only mode (T_WIFI_TYPE_
-                CLIENT) for hardened production builds. The provisioning
-                portal cannot open its AP in this mode, so only choose it when
+                CLIENT) for hardened production builds. Select this only when
                 the device is provisioned out-of-band and never needs the
                 portal.
     endchoice

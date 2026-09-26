@@ -30,6 +30,7 @@ typedef struct wifi_mock_state
 } wifi_mock_state_t;
 
 static wifi_mock_state_t s_mock;
+static bool s_saved_credentials = true;
 
 /**
  * @brief Protects the mock state (counters, subscription slots, config) and
@@ -69,6 +70,7 @@ static bool            s_connect_release  = false;
 void wifi_mgmt_mock_reset(void)
 {
   memset(&s_mock, 0, sizeof(s_mock));
+  s_saved_credentials = true;
 
   pthread_mutex_lock(&s_wait_block_lock);
   s_wait_block       = false;
@@ -136,6 +138,13 @@ void wifi_mgmt_mock_set_connected(bool connected)
 {
   pthread_mutex_lock(&s_mock_lock);
   s_mock.config.connected_state = connected;
+  pthread_mutex_unlock(&s_mock_lock);
+}
+
+void wifi_mgmt_mock_set_saved_credentials(bool saved)
+{
+  pthread_mutex_lock(&s_mock_lock);
+  s_saved_credentials = saved;
   pthread_mutex_unlock(&s_mock_lock);
 }
 
@@ -333,8 +342,12 @@ bool wifi_mgmt_connect(void)
 
 bool wifi_mgmt_is_read_data(void)
 {
-  /* Network-manager host tests model a provisioned device by default. */
-  return true;
+  bool saved;
+
+  pthread_mutex_lock(&s_mock_lock);
+  saved = s_saved_credentials;
+  pthread_mutex_unlock(&s_mock_lock);
+  return saved;
 }
 
 bool wifi_mgmt_disconnect(void)

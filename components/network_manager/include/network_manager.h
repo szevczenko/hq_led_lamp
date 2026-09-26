@@ -139,14 +139,16 @@ typedef struct network_callbacks {
 
 /**
  * @brief   Start the network: bring up the Wi-Fi manager in the
- *          Kconfig-selected default mode (KLC_WIFI_DEFAULT_MODE, AP+STA by
- *          default) and request a connection with the persisted credentials.
+ *          credential-aware Kconfig-selected mode and request a connection
+ *          with the persisted credentials.
  *
  * @details The start mode is a product policy decision owned by this adapter
- *          (the network stage is the single Wi-Fi owner): AP+STA is the
- *          default so the provisioning portal's soft-AP is available when no
- *          usable credentials exist; station-only is selectable for hardened
- *          builds.  The mode never appears in this header — it is set inside
+ *          (the network stage is the single Wi-Fi owner): the default uses
+ *          AP+STA only when no credential is saved, so its portal can open
+ *          immediately. Saved credentials start station-only; on repeated
+ *          failure the provisioning controller changes to AP+STA as it opens
+ *          the HTTP/DNS portal. Station-only is selectable for hardened
+ *          builds. The mode never appears in this header — it is set inside
  *          the adapter before onboarding.
  *
  *          Ordering contract: this operation runs Wi-Fi onboarding to

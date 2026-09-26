@@ -77,6 +77,9 @@ int wifi_mgmt_mock_emit(wifi_mgmt_event_t event);
 /** @brief Set the connected state reported by wifi_mgmt_is_connected(). */
 void wifi_mgmt_mock_set_connected(bool connected);
 
+/** @brief Set whether wifi_mgmt_is_read_data() reports a saved credential. */
+void wifi_mgmt_mock_set_saved_credentials(bool saved);
+
 /**
  * @brief First callback currently subscribed to @p event (NULL if none).
  *

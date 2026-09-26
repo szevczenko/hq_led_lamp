@@ -9,10 +9,10 @@
 #
 # Coverage: connect, disconnect (fail-off ordering), invalid credentials,
 # reconnect, stale/late callbacks after stop, start/stop lifecycle contract,
-# the mode policy (TASK-130: the default build requests the Kconfig-selected
-# AP+STA mode BEFORE wifi_mgmt_start(), callbacks fire identically in AP+STA,
-# and a concurrent stop during start still disarms the session regardless of
-# the mode) and the credentials-never-logged secrecy rule.
+# the mode policy (a saved credential uses STA-only, a fresh device uses the
+# Kconfig-selected AP+STA mode, both before wifi_mgmt_start()), callbacks,
+# and a concurrent stop during start regardless of mode; plus the
+# credentials-never-logged secrecy rule.
 #
 # Usage:
 #   cmake -S tests/network_manager -B <build-dir>
@@ -58,10 +58,9 @@ target_include_directories(network_manager_tests PRIVATE
 # The adapter's Wi-Fi start mode is a product policy owned by Kconfig
 # (KLC_WIFI_DEFAULT_MODE, main/Kconfig.projbuild): the network adapter
 # compiles the Kconfig-selected mode into network_manager_start().  The host
-# test build mirrors the product DEFAULT (AP+STA, T_WIFI_TYPE_CLI_SER — the
-# provisioning portal's soft-AP must be available), which is exactly what
-# the mode-policy cases (TASK-130) assert.  Keep this in lockstep with the
-# project default in main/Kconfig.projbuild.
+# test build enables the product fresh-device default (AP+STA,
+# T_WIFI_TYPE_CLI_SER). The mock defaults to a saved credential, so tests
+# cover the STA-only retry path and explicitly select fresh state for AP+STA.
 target_compile_definitions(network_manager_tests PRIVATE
     CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA=1
 )
