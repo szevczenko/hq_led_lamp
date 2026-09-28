@@ -19,6 +19,8 @@ typedef struct fw_mock {
     int request_check_calls;
     int request_check_result;
     int poll_calls;
+    int confirm_calls;
+    int confirm_result;
     uint32_t last_poll_now;
     tb_firmware_update_status_t status;
 } fw_mock_t;

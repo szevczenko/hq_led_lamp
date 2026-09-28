@@ -98,6 +98,21 @@ static network_ctx_t s_ctx = {
   .stop_count   = 0u,
 };
 
+int network_manager_get_rssi(int *dbm)
+{
+    if (dbm == NULL || !atomic_load_explicit(&s_ctx.started, memory_order_acquire) ||
+            !wifi_mgmt_is_connected()) {
+        return NETWORK_ERR_START_FAILED;
+    }
+    *dbm = wifi_mgmt_get_rssi();
+    return NETWORK_OK;
+}
+
+bool network_manager_erase_credentials(void)
+{
+    return wifi_mgmt_erase_credentials();
+}
+
 /* --------------------------------------------------------------------- */
 /* Small lock helpers                                                     */
 /* --------------------------------------------------------------------- */

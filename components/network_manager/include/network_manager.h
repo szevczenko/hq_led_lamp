@@ -198,6 +198,10 @@ void network_manager_stop(void);
  */
 bool network_manager_is_connected(void);
 
+/** @brief Read the current Wi-Fi RSSI in dBm. */
+int network_manager_get_rssi(int *dbm);
+bool network_manager_erase_credentials(void);
+
 /**
  * @brief   Re-drive the saved-credential station connect request.
  *

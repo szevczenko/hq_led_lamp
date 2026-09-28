@@ -28,6 +28,35 @@ menu "Kitchen LED Controller"
             configure time. The final pin must be confirmed from the schematic
             before PCB release. This value is not a credential.
 
+    choice KLC_LAMP_TYPE
+        prompt "Lamp output type"
+        default KLC_LAMP_TYPE_PWM
+
+        config KLC_LAMP_TYPE_PWM
+            bool "Single-channel PWM"
+
+        config KLC_LAMP_TYPE_RGB
+            bool "RGB (three PWM channels)"
+    endchoice
+
+    config KLC_LED_RGB_GPIO_R
+        int "RGB red channel GPIO"
+        range 0 48
+        default 18
+        depends on KLC_LAMP_TYPE_RGB
+
+    config KLC_LED_RGB_GPIO_G
+        int "RGB green channel GPIO"
+        range 0 48
+        default 19
+        depends on KLC_LAMP_TYPE_RGB
+
+    config KLC_LED_RGB_GPIO_B
+        int "RGB blue channel GPIO"
+        range 0 48
+        default 21
+        depends on KLC_LAMP_TYPE_RGB
+
     config KLC_LED_PWM_FREQUENCY_HZ
         int "LED PWM frequency (Hz)"
         range 1000 9765
@@ -73,6 +102,29 @@ menu "Kitchen LED Controller"
             arrives regardless of this value. This is a hardware default, not
             a credential.
 
+    menu "Factory reset"
+        config KLC_FACTORY_RESET_ENABLE
+            bool "Enable factory reset button"
+            default y
+
+        config KLC_FACTORY_RESET_GPIO
+            int "Factory reset GPIO"
+            range 0 48
+            default 0
+            depends on KLC_FACTORY_RESET_ENABLE
+
+        config KLC_FACTORY_RESET_ACTIVE_LOW
+            bool "Factory reset input is active-low"
+            default y
+            depends on KLC_FACTORY_RESET_ENABLE
+
+        config KLC_FACTORY_RESET_HOLD_MS
+            int "Factory reset hold time (ms)"
+            range 1000 60000
+            default 5000
+            depends on KLC_FACTORY_RESET_ENABLE
+    endmenu
+
     config KLC_THINGSBOARD_SYNC_TIMEOUT_MS
         int "ThingsBoard state synchronization timeout (ms)"
         range 1000 60000
@@ -92,6 +144,16 @@ menu "Kitchen LED Controller"
             longer budget than KLC_THINGSBOARD_SYNC_TIMEOUT_MS because
             first-time device creation can take longer than routine state
             sync round trips.
+
+    config KLC_AUTH_REJECT_REPROVISION_THRESHOLD
+        int "Consecutive auth failures before re-provisioning"
+        range 1 10
+        default 3
+
+    config KLC_REPROVISION_BACKOFF_MS
+        int "Re-provisioning backoff (ms)"
+        range 1000 86400000
+        default 600000
 
     config KLC_TELEMETRY_PERIOD_MS
         int "Periodic telemetry publish interval (ms)"

@@ -53,6 +53,7 @@ bool lamp_mock_state_applied(void);
 
 /** @brief Last applied power value. */
 bool lamp_mock_applied_power(void);
+void lamp_mock_applied_rgb(uint8_t *red, uint8_t *green, uint8_t *blue);
 
 /** @brief Last applied brightness value. */
 uint8_t lamp_mock_applied_brightness(void);

@@ -216,6 +216,31 @@ static void test_saved_credentials_request_sta_mode_before_start(void)
     TEST_ASSERT_TRUE(counters.start_before_connect);
 }
 
+static void test_rssi_reported_only_when_connected(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+    int dbm = 0;
+
+    TEST_ASSERT_NOT_EQUAL(NETWORK_OK, network_manager_get_rssi(&dbm));
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    wifi_mgmt_mock_set_connected(false);
+    TEST_ASSERT_NOT_EQUAL(NETWORK_OK, network_manager_get_rssi(&dbm));
+    wifi_mgmt_mock_set_connected(true);
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_get_rssi(&dbm));
+    TEST_ASSERT_EQUAL_INT(-55, dbm);
+    TEST_ASSERT_NOT_EQUAL(NETWORK_OK, network_manager_get_rssi(NULL));
+}
+
+static void test_erase_credentials_forces_onboarding_mode(void)
+{
+    network_callbacks_t cb = make_callbacks(NULL);
+
+    TEST_ASSERT_TRUE(network_manager_erase_credentials());
+    TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
+    TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLI_SER,
+                             wifi_mgmt_mock_get_counters().last_type);
+}
+
 static void test_fresh_device_requests_apsta_mode_before_start(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
@@ -1169,6 +1194,8 @@ static void test_concurrent_first_start_stop_is_connected_race_is_safe(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_rssi_reported_only_when_connected);
+    RUN_TEST(test_erase_credentials_forces_onboarding_mode);
 
     /* 1. connect */
     RUN_TEST(test_connect_starts_wifi_and_reports_connected);

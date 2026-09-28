@@ -72,6 +72,20 @@
 #include "tb_rpc.h"
 #include "tb_telemetry.h"
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+
+#ifndef CONFIG_KLC_LAMP_TYPE_RGB
+#define CONFIG_KLC_LAMP_TYPE_RGB 0
+#endif
+
+#ifdef CONFIG_KLC_DEFAULT_BRIGHTNESS_PERCENT
+#define TB_APPLICATION_DEFAULT_BRIGHTNESS ((uint8_t)CONFIG_KLC_DEFAULT_BRIGHTNESS_PERCENT)
+#else
+#define TB_APPLICATION_DEFAULT_BRIGHTNESS 0u
+#endif
+
 /* --------------------------------------------------------------------- */
 /* Internal constants                                                     */
 /* --------------------------------------------------------------------- */
@@ -79,12 +93,16 @@
 /** @brief Shared-attribute keys requested as one synchronization operation. */
 #define TB_APPLICATION_KEY_POWER "power"
 #define TB_APPLICATION_KEY_BRIGHTNESS "brightness"
+#define TB_APPLICATION_KEY_RED "red"
+#define TB_APPLICATION_KEY_GREEN "green"
+#define TB_APPLICATION_KEY_BLUE "blue"
 
 /** @brief Documented server-side RPC method names (TASK-113). */
 #define TB_APPLICATION_RPC_METHOD_SET_POWER "setPower"
 #define TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS "setBrightness"
 #define TB_APPLICATION_RPC_METHOD_SET_STATE "setState"
 #define TB_APPLICATION_RPC_METHOD_GET_STATE "getState"
+#define TB_APPLICATION_RPC_METHOD_SET_COLOR "setColor"
 
 /* --------------------------------------------------------------------- */
 /* Internal module state                                                  */
@@ -119,6 +137,7 @@ typedef struct tb_app_module {
     uint32_t           retry_max_ms;
     uint32_t           max_retries;
     tb_application_now_fn_t now_fn;
+    tb_application_rssi_fn_t rssi_fn;
     osal_mutex_id_t    lock;
 
     /* Synchronization state machine (guarded by lock). */
@@ -155,6 +174,34 @@ static void tb_app_on_shared_update(const char *json_payload,
 static void tb_app_on_attr_response(tb_request_result_t result,
                                     const char *json_response,
                                     void *user_data);
+static bool tb_app_is_connected(void);
+
+static void tb_app_publish_applied_attributes(void)
+{
+    char json[160];
+    int written;
+
+    if (!tb_app_is_connected() || !s_tb.has_applied) {
+        return;
+    }
+#if CONFIG_KLC_LAMP_TYPE_RGB
+    written = snprintf(json, sizeof(json),
+                       "{\"power\":%s,\"brightness\":%u,\"red\":%u,"
+                       "\"green\":%u,\"blue\":%u}",
+                       s_tb.applied.power ? "true" : "false",
+                       (unsigned)s_tb.applied.brightness_percent,
+                       (unsigned)s_tb.applied.red,
+                       (unsigned)s_tb.applied.green,
+                       (unsigned)s_tb.applied.blue);
+#else
+    written = snprintf(json, sizeof(json), "{\"power\":%s,\"brightness\":%u}",
+                       s_tb.applied.power ? "true" : "false",
+                       (unsigned)s_tb.applied.brightness_percent);
+#endif
+    if (written > 0 && (size_t)written < sizeof(json)) {
+        (void)tb_attributes_send_json(s_tb.client, json);
+    }
+}
 
 /* --------------------------------------------------------------------- */
 /* Helpers (all internal helpers expect the lock held unless noted)        */
@@ -300,16 +347,33 @@ static void tb_app_publish_telemetry(void)
         (void)lamp_duty_from_brightness(applied.brightness_percent, &duty);
     }
 
+    int rssi = 0;
+    const bool have_rssi = s_tb.rssi_fn != NULL && s_tb.rssi_fn(&rssi) == 0;
+    char rssi_suffix[24] = "";
+    if (have_rssi) {
+        (void)snprintf(rssi_suffix, sizeof(rssi_suffix), ",\"rssi\":%d", rssi);
+    }
+
     n = snprintf(buf, sizeof(buf),
+#if CONFIG_KLC_LAMP_TYPE_RGB
+                 "{\"power\":%s,\"brightness\":%u,\"red\":%u,"
+                 "\"green\":%u,\"blue\":%u,\"pwm_duty\":%u,"
+#else
                  "{\"power\":%s,\"brightness\":%u,\"pwm_duty\":%u,"
+#endif
                  "\"connection_state\":\"%s\","
-                 "\"hardware\":\"%s\",\"uptime_ms\":%u}",
+                 "\"hardware\":\"%s\",\"uptime_ms\":%u%s}",
                  applied.power ? "true" : "false",
                  (unsigned)applied.brightness_percent,
+#if CONFIG_KLC_LAMP_TYPE_RGB
+                 (unsigned)applied.red,
+                 (unsigned)applied.green,
+                 (unsigned)applied.blue,
+#endif
                  (unsigned)duty,
                  TB_APPLICATION_CONNECTION_STATE_ONLINE,
                  s_tb.hardware,
-                 (unsigned)osal_task_get_time_ms());
+                 (unsigned)osal_task_get_time_ms(), rssi_suffix);
     if ((n < 0) || ((size_t)n >= sizeof(buf)))
     {
         osal_log_error("[tb_app] telemetry serialization overflow; "
@@ -365,6 +429,7 @@ static lamp_status_t tb_app_apply_state(const lamp_state_t *desired)
                       "suspended: power=%s brightness=%u",
                       desired->power ? "on" : "off",
                       (unsigned)desired->brightness_percent);
+        tb_app_publish_applied_attributes();
         return LAMP_OK;
     }
 
@@ -378,6 +443,7 @@ static lamp_status_t tb_app_apply_state(const lamp_state_t *desired)
                       "power=%s brightness=%u",
                       desired->power ? "on" : "off",
                       (unsigned)desired->brightness_percent);
+                tb_app_publish_applied_attributes();
         /* Successful state change: publish the applied-state telemetry.  The
          * lock is held here (both sync callbacks call us under the lock). */
         tb_app_publish_telemetry();
@@ -482,6 +548,20 @@ static int tb_app_transport_subscribe_and_request(void)
     static const char *TB_APP_KEYS[] = {
         TB_APPLICATION_KEY_POWER,
         TB_APPLICATION_KEY_BRIGHTNESS,
+#if CONFIG_KLC_LAMP_TYPE_RGB
+        TB_APPLICATION_KEY_RED,
+        TB_APPLICATION_KEY_GREEN,
+        TB_APPLICATION_KEY_BLUE,
+#endif
+    };
+    static const char *TB_APP_CLIENT_KEYS[] = {
+        TB_APPLICATION_KEY_POWER,
+        TB_APPLICATION_KEY_BRIGHTNESS,
+#if CONFIG_KLC_LAMP_TYPE_RGB
+        TB_APPLICATION_KEY_RED,
+        TB_APPLICATION_KEY_GREEN,
+        TB_APPLICATION_KEY_BLUE,
+#endif
     };
     const size_t num_keys =
         sizeof(TB_APP_KEYS) / sizeof(TB_APP_KEYS[0]);
@@ -502,8 +582,10 @@ static int tb_app_transport_subscribe_and_request(void)
      * operation; the transport itself bounds the attempt with its own
      * timeout, and the module additionally enforces the sync window in
      * tb_application_poll(). */
-    rc = tb_attributes_request_shared(
-        s_tb.client, TB_APP_KEYS, num_keys,
+    rc = tb_attributes_request(
+        s_tb.client, TB_APP_CLIENT_KEYS,
+        sizeof(TB_APP_CLIENT_KEYS) / sizeof(TB_APP_CLIENT_KEYS[0]),
+        TB_APP_KEYS, num_keys,
         tb_app_on_attr_response, &s_tb.request_token,
         s_tb.sync_timeout_ms);
     if (rc != 0)
@@ -543,6 +625,21 @@ static void tb_app_run_transport(void)
 /* Desired-state validation                                               */
 /* --------------------------------------------------------------------- */
 
+#if CONFIG_KLC_LAMP_TYPE_RGB
+static bool tb_app_parse_rgb_channel(const cJSON *attrs, const char *key,
+                                     uint8_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(attrs, key);
+
+    if (!cJSON_IsNumber(item) || item->valueint < 0 || item->valueint > 255 ||
+        (double)item->valueint != item->valuedouble) {
+        return false;
+    }
+    *out = (uint8_t)item->valueint;
+    return true;
+}
+#endif
+
 /**
  * @brief Parse and validate a complete desired state payload.
  *
@@ -558,7 +655,8 @@ static void tb_app_run_transport(void)
  * @param[out] out  Receives the validated state on success.
  * @return true when the payload is a complete valid desired state.
  */
-static bool tb_app_parse_state(const char *json, lamp_state_t *out)
+static bool tb_app_parse_state_scope(const char *json, const char *scope,
+                                     lamp_state_t *out)
 {
     cJSON *root;
     cJSON *attrs;
@@ -582,12 +680,18 @@ static bool tb_app_parse_state(const char *json, lamp_state_t *out)
         return false;
     }
 
-    /* Attribute responses wrap the values under "shared"; updates arrive
-     * flat.  Accept both, exactly like the platform attributes module. */
-    attrs = cJSON_GetObjectItemCaseSensitive(root, "shared");
-    if (!cJSON_IsObject(attrs))
-    {
-        attrs = root;
+    /* Responses wrap values under a requested scope; updates arrive flat. */
+    if (scope != NULL) {
+        attrs = cJSON_GetObjectItemCaseSensitive(root, scope);
+        if (!cJSON_IsObject(attrs)) {
+            cJSON_Delete(root);
+            return false;
+        }
+    } else {
+        attrs = cJSON_GetObjectItemCaseSensitive(root, "shared");
+        if (!cJSON_IsObject(attrs)) {
+            attrs = root;
+        }
     }
 
     /* Required field + JSON type: power must be a JSON boolean. */
@@ -618,11 +722,40 @@ static bool tb_app_parse_state(const char *json, lamp_state_t *out)
 
     out->power = cJSON_IsTrue(power_item);
     out->brightness_percent = (uint8_t)brightness_item->valueint;
+#if CONFIG_KLC_LAMP_TYPE_RGB
+    {
+        const bool has_red = cJSON_GetObjectItemCaseSensitive(
+            attrs, TB_APPLICATION_KEY_RED) != NULL;
+        const bool has_green = cJSON_GetObjectItemCaseSensitive(
+            attrs, TB_APPLICATION_KEY_GREEN) != NULL;
+        const bool has_blue = cJSON_GetObjectItemCaseSensitive(
+            attrs, TB_APPLICATION_KEY_BLUE) != NULL;
+        if (!has_red && !has_green && !has_blue) {
+            out->red = 255u;
+            out->green = 255u;
+            out->blue = 255u;
+        } else if (!has_red || !has_green || !has_blue ||
+                   !tb_app_parse_rgb_channel(attrs, TB_APPLICATION_KEY_RED, &out->red) ||
+                   !tb_app_parse_rgb_channel(attrs, TB_APPLICATION_KEY_GREEN, &out->green) ||
+                   !tb_app_parse_rgb_channel(attrs, TB_APPLICATION_KEY_BLUE, &out->blue)) {
+            goto done;
+        }
+    }
+#else
+    out->red = 255u;
+    out->green = 255u;
+    out->blue = 255u;
+#endif
     ok = true;
 
 done:
     cJSON_Delete(root);
     return ok;
+}
+
+static bool tb_app_parse_state(const char *json, lamp_state_t *out)
+{
+    return tb_app_parse_state_scope(json, NULL, out);
 }
 
 static bool tb_app_is_ota_key(const char *key, bool *is_firmware)
@@ -718,18 +851,23 @@ static bool tb_app_parse_initial_state(const char *json, lamp_state_t *out)
     }
 
     attrs = cJSON_GetObjectItemCaseSensitive(root, "shared");
-    if (attrs == NULL)
-    {
-        attrs = root;
-    }
-    if (!cJSON_IsObject(attrs) || (cJSON_GetArraySize(attrs) != 0))
-    {
+    if (attrs != NULL || cJSON_GetObjectItemCaseSensitive(root, "client") != NULL) {
+        const cJSON *client = cJSON_GetObjectItemCaseSensitive(root, "client");
+        if ((attrs != NULL && (!cJSON_IsObject(attrs) || cJSON_GetArraySize(attrs) != 0)) ||
+            (client != NULL && (!cJSON_IsObject(client) || cJSON_GetArraySize(client) != 0))) {
+            cJSON_Delete(root);
+            return false;
+        }
+    } else if (!cJSON_IsObject(root) || cJSON_GetArraySize(root) != 0) {
         cJSON_Delete(root);
         return false;
     }
 
     out->power = false;
-    out->brightness_percent = 0U;
+    out->brightness_percent = TB_APPLICATION_DEFAULT_BRIGHTNESS;
+    out->red = 255u;
+    out->green = 255u;
+    out->blue = 255u;
     cJSON_Delete(root);
     return true;
 }
@@ -803,7 +941,10 @@ static void tb_app_on_shared_update(const char *json_payload,
 
     if ((s_tb.state == TB_APP_STATE_SYNCED) && s_tb.has_applied &&
         (desired.power == s_tb.applied.power) &&
-        (desired.brightness_percent == s_tb.applied.brightness_percent))
+        (desired.brightness_percent == s_tb.applied.brightness_percent) &&
+        (desired.red == s_tb.applied.red) &&
+        (desired.green == s_tb.applied.green) &&
+        (desired.blue == s_tb.applied.blue))
     {
         /* Duplicate retransmission of the already-applied complete state:
          * no-op (duplicates never re-apply and never enable the output). */
@@ -901,8 +1042,13 @@ static void tb_app_on_attr_response(tb_request_result_t result,
         return;
     }
 
-    if (!tb_app_parse_state(json_response, &desired) &&
-        !tb_app_parse_initial_state(json_response, &desired))
+    if (tb_app_parse_state_scope(json_response, "client", &desired)) {
+        osal_log_info("[tb_app] sync source=client");
+    } else if (tb_app_parse_state_scope(json_response, "shared", &desired)) {
+        osal_log_info("[tb_app] sync source=shared");
+    } else if (tb_app_parse_initial_state(json_response, &desired)) {
+        osal_log_info("[tb_app] sync source=default");
+    } else
     {
         osal_log_warning("[tb_app] rejected invalid/partial sync response");
         tb_app_fail_attempt();
@@ -989,6 +1135,11 @@ static void tb_app_rpc_respond_success(uint32_t request_id,
             cJSON_AddBoolToObject(desired_obj, "power", desired->power);
             cJSON_AddNumberToObject(desired_obj, "brightness",
                                     (double)desired->brightness_percent);
+#if CONFIG_KLC_LAMP_TYPE_RGB
+            cJSON_AddNumberToObject(desired_obj, "red", (double)desired->red);
+            cJSON_AddNumberToObject(desired_obj, "green", (double)desired->green);
+            cJSON_AddNumberToObject(desired_obj, "blue", (double)desired->blue);
+#endif
             cJSON_AddItemToObject(root, "desired", desired_obj);
         }
     }
@@ -1003,6 +1154,11 @@ static void tb_app_rpc_respond_success(uint32_t request_id,
                                     (double)applied->brightness_percent);
             cJSON_AddBoolToObject(applied_obj, "output_active",
                                   applied->output_active);
+#if CONFIG_KLC_LAMP_TYPE_RGB
+            cJSON_AddNumberToObject(applied_obj, "red", (double)applied->red);
+            cJSON_AddNumberToObject(applied_obj, "green", (double)applied->green);
+            cJSON_AddNumberToObject(applied_obj, "blue", (double)applied->blue);
+#endif
             cJSON_AddItemToObject(root, "applied", applied_obj);
         }
     }
@@ -1077,6 +1233,7 @@ static void tb_app_rpc_apply_and_respond(uint32_t request_id,
     {
         s_tb.applied = *desired;
         s_tb.has_applied = true;
+        tb_app_publish_applied_attributes();
         (void)lamp_control_get_applied_state(&applied);
         tb_app_rpc_respond_success(request_id, desired, &applied);
         return;
@@ -1094,6 +1251,7 @@ static void tb_app_rpc_apply_and_respond(uint32_t request_id,
     s_tb.applied = *desired;
     s_tb.has_applied = true;
 
+    tb_app_publish_applied_attributes();
     tb_app_rpc_respond_success(request_id, desired, &applied);
     tb_app_publish_telemetry();
 }
@@ -1115,6 +1273,9 @@ static bool tb_app_rpc_current_state(lamp_state_t *out)
     }
     out->power = applied.power;
     out->brightness_percent = applied.brightness_percent;
+    out->red = applied.red;
+    out->green = applied.green;
+    out->blue = applied.blue;
     return true;
 }
 
@@ -1182,6 +1343,60 @@ static bool tb_app_rpc_parse_brightness(const cJSON *params, uint8_t *out)
     }
     *out = (uint8_t)item->valueint;
     return true;
+}
+
+#if CONFIG_KLC_LAMP_TYPE_RGB
+static bool tb_app_rpc_parse_rgb(const cJSON *params, lamp_state_t *out)
+{
+    return tb_app_parse_rgb_channel(params, "red", &out->red) &&
+           tb_app_parse_rgb_channel(params, "green", &out->green) &&
+           tb_app_parse_rgb_channel(params, "blue", &out->blue);
+}
+
+/** @brief Update only the channels present in @p params; at least one is required. */
+static bool tb_app_rpc_parse_rgb_partial(const cJSON *params, lamp_state_t *out)
+{
+    static const char *const keys[] = { "red", "green", "blue" };
+    lamp_state_t parsed = *out;
+    uint8_t *const channels[] = { &parsed.red, &parsed.green, &parsed.blue };
+    bool any = false;
+
+    for (size_t i = 0; i < 3u; ++i) {
+        if (!tb_app_rpc_has_field(params, keys[i])) {
+            continue;
+        }
+        if (!tb_app_parse_rgb_channel(params, keys[i], channels[i])) {
+            return false;
+        }
+        any = true;
+    }
+    if (any) {
+        *out = parsed;
+    }
+    return any;
+}
+#endif
+
+static void tb_app_rpc_handle_set_color(uint32_t request_id,
+                                        const cJSON *params)
+{
+#if CONFIG_KLC_LAMP_TYPE_RGB
+    lamp_state_t desired;
+
+    if (!tb_app_rpc_current_state(&desired)) {
+        tb_app_rpc_respond_error(request_id, "hardware failure", NULL, NULL);
+        return;
+    }
+    if (!tb_app_rpc_parse_rgb_partial(params, &desired)) {
+        tb_app_rpc_respond_error(request_id, "invalid payload",
+                                 "invalid RGB channel", NULL);
+        return;
+    }
+    tb_app_rpc_apply_and_respond(request_id, &desired);
+#else
+    (void)params;
+    tb_app_rpc_respond_error(request_id, "unknown method", NULL, "setColor");
+#endif
 }
 
 /** @brief `setPower` handler: requires a boolean `power`. */
@@ -1284,8 +1499,28 @@ static void tb_app_rpc_handle_set_state(uint32_t request_id,
         return;
     }
 
+    if (!tb_app_rpc_current_state(&desired)) {
+        memset(&desired, 0, sizeof(desired));
+        desired.red = 255u;
+        desired.green = 255u;
+        desired.blue = 255u;
+    }
     desired.power = power;
     desired.brightness_percent = brightness;
+#if CONFIG_KLC_LAMP_TYPE_RGB
+    if (tb_app_rpc_has_field(params, "red") ||
+        tb_app_rpc_has_field(params, "green") ||
+        tb_app_rpc_has_field(params, "blue")) {
+        if (!tb_app_rpc_has_field(params, "red") ||
+            !tb_app_rpc_has_field(params, "green") ||
+            !tb_app_rpc_has_field(params, "blue") ||
+            !tb_app_rpc_parse_rgb(params, &desired)) {
+            tb_app_rpc_respond_error(request_id, "invalid payload",
+                                     "invalid RGB channel", NULL);
+            return;
+        }
+    }
+#endif
     tb_app_rpc_apply_and_respond(request_id, &desired);
 }
 
@@ -1384,6 +1619,7 @@ static void tb_app_on_server_rpc(const char *method, const char *params_json,
     if ((strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_POWER) != 0) &&
         (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS) != 0) &&
         (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_STATE) != 0) &&
+        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_COLOR) != 0) &&
         (strcmp(method_name, TB_APPLICATION_RPC_METHOD_GET_STATE) != 0))
     {
         tb_app_rpc_respond_error(request_id, "unknown method", NULL,
@@ -1421,6 +1657,10 @@ static void tb_app_on_server_rpc(const char *method, const char *params_json,
     else if (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_STATE) == 0)
     {
         tb_app_rpc_handle_set_state(request_id, params);
+    }
+    else if (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_COLOR) == 0)
+    {
+        tb_app_rpc_handle_set_color(request_id, params);
     }
     else
     {
@@ -1517,6 +1757,7 @@ tb_application_status_t tb_application_init(
                            ? TB_APPLICATION_MAX_RETRIES_DEFAULT
                            : config->max_retries;
     s_tb.now_fn = config->now_ms;
+    s_tb.rssi_fn = config->rssi_dbm;
     s_tb.telemetry_period_ms =
         tb_app_clamp((config->telemetry_period_ms == 0u)
                          ? TB_APPLICATION_TELEMETRY_PERIOD_DEFAULT_MS

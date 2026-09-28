@@ -62,6 +62,13 @@ uint8_t lamp_mock_applied_brightness(void)
     return s_last_applied.brightness_percent;
 }
 
+void lamp_mock_applied_rgb(uint8_t *red, uint8_t *green, uint8_t *blue)
+{
+    *red = s_last_applied.red;
+    *green = s_last_applied.green;
+    *blue = s_last_applied.blue;
+}
+
 void lamp_mock_set_apply_result(lamp_status_t status)
 {
     s_apply_result = status;
@@ -102,6 +109,9 @@ lamp_status_t lamp_control_apply_state(const lamp_state_t *requested,
     {
         applied_out->power = s_last_applied.power;
         applied_out->brightness_percent = s_last_applied.brightness_percent;
+        applied_out->red = s_last_applied.red;
+        applied_out->green = s_last_applied.green;
+        applied_out->blue = s_last_applied.blue;
         applied_out->output_active =
             s_last_applied.power && (s_last_applied.brightness_percent > 0u);
     }
@@ -117,6 +127,9 @@ lamp_status_t lamp_control_get_applied_state(lamp_applied_state_t *applied_out)
 
     applied_out->power = s_last_applied.power;
     applied_out->brightness_percent = s_last_applied.brightness_percent;
+    applied_out->red = s_last_applied.red;
+    applied_out->green = s_last_applied.green;
+    applied_out->blue = s_last_applied.blue;
     applied_out->output_active =
         s_last_applied.power && (s_last_applied.brightness_percent > 0u);
     return LAMP_OK;

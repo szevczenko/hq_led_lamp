@@ -46,6 +46,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <string.h>
 
 #include "lamp_control.h"
 
@@ -58,7 +59,8 @@
  */
 typedef struct lamp_control_state {
     bool                 initialized; /**< PWM output initialized and not deinitialized. */
-    hal_pin_t            pin;         /**< PWM pin; only valid while initialized. */
+    hal_pin_t            pins[LAMP_CONTROL_MAX_CHANNELS]; /**< PWM pins. */
+    uint8_t              channel_count; /**< Number of initialized PWM channels. */
     lamp_applied_state_t applied;     /**< Last state successfully applied. */
     bool                 fail_off_barrier; /**< Fail-off barrier latched by the
                                             last successful explicit
@@ -69,8 +71,9 @@ typedef struct lamp_control_state {
 
 static lamp_control_state_t s_lamp = {
     .initialized      = false,
-    .pin              = HAL_PIN_NONE,
-    .applied          = { false, LAMP_BRIGHTNESS_MIN, false },
+    .pins             = { HAL_PIN_NONE, HAL_PIN_NONE, HAL_PIN_NONE },
+    .channel_count    = 0u,
+    .applied          = { false, LAMP_BRIGHTNESS_MIN, false, 0u, 0u, 0u },
     .fail_off_barrier = false,
 };
 
@@ -182,17 +185,21 @@ static bool lamp_state_is_valid(const lamp_state_t *state)
  */
 static lamp_status_t lamp_fail_off(void)
 {
-    hal_status_t hs;
+    bool all_off = true;
 
-    hs = hal_pwm_force_inactive(s_lamp.pin);
-    if (hs != HAL_OK) {
-        hs = hal_pwm_force_inactive(s_lamp.pin);
+    for (uint8_t index = 0u; index < s_lamp.channel_count; ++index) {
+        hal_status_t hs = hal_pwm_force_inactive(s_lamp.pins[index]);
+        if (hs != HAL_OK) {
+            hs = hal_pwm_force_inactive(s_lamp.pins[index]);
+        }
+        if (hs != HAL_OK) {
+            hs = hal_pwm_set_duty(s_lamp.pins[index], HAL_PWM_DUTY_MIN_PERCENT);
+        }
+        if (hs != HAL_OK) {
+            all_off = false;
+        }
     }
-    if (hs != HAL_OK) {
-        hs = hal_pwm_set_duty(s_lamp.pin, HAL_PWM_DUTY_MIN_PERCENT);
-    }
-
-    if (hs != HAL_OK) {
+    if (!all_off) {
         return LAMP_ERR_FAIL_OFF;
     }
 
@@ -258,10 +265,41 @@ lamp_status_t lamp_brightness_from_duty(lamp_duty_t duty,
 /* Lifecycle and state operations                                        */
 /* --------------------------------------------------------------------- */
 
+/* Channels whose release failed stay tracked so a later deinit can retry. */
+static hal_status_t lamp_release_channels(void)
+{
+    hal_status_t first_error = HAL_OK;
+    uint8_t kept = 0u;
+
+    for (uint8_t index = 0u; index < s_lamp.channel_count; ++index) {
+        const hal_status_t hs = hal_pwm_deinit(s_lamp.pins[index]);
+        if (hs != HAL_OK) {
+            if (first_error == HAL_OK) {
+                first_error = hs;
+            }
+            s_lamp.pins[kept++] = s_lamp.pins[index];
+        }
+    }
+    for (uint8_t index = kept; index < LAMP_CONTROL_MAX_CHANNELS; ++index) {
+        s_lamp.pins[index] = HAL_PIN_NONE;
+    }
+    s_lamp.channel_count = kept;
+    return first_error;
+}
+
+static void lamp_reset_released_state(void)
+{
+    s_lamp.initialized = false;
+    s_lamp.channel_count = 0u;
+    memset(&s_lamp.applied, 0, sizeof(s_lamp.applied));
+}
+
 static lamp_status_t lamp_control_init_locked(const lamp_control_config_t *config)
 {
     hal_pwm_config_t pwm_cfg;
-    hal_status_t hs;
+    hal_status_t hs = HAL_OK;
+    uint8_t channel_count;
+    uint8_t initialized_channels = 0u;
 
     if (config == NULL) {
         return LAMP_ERR_INVALID_ARGUMENT;
@@ -271,7 +309,11 @@ static lamp_status_t lamp_control_init_locked(const lamp_control_config_t *confi
     }
 
     /* Validate the whole boundary up front (reject, never wrap/truncate). */
-    if (config->pin == HAL_PIN_NONE) {
+    /* Legacy callers leave the appended channel_count field unset; only the
+     * explicit RGB value changes the established single-channel behavior. */
+    channel_count = config->channel_count == LAMP_CONTROL_MAX_CHANNELS
+                        ? LAMP_CONTROL_MAX_CHANNELS : 1u;
+    if (channel_count == 1u && config->pin == HAL_PIN_NONE) {
         return LAMP_ERR_INVALID_ARGUMENT;
     }
     if (config->frequency_hz == 0u) {
@@ -282,20 +324,37 @@ static lamp_status_t lamp_control_init_locked(const lamp_control_config_t *confi
         return LAMP_ERR_INVALID_ARGUMENT;
     }
 
-    pwm_cfg.pin = config->pin;
     pwm_cfg.frequency_hz = config->frequency_hz;
     pwm_cfg.polarity = config->polarity;
 
-    hs = hal_pwm_init(&pwm_cfg);
-    if (hs != HAL_OK) {
-        return lamp_map_hal_status(hs);
+    for (uint8_t index = 0u; index < channel_count; ++index) {
+        const hal_pin_t pin = channel_count == 1u && config->pin != HAL_PIN_NONE
+                                  ? config->pin : config->pins[index];
+        if (pin == HAL_PIN_NONE) {
+            return LAMP_ERR_INVALID_ARGUMENT;
+        }
+        pwm_cfg.pin = pin;
+        hs = hal_pwm_init(&pwm_cfg);
+        if (hs != HAL_OK) {
+            while (initialized_channels > 0u) {
+                --initialized_channels;
+                (void)hal_pwm_deinit(s_lamp.pins[initialized_channels]);
+                s_lamp.pins[initialized_channels] = HAL_PIN_NONE;
+            }
+            return lamp_map_hal_status(hs);
+        }
+        s_lamp.pins[index] = pin;
+        ++initialized_channels;
     }
 
     s_lamp.initialized = true;
-    s_lamp.pin = config->pin;
+    s_lamp.channel_count = channel_count;
     s_lamp.applied.power = false;
     s_lamp.applied.brightness_percent = LAMP_BRIGHTNESS_MIN;
     s_lamp.applied.output_active = false;
+    s_lamp.applied.red = 0u;
+    s_lamp.applied.green = 0u;
+    s_lamp.applied.blue = 0u;
     /* A fresh initialization clears any fail-off barrier latched before a
      * deinit: initialization is the re-enable transition for a
      * deinitialized lamp, so re-initialization starts clean. */
@@ -308,25 +367,21 @@ static lamp_status_t lamp_control_init_locked(const lamp_control_config_t *confi
      * If the hold fails the strongest available fail-off is performed and
      * the HAL init is then rolled back so a later init attempt starts from
      * a clean, fully-off state. */
-    hs = hal_pwm_force_inactive(s_lamp.pin);
+    for (uint8_t index = 0u; index < s_lamp.channel_count; ++index) {
+        hs = hal_pwm_force_inactive(s_lamp.pins[index]);
+        if (hs != HAL_OK) {
+            break;
+        }
+    }
     if (hs != HAL_OK) {
         /* Best-effort fail-off before releasing the resource. */
         (void)lamp_fail_off();
 
-        /* Roll the HAL init back.  If the rollback deinit also fails the
-         * HAL resource is still held: preserve `initialized` and `pin` so a
-         * later lamp_control_deinit() retries the release, and return the
-         * original hold error (the call failed, but the lamp stays
-         * cleanable instead of leaking the pin). */
-        if (hal_pwm_deinit(s_lamp.pin) != HAL_OK) {
-            return lamp_map_hal_status(hs);
+        /* If the rollback deinit also fails the unreleased channels stay
+         * tracked so a later lamp_control_deinit() retries the release. */
+        if (lamp_release_channels() == HAL_OK) {
+            lamp_reset_released_state();
         }
-
-        s_lamp.initialized = false;
-        s_lamp.pin = HAL_PIN_NONE;
-        s_lamp.applied.power = false;
-        s_lamp.applied.brightness_percent = LAMP_BRIGHTNESS_MIN;
-        s_lamp.applied.output_active = false;
         return lamp_map_hal_status(hs);
     }
 
@@ -347,9 +402,11 @@ lamp_status_t lamp_control_init(const lamp_control_config_t *config)
 static lamp_status_t lamp_control_apply_state_locked(
     const lamp_state_t *requested, lamp_applied_state_t *applied_out)
 {
-    lamp_duty_t duty;
-    float duty_percent;
-    hal_status_t hs;
+    const uint8_t colors[LAMP_CONTROL_MAX_CHANNELS] = {
+        requested == NULL ? 0u : requested->red,
+        requested == NULL ? 0u : requested->green,
+        requested == NULL ? 0u : requested->blue,
+    };
 
     if (!s_lamp.initialized) {
         return LAMP_ERR_NOT_INITIALIZED;
@@ -374,31 +431,35 @@ static lamp_status_t lamp_control_apply_state_locked(
         return LAMP_ERR_OUT_OF_RANGE;
     }
 
-    /* Both power-off and zero brightness select the electrical off duty;
-     * the requested power state is still recorded below. */
-    if (!requested->power || requested->brightness_percent == LAMP_BRIGHTNESS_MIN) {
-        duty = LAMP_DUTY_MIN;
-    } else {
-        (void)lamp_duty_from_brightness(requested->brightness_percent, &duty);
-    }
-
-    duty_percent = (float)duty / (float)LAMP_DUTY_SCALE;
-
-    hs = hal_pwm_set_duty(s_lamp.pin, duty_percent);
-    if (hs != HAL_OK) {
-        /* Failure path: force the output off before propagating the error.
-         * If the fail-off escalation itself fails, report that instead —
-         * the state must not claim the output is off when it may be on. */
-        if (lamp_fail_off() != LAMP_OK) {
-            return LAMP_ERR_FAIL_OFF;
+    for (uint8_t index = 0u; index < s_lamp.channel_count; ++index) {
+        const uint32_t scaled_brightness =
+            (uint32_t)requested->brightness_percent * LAMP_DUTY_SCALE;
+        const lamp_duty_t channel_duty =
+            s_lamp.channel_count == 1u
+                ? scaled_brightness
+                : (scaled_brightness * colors[index] + 127u) / 255u;
+        const lamp_duty_t duty = requested->power ? channel_duty
+                                                  : LAMP_DUTY_MIN;
+        const hal_status_t hs = hal_pwm_set_duty(
+            s_lamp.pins[index], (float)duty / (float)LAMP_DUTY_SCALE);
+        if (hs != HAL_OK) {
+            /* Failure path: force every channel off before returning. */
+            if (lamp_fail_off() != LAMP_OK) {
+                return LAMP_ERR_FAIL_OFF;
+            }
+            return lamp_map_hal_status(hs);
         }
-        return lamp_map_hal_status(hs);
     }
 
     s_lamp.applied.power = requested->power;
     s_lamp.applied.brightness_percent = requested->brightness_percent;
     s_lamp.applied.output_active =
-        requested->power && (requested->brightness_percent > LAMP_BRIGHTNESS_MIN);
+        requested->power && (requested->brightness_percent > LAMP_BRIGHTNESS_MIN) &&
+        (s_lamp.channel_count == 1u || requested->red != 0u ||
+         requested->green != 0u || requested->blue != 0u);
+    s_lamp.applied.red = requested->red;
+    s_lamp.applied.green = requested->green;
+    s_lamp.applied.blue = requested->blue;
 
     if (applied_out != NULL) {
         *applied_out = s_lamp.applied;
@@ -491,29 +552,23 @@ lamp_status_t lamp_control_release_fail_off(void)
 
 static lamp_status_t lamp_control_deinit_locked(void)
 {
-    hal_status_t hs;
-
     if (!s_lamp.initialized) {
         return LAMP_ERR_NOT_INITIALIZED;
     }
 
-    hs = hal_pwm_deinit(s_lamp.pin);
-    if (hs != HAL_OK) {
-        /* Failure path: keep the output off even though the release failed,
-         * and stay initialized so the release can be retried.  If the
-         * fail-off escalation itself fails, report that instead of claiming
-         * the output is off. */
-        if (lamp_fail_off() != LAMP_OK) {
-            return LAMP_ERR_FAIL_OFF;
+    {
+        const hal_status_t hs = lamp_release_channels();
+        if (hs != HAL_OK) {
+            /* Failure path: keep the output off and stay initialized so the
+             * release can be retried. */
+            if (lamp_fail_off() != LAMP_OK) {
+                return LAMP_ERR_FAIL_OFF;
+            }
+            return lamp_map_hal_status(hs);
         }
-        return lamp_map_hal_status(hs);
     }
 
-    s_lamp.initialized = false;
-    s_lamp.pin = HAL_PIN_NONE;
-    s_lamp.applied.power = false;
-    s_lamp.applied.brightness_percent = LAMP_BRIGHTNESS_MIN;
-    s_lamp.applied.output_active = false;
+    lamp_reset_released_state();
 
     return LAMP_OK;
 }

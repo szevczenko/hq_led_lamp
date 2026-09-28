@@ -37,20 +37,39 @@ if(_klc_clk_req GREATER ${_klc_apb_hz})
         "8000 Hz).")
 endif()
 
-# --- Input-only GPIO check (ESP32-WROOM-32D) --------------------------------
-# GPIOs 34-39 have no output driver on ESP32.
-if(CONFIG_KLC_BOARD_ESP32_WROOM_32D AND
-   DEFINED CONFIG_KLC_LED_PWM_GPIO)
-    if(CONFIG_KLC_LED_PWM_GPIO GREATER 39)
-        message(FATAL_ERROR
-            "KLC: GPIO ${CONFIG_KLC_LED_PWM_GPIO} is not a valid ESP32 GPIO (valid: 0-39; GPIOs 34-39 are input-only).")
-    elseif(CONFIG_KLC_LED_PWM_GPIO GREATER_EQUAL 34)
-        message(FATAL_ERROR
-            "KLC: GPIO ${CONFIG_KLC_LED_PWM_GPIO} is input-only on ESP32-WROOM-32D "
-            "(GPIOs 34-39 have no output driver). "
-            "Set KLC_LED_PWM_GPIO to an output-capable GPIO (0-33).")
-    endif()
+# --- Lamp output GPIO checks ------------------------------------------------
+# Validates the active PWM or RGB output pins: output-capable on ESP32-WROOM-32D
+# (GPIOs 34-39 have no output driver), unique, and not shared with the
+# factory-reset button.
+set(_klc_led_pin_names)
+if(CONFIG_KLC_LAMP_TYPE_RGB)
+    list(APPEND _klc_led_pin_names KLC_LED_RGB_GPIO_R KLC_LED_RGB_GPIO_G KLC_LED_RGB_GPIO_B)
+elseif(DEFINED CONFIG_KLC_LED_PWM_GPIO)
+    list(APPEND _klc_led_pin_names KLC_LED_PWM_GPIO)
 endif()
+
+set(_klc_used_gpios)
+foreach(_klc_pin_name IN LISTS _klc_led_pin_names)
+    set(_klc_pin "${CONFIG_${_klc_pin_name}}")
+    if(CONFIG_KLC_BOARD_ESP32_WROOM_32D)
+        if(_klc_pin GREATER 39)
+            message(FATAL_ERROR
+                "KLC: ${_klc_pin_name}=${_klc_pin} is not a valid ESP32 GPIO (valid: 0-39; GPIOs 34-39 are input-only).")
+        elseif(_klc_pin GREATER_EQUAL 34)
+            message(FATAL_ERROR
+                "KLC: ${_klc_pin_name}=${_klc_pin} is input-only on ESP32-WROOM-32D "
+                "(GPIOs 34-39 have no output driver). Use an output-capable GPIO (0-33).")
+        endif()
+    endif()
+    if(_klc_pin IN_LIST _klc_used_gpios)
+        message(FATAL_ERROR "KLC: ${_klc_pin_name}=${_klc_pin} is already used by another lamp channel.")
+    endif()
+    if(CONFIG_KLC_FACTORY_RESET_ENABLE AND _klc_pin EQUAL CONFIG_KLC_FACTORY_RESET_GPIO)
+        message(FATAL_ERROR
+            "KLC: ${_klc_pin_name}=${_klc_pin} conflicts with KLC_FACTORY_RESET_GPIO.")
+    endif()
+    list(APPEND _klc_used_gpios ${_klc_pin})
+endforeach()
 
 # --- Partition table validation (TASK-107) -----------------------------------
 # Parse the custom partition table and verify the OTA-capable layout before

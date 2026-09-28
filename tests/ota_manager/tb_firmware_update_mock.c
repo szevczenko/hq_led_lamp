@@ -68,7 +68,8 @@ int tb_firmware_update_request_check(tb_client_t *client)
 int tb_firmware_update_confirm_health(tb_client_t *client)
 {
     (void)client;
-    return 0;
+    g_fw_mock.confirm_calls++;
+    return g_fw_mock.confirm_result;
 }
 
 bool tb_firmware_update_is_in_progress(void)

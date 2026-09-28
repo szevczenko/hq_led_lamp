@@ -38,6 +38,8 @@ typedef struct ota_manager_module {
 
 static ota_manager_module_t s_ota;
 static atomic_bool s_check_requested;
+static atomic_bool s_confirm_requested;
+static uint32_t s_confirm_retry_at_ms;
 static atomic_bool s_disconnected;
 static atomic_bool s_reboot_requested;
 
@@ -276,6 +278,8 @@ ota_manager_status_t ota_manager_init(const ota_manager_config_t *config)
         s_ota.cfg.blink_period_ms = OTA_MANAGER_BLINK_PERIOD_DEFAULT_MS;
     }
     atomic_store(&s_check_requested, false);
+    atomic_store(&s_confirm_requested, false);
+    s_confirm_retry_at_ms = 0u;
     atomic_store(&s_disconnected, false);
     atomic_store(&s_reboot_requested, false);
     s_ota.last_check_ms = ota_now();
@@ -318,6 +322,28 @@ void ota_manager_on_disconnected(void)
 void ota_manager_request_check(void)
 {
     atomic_store(&s_check_requested, true);
+}
+
+void ota_manager_request_image_confirmation(void)
+{
+    atomic_store(&s_confirm_requested, true);
+}
+
+static void ota_confirm_image(uint32_t now)
+{
+    if (!atomic_load(&s_confirm_requested) ||
+        !ota_time_reached(now, s_confirm_retry_at_ms))
+    {
+        return;
+    }
+    if (tb_firmware_update_confirm_health(s_ota.client) == 0)
+    {
+        atomic_store(&s_confirm_requested, false);
+        return;
+    }
+    s_confirm_retry_at_ms = now + OTA_MANAGER_CONFIRM_RETRY_MS;
+    osal_log_warning("[ota] running image confirmation failed; retry in %u ms",
+                     (unsigned)OTA_MANAGER_CONFIRM_RETRY_MS);
 }
 
 void ota_manager_poll(void)
@@ -377,6 +403,7 @@ void ota_manager_poll(void)
         return;
     }
 
+    ota_confirm_image(now);
     tb_firmware_update_poll(s_ota.client, now);
     ota_track_status(now);
 

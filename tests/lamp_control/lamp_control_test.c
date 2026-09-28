@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <string.h>
 
 #include "lamp_control.h"
 #include "hal_pwm_mock.h"
@@ -56,6 +57,7 @@ static lamp_control_config_t lamp_config(hal_polarity_t polarity)
 {
     lamp_control_config_t cfg;
 
+    memset(&cfg, 0, sizeof(cfg));
     cfg.pin = TEST_PIN;
     cfg.frequency_hz = TEST_FREQUENCY_HZ;
     cfg.polarity = polarity;
@@ -238,7 +240,7 @@ static void test_duty_rounding(void)
 
 static void test_operations_before_init_fail(void)
 {
-    lamp_state_t st = {true, 50u};
+    lamp_state_t st = { .power = true, .brightness_percent = 50u };
     lamp_applied_state_t applied;
 
     TEST_ASSERT_EQUAL_INT(LAMP_ERR_NOT_INITIALIZED,
@@ -495,7 +497,7 @@ static void test_apply_state_rejects_invalid_brightness(void)
 static void test_apply_state_rejects_null(void)
 {
     lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
-    lamp_state_t st_on = {true, 75u};
+    lamp_state_t st_on = { .power = true, .brightness_percent = 75u };
     lamp_applied_state_t applied;
 
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
@@ -530,7 +532,7 @@ static void test_apply_state_rejects_null(void)
 static void run_apply_hal_failure_keeps_off(hal_status_t injected)
 {
     lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
-    lamp_state_t st = {true, 60u};
+    lamp_state_t st = { .power = true, .brightness_percent = 60u };
     lamp_applied_state_t applied;
     lamp_status_t expected;
 
@@ -574,7 +576,7 @@ static void test_apply_hal_internal_fails_off(void)
 static void test_apply_fail_off_failure_reports(void)
 {
     lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
-    lamp_state_t st_on = {true, 60u};
+    lamp_state_t st_on = { .power = true, .brightness_percent = 60u };
     lamp_state_t st_bad;
     lamp_applied_state_t applied;
 
@@ -664,7 +666,7 @@ static void test_init_hold_failure_rollback_deinit_failure_keeps_cleanup(void)
 static void test_force_inactive_transient_failure_recovers(void)
 {
     lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
-    lamp_state_t st = {true, 70u};
+    lamp_state_t st = { .power = true, .brightness_percent = 70u };
 
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_apply_state(&st, NULL));
@@ -682,7 +684,7 @@ static void test_force_inactive_transient_failure_recovers(void)
 static void test_force_inactive_failure_escalates_and_reports(void)
 {
     lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
-    lamp_state_t st = {true, 70u};
+    lamp_state_t st = { .power = true, .brightness_percent = 70u };
     lamp_applied_state_t applied;
 
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
@@ -710,7 +712,7 @@ static void test_force_inactive_failure_escalates_and_reports(void)
 static void test_deinit_failure_fails_off(void)
 {
     lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
-    lamp_state_t st = {true, 60u};
+    lamp_state_t st = { .power = true, .brightness_percent = 60u };
 
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_apply_state(&st, NULL));
@@ -734,7 +736,7 @@ static void test_deinit_failure_fails_off(void)
 static void test_force_inactive_retains_requested_state(void)
 {
     lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
-    lamp_state_t st = {true, 90u};
+    lamp_state_t st = { .power = true, .brightness_percent = 90u };
     lamp_applied_state_t applied;
 
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
@@ -794,7 +796,7 @@ static void test_get_applied_state_validation(void)
 static void *apply_state_worker(void *arg)
 {
     lamp_applied_state_t applied;
-    lamp_state_t on = {true, RACE_BRIGHTNESS_PERCENT};
+    lamp_state_t on = { .power = true, .brightness_percent = RACE_BRIGHTNESS_PERCENT };
 
     for (unsigned i = 0u; i < RACE_ITERATIONS; ++i) {
         (void)lamp_control_apply_state(&on, &applied);
@@ -822,7 +824,7 @@ static void test_fail_off_racing_apply_state_stays_consistent(void)
 {
     const lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
     lamp_applied_state_t applied;
-    lamp_state_t on = {true, RACE_BRIGHTNESS_PERCENT};
+    lamp_state_t on = { .power = true, .brightness_percent = RACE_BRIGHTNESS_PERCENT };
     pthread_t worker;
     unsigned i;
 
@@ -886,7 +888,7 @@ static void test_apply_state_after_deinit_with_latched_barrier_is_not_initialize
 {
     const lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
     lamp_applied_state_t applied;
-    lamp_state_t on = {true, 70u};
+    lamp_state_t on = { .power = true, .brightness_percent = 70u };
 
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_apply_state(&on, &applied));
@@ -920,7 +922,7 @@ static void test_apply_state_barrier_reforce_failure_reports_fail_off(void)
 {
     const lamp_control_config_t cfg = lamp_config(HAL_POLARITY_ACTIVE_HIGH);
     lamp_applied_state_t applied;
-    lamp_state_t on = {true, 70u};
+    lamp_state_t on = { .power = true, .brightness_percent = 70u };
 
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_apply_state(&on, &applied));
@@ -951,6 +953,97 @@ static void test_apply_state_barrier_reforce_failure_reports_fail_off(void)
     assert_output_inactive(HAL_POLARITY_ACTIVE_HIGH);
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_release_fail_off());
     TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_deinit());
+}
+
+static void test_rgb_applies_three_channels_and_fails_off_together(void)
+{
+    const lamp_control_config_t cfg = {
+        .pin = (hal_pin_t)30u,
+        .pins = { (hal_pin_t)30u, (hal_pin_t)31u, (hal_pin_t)32u },
+        .channel_count = LAMP_CONTROL_MAX_CHANNELS,
+        .frequency_hz = TEST_FREQUENCY_HZ,
+        .polarity = HAL_POLARITY_ACTIVE_HIGH,
+    };
+    const lamp_state_t state = {
+        .power = true,
+        .brightness_percent = 80u,
+        .red = 255u,
+        .green = 128u,
+        .blue = 0u,
+    };
+    lamp_applied_state_t applied;
+
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
+    TEST_ASSERT_EQUAL_UINT32(3u, hal_pwm_mock_init_count());
+    TEST_ASSERT_EQUAL_INT(LAMP_OK,
+                          (int)lamp_control_apply_state(&state, &applied));
+    TEST_ASSERT_EQUAL_UINT32(3u, hal_pwm_mock_set_duty_count());
+    TEST_ASSERT_TRUE(applied.output_active);
+    TEST_ASSERT_EQUAL_UINT8(255u, applied.red);
+    TEST_ASSERT_EQUAL_UINT8(128u, applied.green);
+    TEST_ASSERT_EQUAL_UINT8(0u, applied.blue);
+
+    hal_pwm_mock_fail_next(HAL_PWM_MOCK_CALL_SET_DUTY, HAL_ERR_INTERNAL);
+    TEST_ASSERT_EQUAL_INT(LAMP_ERR_INTERNAL,
+                          (int)lamp_control_apply_state(&state, &applied));
+    TEST_ASSERT_EQUAL_INT(LAMP_OK,
+                          (int)lamp_control_get_applied_state(&applied));
+    TEST_ASSERT_FALSE(applied.output_active);
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_deinit());
+}
+
+static lamp_control_config_t rgb_config(void)
+{
+    const lamp_control_config_t cfg = {
+        .pins = { (hal_pin_t)30u, (hal_pin_t)31u, (hal_pin_t)32u },
+        .channel_count = LAMP_CONTROL_MAX_CHANNELS,
+        .frequency_hz = TEST_FREQUENCY_HZ,
+        .polarity = HAL_POLARITY_ACTIVE_HIGH,
+    };
+    return cfg;
+}
+
+static void test_rgb_keeps_full_color_resolution(void)
+{
+    const lamp_control_config_t cfg = rgb_config();
+    const lamp_state_t dim_red = {
+        .power = true, .brightness_percent = 100u, .red = 1u,
+    };
+    float duty = 0.0f;
+
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_apply_state(&dim_red, NULL));
+    TEST_ASSERT_EQUAL_INT(HAL_OK, (int)hal_pwm_mock_get_duty(&duty));
+    TEST_ASSERT_FLOAT_WITHIN(0.005f, 0.39f, duty);
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_deinit());
+}
+
+static void test_rgb_fail_off_attempts_every_channel(void)
+{
+    const lamp_control_config_t cfg = rgb_config();
+    uint32_t before;
+
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
+    before = hal_pwm_mock_force_inactive_count();
+    hal_pwm_mock_fail_next(HAL_PWM_MOCK_CALL_FORCE_INACTIVE, HAL_ERR_INTERNAL);
+    hal_pwm_mock_fail_next(HAL_PWM_MOCK_CALL_FORCE_INACTIVE, HAL_ERR_INTERNAL);
+    hal_pwm_mock_fail_next(HAL_PWM_MOCK_CALL_SET_DUTY, HAL_ERR_INTERNAL);
+    TEST_ASSERT_EQUAL_INT(LAMP_ERR_FAIL_OFF, (int)lamp_control_force_inactive());
+    /* Two attempts on the failing channel plus one on each remaining channel. */
+    TEST_ASSERT_EQUAL_UINT32(before + 4u, hal_pwm_mock_force_inactive_count());
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_deinit());
+}
+
+static void test_rgb_partial_deinit_failure_retries_only_unreleased(void)
+{
+    const lamp_control_config_t cfg = rgb_config();
+
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_init(&cfg));
+    hal_pwm_mock_fail_next(HAL_PWM_MOCK_CALL_DEINIT, HAL_ERR_INTERNAL);
+    TEST_ASSERT_EQUAL_INT(LAMP_ERR_INTERNAL, (int)lamp_control_deinit());
+    TEST_ASSERT_EQUAL_INT(LAMP_OK, (int)lamp_control_deinit());
+    TEST_ASSERT_EQUAL_UINT32(4u, hal_pwm_mock_deinit_count());
+    TEST_ASSERT_EQUAL_INT(LAMP_ERR_NOT_INITIALIZED, (int)lamp_control_deinit());
 }
 
 /* --------------------------------------------------------------------- */
@@ -1007,6 +1100,10 @@ int main(void)
     RUN_TEST(test_fail_off_racing_apply_state_stays_consistent);
     RUN_TEST(test_apply_state_after_deinit_with_latched_barrier_is_not_initialized);
     RUN_TEST(test_apply_state_barrier_reforce_failure_reports_fail_off);
+    RUN_TEST(test_rgb_applies_three_channels_and_fails_off_together);
+    RUN_TEST(test_rgb_keeps_full_color_resolution);
+    RUN_TEST(test_rgb_fail_off_attempts_every_channel);
+    RUN_TEST(test_rgb_partial_deinit_failure_retries_only_unreleased);
 
     return UNITY_END();
 }

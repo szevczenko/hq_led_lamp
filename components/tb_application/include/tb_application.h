@@ -99,12 +99,14 @@
  * service/test control channel: it drives the lamp hardware directly and
  * never writes shared attributes (dashboards keep writing shared
  * attributes; a server rule chain may synchronize RPC results into shared
- * attributes explicitly).  Exactly four methods are supported:
+ * attributes explicitly).  PWM builds support four methods; RGB builds
+ * additionally support `setColor`:
  *
  *   - `setPower`      `{"power": <boolean>}`                         — required,
  *   - `setBrightness` `{"brightness": <integer 0..100>}`             — required,
  *   - `setState`      `{"power": <boolean>, "brightness": <0..100>}` — both required,
  *   - `getState`      `{}`                                           — returns state.
+ *   - `setColor`      `{"red":0..255,"green":0..255,"blue":0..255}` — RGB only.
  *
  * Validation is strict and happens before any hardware action:
  *   - method name and params payload are length-bounded before parsing
@@ -309,6 +311,7 @@ typedef enum tb_application_status {
  * monotonic clock (osal_task_get_time_ms()).
  */
 typedef uint32_t (*tb_application_now_fn_t)(void);
+typedef int (*tb_application_rssi_fn_t)(int *dbm);
 
 /**
  * @brief Initialization configuration.
@@ -324,6 +327,7 @@ typedef struct tb_application_config {
     uint32_t     retry_max_delay_ms;              /**< Backoff cap; 0 = default. */
     uint32_t     max_retries;                     /**< Consecutive failed attempts per session; 0 = default. */
     tb_application_now_fn_t now_ms;               /**< Clock provider; NULL = OSAL monotonic clock. */
+    tb_application_rssi_fn_t rssi_dbm;            /**< RSSI provider; NULL = omit RSSI. */
 
     /**
      * @brief Periodic health telemetry interval (ms); 0 = default

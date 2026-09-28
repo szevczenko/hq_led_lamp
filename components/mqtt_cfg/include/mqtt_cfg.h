@@ -74,6 +74,7 @@
 #define MQTT_CFG_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -142,8 +143,9 @@ typedef enum mqtt_cfg_status {
                                                self-check failed. */
     MQTT_CFG_ERR_CONNECT           = -13, /**< Verified TLS connection failed or
                                                timed out. */
-    MQTT_CFG_ERR_NOT_APPLIED       = -14  /**< connect() called before a valid
+    MQTT_CFG_ERR_NOT_APPLIED       = -14, /**< connect() called before a valid
                                                transport configuration. */
+    MQTT_CFG_ERR_AUTH_REJECTED     = -15  /**< Broker rejected credentials. */
 } mqtt_cfg_status_t;
 
 /**
@@ -281,6 +283,9 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg);
  *         the verified transport was configured.
  */
 mqtt_cfg_status_t mqtt_cfg_load_and_apply(void);
+
+/** @brief Copy the validated broker URL into @p out. */
+mqtt_cfg_status_t mqtt_cfg_get_server_url(char *out, size_t out_size);
 
 /**
  * @brief Drive one verified TLS connection over the configured transport.

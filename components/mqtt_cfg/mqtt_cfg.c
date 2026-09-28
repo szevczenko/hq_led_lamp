@@ -116,6 +116,7 @@ static atomic_uint s_apply_generation;
 static atomic_uint s_connected_generation;
 static atomic_bool s_waiting_for_connection;
 static atomic_bool s_connect_failed;
+static atomic_bool s_auth_rejected;
 
 /* --------------------------------------------------------------------- */
 /* Local helpers                                                          */
@@ -524,6 +525,7 @@ const char *mqtt_cfg_status_name(mqtt_cfg_status_t status)
         case MQTT_CFG_ERR_APPLY:            return "apply_failed";
         case MQTT_CFG_ERR_CONNECT:          return "connect_failed";
         case MQTT_CFG_ERR_NOT_APPLIED:      return "not_applied";
+        case MQTT_CFG_ERR_AUTH_REJECTED:    return "auth_rejected";
         default:                            return "unknown";
     }
 }
@@ -1337,6 +1339,29 @@ mqtt_cfg_status_t mqtt_cfg_load_and_apply(void)
     return mqtt_cfg_apply(&cfg);
 }
 
+mqtt_cfg_status_t mqtt_cfg_get_server_url(char *out, size_t out_size)
+{
+    int written;
+
+    if (out == NULL || out_size == 0u) {
+        return MQTT_CFG_ERR_INVALID_ARGUMENT;
+    }
+    mqtt_cfg_lock();
+    if (!s_verified_applied) {
+        mqtt_cfg_unlock();
+        out[0] = '\0';
+        return MQTT_CFG_ERR_NOT_APPLIED;
+    }
+    written = snprintf(out, out_size, "mqtts://%s:%u", s_applied_cfg.hostname,
+                       (unsigned)s_applied_cfg.port);
+    mqtt_cfg_unlock();
+    if (written < 0 || (size_t)written >= out_size) {
+        out[0] = '\0';
+        return MQTT_CFG_ERR_BOUNDS;
+    }
+    return MQTT_CFG_OK;
+}
+
 /* --------------------------------------------------------------------- */
 /* Connect (verified TLS)                                                 */
 /* --------------------------------------------------------------------- */
@@ -1382,6 +1407,9 @@ static void mqtt_cfg_on_connect_failure(mqtt_connect_failure_reason_t reason)
     atomic_store_explicit(&s_connected_generation, 0u,
                           memory_order_release);
     atomic_store_explicit(&s_connect_failed, true, memory_order_release);
+    atomic_store_explicit(&s_auth_rejected,
+                          reason == MQTT_CONNECT_FAILURE_REASON_AUTH_REJECTED,
+                          memory_order_release);
     if (reason == MQTT_CONNECT_FAILURE_REASON_CONFIG_REJECTED)
     {
         /* The generic save/apply path was refused because the candidate did
@@ -1411,6 +1439,7 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
     mqtt_cfg_lock();
     if (!s_verified_applied)
     {
+        osal_log_error("mqtt_cfg: connect rejected because verified apply latch is clear");
         /* No apply requested a wait: clear any leftover wait state so a
          * stale generation can never be published for this connect (the
          * timeout path below mirrors this). */
@@ -1423,6 +1452,7 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
     }
     if (!mqtt_cfg_applied_transport_matches())
     {
+        osal_log_error("mqtt_cfg: applied transport snapshot mismatch");
         /* A mutation of any Mongoose value is treated exactly like a failed
          * configuration.  Close the gate so the changed state cannot be
          * retried without another validated apply. */
@@ -1449,6 +1479,7 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
      * the transport thread after mqtt_app_init() is never lost. */
     mqtt_cfg_lock();
     atomic_store_explicit(&s_connect_failed, false, memory_order_relaxed);
+    atomic_store_explicit(&s_auth_rejected, false, memory_order_relaxed);
     atomic_store_explicit(&s_connected_generation, 0u, memory_order_relaxed);
     atomic_store_explicit(&s_waiting_for_connection, true,
                           memory_order_release);
@@ -1526,8 +1557,11 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
         }
         if (connect_failed)
         {
+            const bool auth_rejected = atomic_load_explicit(
+                &s_auth_rejected, memory_order_acquire);
             mqtt_cfg_unlock();
-            return MQTT_CFG_ERR_CONNECT;
+            return auth_rejected ? MQTT_CFG_ERR_AUTH_REJECTED
+                                 : MQTT_CFG_ERR_CONNECT;
         }
         if (timeout_ms == 0u || waited >= timeout_ms)
         {

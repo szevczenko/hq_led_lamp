@@ -29,6 +29,7 @@ project(hq_led_lamp_mqtt_cfg_tests LANGUAGES C)
 
 set(MQTT_CFG_DIR     ${CMAKE_CURRENT_LIST_DIR}/../../components/mqtt_cfg)
 set(LAMP_CONTROL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/lamp_control/include)
+set(DEVICE_IDENTITY_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/device_identity/include)
 set(HAL_INCLUDE_DIR  ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hal/include)
 set(OSAL_DIR         ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/osal)
 set(OSAL_INCLUDE_DIR  ${OSAL_DIR}/include)
@@ -49,6 +50,7 @@ add_executable(mqtt_cfg_tests
     ${CMAKE_CURRENT_LIST_DIR}/mqtt_cfg_test.c
     ${CMAKE_CURRENT_LIST_DIR}/mqtt_app_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_mock.c
+    ${CMAKE_CURRENT_LIST_DIR}/device_identity_mock.c
     ${MQTT_CFG_DIR}/mqtt_cfg.c
     ${MONGOOSE_DIR}/mqtt_config.c
     ${OSAL_IMPL_DIR}/osal_file_impl.c
@@ -70,6 +72,7 @@ add_executable(mqtt_cfg_tests
 target_include_directories(mqtt_cfg_tests PRIVATE
     ${MQTT_CFG_DIR}/include
     ${LAMP_CONTROL_INCLUDE_DIR}
+    ${DEVICE_IDENTITY_INCLUDE_DIR}
     ${HAL_INCLUDE_DIR}
     ${OSAL_INCLUDE_DIR}
     ${OSAL_IMPL_DIR}
@@ -121,6 +124,7 @@ set(MONGOOSE_POSIX_DIR ${MONGOOSE_DIR}/posix)
 add_executable(mqtt_cfg_tls_it_tests
     ${CMAKE_CURRENT_LIST_DIR}/mqtt_cfg_tls_it_test.c
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_mock.c
+    ${CMAKE_CURRENT_LIST_DIR}/device_identity_mock.c
     ${MQTT_CFG_DIR}/mqtt_cfg.c
     ${MONGOOSE_DIR}/mqtt_app.c
     ${MONGOOSE_DIR}/mqtt_config.c
@@ -148,6 +152,7 @@ add_executable(mqtt_cfg_tls_it_tests
 target_include_directories(mqtt_cfg_tls_it_tests PRIVATE
     ${MQTT_CFG_DIR}/include
     ${LAMP_CONTROL_INCLUDE_DIR}
+    ${DEVICE_IDENTITY_INCLUDE_DIR}
     ${HAL_INCLUDE_DIR}
     ${OSAL_INCLUDE_DIR}
     ${OSAL_IMPL_DIR}

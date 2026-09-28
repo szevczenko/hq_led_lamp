@@ -248,8 +248,7 @@ tb_provisioning_status_t tb_provisioning_enroll(
         memset(response.token, 0, sizeof(response.token));
         return TB_PROVISIONING_ERR_RESPONSE;
     }
-    if (!write_identity(config, response.token) ||
-        osal_remove(TB_PROVISIONING_FILE_PATH) != OSAL_SUCCESS) {
+    if (!write_identity(config, response.token)) {
         memset(response.token, 0, sizeof(response.token));
         return TB_PROVISIONING_ERR_PERSIST;
     }

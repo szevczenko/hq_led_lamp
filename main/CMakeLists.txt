@@ -45,6 +45,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES lamp_control lamp_fs app_config network_manager mqtt_cfg
              device_identity app_state osal wifi_provisioning_manager mongoose
-             thingsboard tb_application tb_provisioning ota_manager
+             thingsboard tb_application tb_provisioning ota_manager factory_reset
              app_update esp_app_format
 )

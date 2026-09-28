@@ -368,6 +368,19 @@ bool wifi_mgmt_is_connected(void)
   return connected;
 }
 
+int wifi_mgmt_get_rssi(void)
+{
+  return -55;
+}
+
+bool wifi_mgmt_erase_credentials(void)
+{
+  pthread_mutex_lock(&s_mock_lock);
+  s_saved_credentials = false;
+  pthread_mutex_unlock(&s_mock_lock);
+  return true;
+}
+
 bool wifi_mgmt_subscribe(wifi_mgmt_event_t event, wifi_mgmt_event_cb_t cb,
                          void *user_data)
 {

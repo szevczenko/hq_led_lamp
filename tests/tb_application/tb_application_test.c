@@ -95,6 +95,10 @@
 #include "tb_client.h"
 #include "unity.h"
 
+#ifndef CONFIG_KLC_LAMP_TYPE_RGB
+#define CONFIG_KLC_LAMP_TYPE_RGB 0
+#endif
+
 #include "lamp_control_mock.h"
 #include "tb_application.h"
 
@@ -1350,18 +1354,30 @@ static void test_rpc_brightness_out_of_range_rejected(void)
 static void test_rpc_unknown_method_rejected(void)
 {
     cJSON *response;
+#if !CONFIG_KLC_LAMP_TYPE_RGB
     cJSON *method;
+#endif
 
     rpc_sync_state(true, 80u);
 
-    deliver_rpc(17u, "setColor", "{\"x\":1}");
+ #if CONFIG_KLC_LAMP_TYPE_RGB
+     deliver_rpc(17u, "setColor", "{\"red\":1,\"green\":2,\"blue\":3}");
+ #else
+     deliver_rpc(17u, "setColor", "{\"x\":1}");
+ #endif
 
     TEST_ASSERT_EQUAL_INT(1, rpc_response_count(17u));
-    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
-    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
-
     response = rpc_parse_response(17u);
     TEST_ASSERT_NOT_NULL(response);
+#if CONFIG_KLC_LAMP_TYPE_RGB
+    TEST_ASSERT_TRUE(cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(response, "success")));
+    TEST_ASSERT_EQUAL_UINT(2u, lamp_mock_apply_calls());
+    cJSON_Delete(response);
+    return;
+#else
+    TEST_ASSERT_EQUAL_UINT(1u, lamp_mock_apply_calls());
+    TEST_ASSERT_EQUAL_INT(TELEMETRY_AFTER_SYNC, telemetry_publish_count());
     TEST_ASSERT_TRUE(cJSON_IsFalse(
         cJSON_GetObjectItemCaseSensitive(response, "success")));
     TEST_ASSERT_TRUE(cJSON_IsString(
@@ -1372,6 +1388,7 @@ static void test_rpc_unknown_method_rejected(void)
     TEST_ASSERT_TRUE(cJSON_IsString(method));
     TEST_ASSERT_EQUAL_STRING("setColor", method->valuestring);
     cJSON_Delete(response);
+#endif
 }
 
 /**
@@ -1516,6 +1533,9 @@ static void telemetry_assert_only_documented_fields(const cJSON *telemetry)
     static const char *keys[] = {
         "power", "brightness", "pwm_duty", "connection_state",
         "hardware", "uptime_ms",
+#if CONFIG_KLC_LAMP_TYPE_RGB
+        "red", "green", "blue",
+#endif
     };
     const cJSON *child;
     int count = 0;
@@ -1525,8 +1545,8 @@ static void telemetry_assert_only_documented_fields(const cJSON *telemetry)
     {
         count++;
     }
-    TEST_ASSERT_EQUAL_INT(6, count);
-    for (int i = 0; i < 6; i++)
+    TEST_ASSERT_EQUAL_INT(CONFIG_KLC_LAMP_TYPE_RGB ? 9 : 6, count);
+    for (int i = 0; i < (CONFIG_KLC_LAMP_TYPE_RGB ? 9 : 6); i++)
     {
         TEST_ASSERT_NOT_NULL(
             cJSON_GetObjectItemCaseSensitive(telemetry, keys[i]));
@@ -1837,12 +1857,185 @@ static void test_resume_without_sync_forces_off(void)
 }
 
 /* --------------------------------------------------------------------- */
+/* Client-attribute persistence and RSSI                                  */
+/* --------------------------------------------------------------------- */
+
+static const char *latest_client_attributes(void)
+{
+    for (int i = mock_publish_count - 1; i >= 0; i--)
+    {
+        if (strcmp(mock_publishes[i].topic, ATTRIBUTES_TOPIC) == 0)
+        {
+            return mock_publishes[i].message;
+        }
+    }
+    return NULL;
+}
+
+static void test_sync_prefers_client_attributes(void)
+{
+    app_init(10000u);
+    connect_client();
+    deliver_response(last_request_id(),
+                     "{\"client\":{\"power\":true,\"brightness\":30},"
+                     "\"shared\":{\"power\":false,\"brightness\":90}}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(30u, lamp_mock_applied_brightness());
+}
+
+static void test_sync_partial_client_falls_back_to_shared(void)
+{
+    app_init(10000u);
+    connect_client();
+    deliver_response(last_request_id(),
+                     "{\"client\":{\"power\":true},"
+                     "\"shared\":{\"power\":true,\"brightness\":70}}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_EQUAL_UINT(70u, lamp_mock_applied_brightness());
+}
+
+static void test_sync_empty_scopes_apply_default_off(void)
+{
+    app_init(10000u);
+    connect_client();
+    deliver_response(last_request_id(), "{\"client\":{},\"shared\":{}}");
+    TEST_ASSERT_TRUE(tb_application_is_synchronized(s_client));
+    TEST_ASSERT_FALSE(lamp_mock_applied_power());
+    TEST_ASSERT_NOT_NULL(latest_client_attributes());
+}
+
+static void test_sync_request_carries_client_and_shared_keys(void)
+{
+    cJSON *root;
+
+    app_init(10000u);
+    connect_client();
+    TEST_ASSERT_TRUE(last_request_has_both_keys());
+    for (int i = mock_publish_count - 1; i >= 0; i--)
+    {
+        if (strncmp(mock_publishes[i].topic, RESPONSE_TOPIC_PREFIX,
+                    RESPONSE_TOPIC_PREFIX_LEN) == 0)
+        {
+            root = cJSON_Parse(mock_publishes[i].message);
+            TEST_ASSERT_NOT_NULL(root);
+            TEST_ASSERT_TRUE(cJSON_IsString(
+                cJSON_GetObjectItemCaseSensitive(root, "clientKeys")));
+            cJSON_Delete(root);
+            return;
+        }
+    }
+    TEST_FAIL_MESSAGE("no attribute request published");
+}
+
+static void test_rpc_change_published_as_client_attributes(void)
+{
+    cJSON *attrs;
+    cJSON *response;
+
+    rpc_sync_state(true, 80u);
+    deliver_rpc(40u, "setBrightness", "{\"brightness\":40}");
+    response = rpc_assert_success(40u);
+    cJSON_Delete(response);
+
+    attrs = cJSON_Parse(latest_client_attributes());
+    TEST_ASSERT_NOT_NULL(attrs);
+    TEST_ASSERT_TRUE(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(attrs, "power")));
+    TEST_ASSERT_EQUAL_INT(40, cJSON_GetObjectItemCaseSensitive(attrs, "brightness")->valueint);
+    cJSON_Delete(attrs);
+}
+
+static int test_rssi(int *dbm)
+{
+    *dbm = -61;
+    return 0;
+}
+
+static void test_telemetry_includes_rssi_when_available(void)
+{
+    tb_application_config_t cfg = make_app_config(10000u, 5u);
+    cJSON *telemetry;
+
+    cfg.rssi_dbm = test_rssi;
+    app_init_cfg(&cfg);
+    connect_client();
+    telemetry = cJSON_Parse(latest_telemetry_message());
+    TEST_ASSERT_NOT_NULL(telemetry);
+    TEST_ASSERT_EQUAL_INT(-61, cJSON_GetObjectItemCaseSensitive(telemetry, "rssi")->valueint);
+    cJSON_Delete(telemetry);
+}
+
+#if CONFIG_KLC_LAMP_TYPE_RGB
+static void test_rpc_set_color_single_channels_merge(void)
+{
+    uint8_t r, g, b;
+    cJSON *response;
+
+    rpc_sync_state(true, 80u);
+    deliver_rpc(50u, "setColor", "{\"red\":10,\"green\":20,\"blue\":30}");
+    cJSON_Delete(rpc_assert_success(50u));
+
+    deliver_rpc(51u, "setColor", "{\"red\":232}");
+    cJSON_Delete(rpc_assert_success(51u));
+    lamp_mock_applied_rgb(&r, &g, &b);
+    TEST_ASSERT_EQUAL_UINT8(232u, r);
+    TEST_ASSERT_EQUAL_UINT8(20u, g);
+    TEST_ASSERT_EQUAL_UINT8(30u, b);
+
+    deliver_rpc(52u, "setColor", "{\"blue\":0}");
+    response = rpc_assert_success(52u);
+    TEST_ASSERT_EQUAL_INT(232, cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(response, "applied"), "red")->valueint);
+    cJSON_Delete(response);
+    lamp_mock_applied_rgb(&r, &g, &b);
+    TEST_ASSERT_EQUAL_UINT8(232u, r);
+    TEST_ASSERT_EQUAL_UINT8(20u, g);
+    TEST_ASSERT_EQUAL_UINT8(0u, b);
+    TEST_ASSERT_TRUE(lamp_mock_applied_power());
+    TEST_ASSERT_EQUAL_UINT(80u, lamp_mock_applied_brightness());
+}
+
+static void test_rpc_set_color_invalid_channel_rejected_atomically(void)
+{
+    uint8_t r, g, b;
+
+    rpc_sync_state(true, 80u);
+    deliver_rpc(60u, "setColor", "{\"red\":1,\"green\":2,\"blue\":3}");
+    cJSON_Delete(rpc_assert_success(60u));
+
+    deliver_rpc(61u, "setColor", "{\"red\":100,\"green\":256}");
+    rpc_assert_error(61u, "invalid payload", "invalid RGB channel");
+    deliver_rpc(62u, "setColor", "{}");
+    rpc_assert_error(62u, "invalid payload", "invalid RGB channel");
+    deliver_rpc(63u, "setColor", "{\"green\":1.5}");
+    rpc_assert_error(63u, "invalid payload", "invalid RGB channel");
+
+    /* Sync + the first setColor only; rejected requests never apply. */
+    TEST_ASSERT_EQUAL_UINT(2u, lamp_mock_apply_calls());
+    lamp_mock_applied_rgb(&r, &g, &b);
+    TEST_ASSERT_EQUAL_UINT8(1u, r);
+    TEST_ASSERT_EQUAL_UINT8(2u, g);
+    TEST_ASSERT_EQUAL_UINT8(3u, b);
+}
+#endif
+
+/* --------------------------------------------------------------------- */
 /* Runner                                                                 */
 /* --------------------------------------------------------------------- */
 
 int main(void)
 {
     UNITY_BEGIN();
+#if CONFIG_KLC_LAMP_TYPE_RGB
+    RUN_TEST(test_rpc_set_color_single_channels_merge);
+    RUN_TEST(test_rpc_set_color_invalid_channel_rejected_atomically);
+#endif
+    RUN_TEST(test_sync_prefers_client_attributes);
+    RUN_TEST(test_sync_partial_client_falls_back_to_shared);
+    RUN_TEST(test_sync_empty_scopes_apply_default_off);
+    RUN_TEST(test_sync_request_carries_client_and_shared_keys);
+    RUN_TEST(test_rpc_change_published_as_client_attributes);
+    RUN_TEST(test_telemetry_includes_rssi_when_available);
     RUN_TEST(test_firmware_only_update_does_not_fail_lamp);
     RUN_TEST(test_firmware_keys_during_initial_sync_ignored);
     RUN_TEST(test_mixed_update_applies_lamp_state_and_raises_hint);

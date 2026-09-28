@@ -50,7 +50,9 @@ typedef struct hal_pwm_mock_counters {
     uint32_t deinit;
 } hal_pwm_mock_counters_t;
 
-static hal_pwm_mock_slot_t      s_slot;
+#define HAL_PWM_MOCK_MAX_SLOTS 3u
+
+static hal_pwm_mock_slot_t      s_slots[HAL_PWM_MOCK_MAX_SLOTS];
 static hal_pwm_mock_fail_queue_t s_failqueue;
 static hal_pwm_mock_counters_t  s_counts;
 
@@ -93,12 +95,14 @@ static bool hal_pwm_mock_take_failure(hal_pwm_mock_call_t call,
 
 void hal_pwm_mock_reset(void)
 {
-    s_slot.initialized = false;
-    s_slot.pin = HAL_PIN_NONE;
-    s_slot.polarity = HAL_POLARITY_ACTIVE_HIGH;
-    s_slot.frequency_hz = 0u;
-    s_slot.duty_percent = HAL_PWM_DUTY_MIN_PERCENT;
-    s_slot.forced_inactive = false;
+    for (uint8_t index = 0u; index < HAL_PWM_MOCK_MAX_SLOTS; ++index) {
+        s_slots[index].initialized = false;
+        s_slots[index].pin = HAL_PIN_NONE;
+        s_slots[index].polarity = HAL_POLARITY_ACTIVE_HIGH;
+        s_slots[index].frequency_hz = 0u;
+        s_slots[index].duty_percent = HAL_PWM_DUTY_MIN_PERCENT;
+        s_slots[index].forced_inactive = false;
+    }
 
     s_failqueue.count = 0u;
 
@@ -125,7 +129,7 @@ void hal_pwm_mock_fail_next(hal_pwm_mock_call_t call, hal_status_t status)
 
 bool hal_pwm_mock_is_initialized(void)
 {
-    return s_slot.initialized;
+    return s_slots[0].initialized;
 }
 
 uint32_t hal_pwm_mock_init_count(void)
@@ -150,12 +154,12 @@ uint32_t hal_pwm_mock_deinit_count(void)
 
 bool hal_pwm_mock_is_forced_inactive(void)
 {
-    return s_slot.forced_inactive;
+    return s_slots[0].forced_inactive;
 }
 
 hal_polarity_t hal_pwm_mock_get_polarity(void)
 {
-    return s_slot.polarity;
+    return s_slots[0].polarity;
 }
 
 hal_status_t hal_pwm_mock_get_duty(float *duty_percent)
@@ -163,11 +167,11 @@ hal_status_t hal_pwm_mock_get_duty(float *duty_percent)
     if (duty_percent == NULL) {
         return HAL_ERR_INVALID_ARGUMENT;
     }
-    if (!s_slot.initialized) {
+    if (!s_slots[0].initialized) {
         return HAL_ERR_NOT_INITIALIZED;
     }
 
-    *duty_percent = s_slot.duty_percent;
+    *duty_percent = s_slots[0].duty_percent;
 
     return HAL_OK;
 }
@@ -177,11 +181,11 @@ hal_status_t hal_pwm_mock_get_frequency(uint32_t *frequency_hz)
     if (frequency_hz == NULL) {
         return HAL_ERR_INVALID_ARGUMENT;
     }
-    if (!s_slot.initialized) {
+    if (!s_slots[0].initialized) {
         return HAL_ERR_NOT_INITIALIZED;
     }
 
-    *frequency_hz = s_slot.frequency_hz;
+    *frequency_hz = s_slots[0].frequency_hz;
 
     return HAL_OK;
 }
@@ -193,13 +197,13 @@ hal_status_t hal_pwm_mock_get_output(int *raw_level, bool *generating)
     if (raw_level == NULL || generating == NULL) {
         return HAL_ERR_INVALID_ARGUMENT;
     }
-    if (!s_slot.initialized) {
+    if (!s_slots[0].initialized) {
         return HAL_ERR_NOT_INITIALIZED;
     }
 
-    *generating = !s_slot.forced_inactive;
-    active = (*generating) && (s_slot.duty_percent > HAL_PWM_DUTY_MIN_PERCENT);
-    *raw_level = hal_pwm_mock_raw_for_logical(s_slot.polarity, active);
+    *generating = !s_slots[0].forced_inactive;
+    active = (*generating) && (s_slots[0].duty_percent > HAL_PWM_DUTY_MIN_PERCENT);
+    *raw_level = hal_pwm_mock_raw_for_logical(s_slots[0].polarity, active);
 
     return HAL_OK;
 }
@@ -211,6 +215,7 @@ hal_status_t hal_pwm_mock_get_output(int *raw_level, bool *generating)
 hal_status_t hal_pwm_init(const hal_pwm_config_t *config)
 {
     hal_status_t status;
+    hal_pwm_mock_slot_t *slot = NULL;
 
     s_counts.init += 1u;
 
@@ -231,17 +236,25 @@ hal_status_t hal_pwm_init(const hal_pwm_config_t *config)
     if (config->pin == HAL_PIN_NONE) {
         return HAL_ERR_INVALID_PIN;
     }
-    if (s_slot.initialized) {
-        return HAL_ERR_ALREADY_INITIALIZED;
+    for (uint8_t index = 0u; index < HAL_PWM_MOCK_MAX_SLOTS; ++index) {
+        if (s_slots[index].initialized && s_slots[index].pin == config->pin) {
+            return HAL_ERR_ALREADY_INITIALIZED;
+        }
+        if (!s_slots[index].initialized && slot == NULL) {
+            slot = &s_slots[index];
+        }
+    }
+    if (slot == NULL) {
+        return HAL_ERR_NO_RESOURCE;
     }
 
-    s_slot.initialized = true;
-    s_slot.pin = config->pin;
-    s_slot.polarity = config->polarity;
-    s_slot.frequency_hz = config->frequency_hz;
+    slot->initialized = true;
+    slot->pin = config->pin;
+    slot->polarity = config->polarity;
+    slot->frequency_hz = config->frequency_hz;
     /* The output starts in the logical INACTIVE state. */
-    s_slot.duty_percent = HAL_PWM_DUTY_MIN_PERCENT;
-    s_slot.forced_inactive = false;
+    slot->duty_percent = HAL_PWM_DUTY_MIN_PERCENT;
+    slot->forced_inactive = false;
 
     return HAL_OK;
 }
@@ -259,12 +272,19 @@ hal_status_t hal_pwm_set_duty(hal_pin_t pin, float duty_percent)
     if (!hal_pwm_mock_is_valid_duty(duty_percent)) {
         return HAL_ERR_OUT_OF_RANGE;
     }
-    if (!s_slot.initialized || s_slot.pin != pin) {
+    hal_pwm_mock_slot_t *slot = NULL;
+    for (uint8_t index = 0u; index < HAL_PWM_MOCK_MAX_SLOTS; ++index) {
+        if (s_slots[index].initialized && s_slots[index].pin == pin) {
+            slot = &s_slots[index];
+            break;
+        }
+    }
+    if (slot == NULL) {
         return HAL_ERR_NOT_INITIALIZED;
     }
 
-    s_slot.duty_percent = duty_percent;
-    s_slot.forced_inactive = false;
+    slot->duty_percent = duty_percent;
+    slot->forced_inactive = false;
 
     return HAL_OK;
 }
@@ -279,12 +299,19 @@ hal_status_t hal_pwm_force_inactive(hal_pin_t pin)
         return status;
     }
 
-    if (!s_slot.initialized || s_slot.pin != pin) {
+    hal_pwm_mock_slot_t *slot = NULL;
+    for (uint8_t index = 0u; index < HAL_PWM_MOCK_MAX_SLOTS; ++index) {
+        if (s_slots[index].initialized && s_slots[index].pin == pin) {
+            slot = &s_slots[index];
+            break;
+        }
+    }
+    if (slot == NULL) {
         return HAL_ERR_NOT_INITIALIZED;
     }
 
     /* The previously set duty is retained; only generation is halted. */
-    s_slot.forced_inactive = true;
+    slot->forced_inactive = true;
 
     return HAL_OK;
 }
@@ -299,16 +326,23 @@ hal_status_t hal_pwm_deinit(hal_pin_t pin)
         return status;
     }
 
-    if (!s_slot.initialized || s_slot.pin != pin) {
+    hal_pwm_mock_slot_t *slot = NULL;
+    for (uint8_t index = 0u; index < HAL_PWM_MOCK_MAX_SLOTS; ++index) {
+        if (s_slots[index].initialized && s_slots[index].pin == pin) {
+            slot = &s_slots[index];
+            break;
+        }
+    }
+    if (slot == NULL) {
         return HAL_ERR_NOT_INITIALIZED;
     }
 
-    s_slot.initialized = false;
-    s_slot.pin = HAL_PIN_NONE;
-    s_slot.polarity = HAL_POLARITY_ACTIVE_HIGH;
-    s_slot.frequency_hz = 0u;
-    s_slot.duty_percent = HAL_PWM_DUTY_MIN_PERCENT;
-    s_slot.forced_inactive = false;
+    slot->initialized = false;
+    slot->pin = HAL_PIN_NONE;
+    slot->polarity = HAL_POLARITY_ACTIVE_HIGH;
+    slot->frequency_hz = 0u;
+    slot->duty_percent = HAL_PWM_DUTY_MIN_PERCENT;
+    slot->forced_inactive = false;
 
     return HAL_OK;
 }

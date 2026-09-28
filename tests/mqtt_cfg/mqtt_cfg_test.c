@@ -227,6 +227,28 @@ static void test_load_and_apply_convenience(void)
     TEST_ASSERT_EQUAL_UINT(0u, lamp_mock_force_inactive_calls());
 }
 
+static void test_server_url_requires_verified_apply(void)
+{
+    char url[64];
+    char small[8];
+
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_NOT_APPLIED,
+                          mqtt_cfg_get_server_url(url, sizeof(url)));
+    TEST_ASSERT_EQUAL_STRING("", url);
+
+    TEST_ASSERT_TRUE(write_doc(DEV_MQTT_V1));
+    TEST_ASSERT_TRUE(provision_pem(host_pem_path("ca.crt"), "/cert/ca.crt"));
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_load_and_apply());
+
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_get_server_url(url, sizeof(url)));
+    TEST_ASSERT_EQUAL_STRING("mqtts://thingsboard.home.arpa:8883", url);
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_BOUNDS,
+                          mqtt_cfg_get_server_url(small, sizeof(small)));
+    TEST_ASSERT_EQUAL_STRING("", small);
+    TEST_ASSERT_EQUAL_INT(MQTT_CFG_ERR_INVALID_ARGUMENT,
+                          mqtt_cfg_get_server_url(NULL, sizeof(url)));
+}
+
 /* --------------------------------------------------------------------- */
 /* Plaintext rejection                                                    */
 /* --------------------------------------------------------------------- */
@@ -1115,6 +1137,7 @@ int main(void)
 
     RUN_TEST(test_valid_trusted_ca_configures_verified_tls);
     RUN_TEST(test_load_and_apply_convenience);
+    RUN_TEST(test_server_url_requires_verified_apply);
     RUN_TEST(test_plaintext_tls_mode_rejected);
     RUN_TEST(test_skip_verify_true_rejected);
     RUN_TEST(test_skip_verify_wrong_type_rejected);

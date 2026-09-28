@@ -41,6 +41,7 @@ typedef struct tb_client tb_client_t;
 #define OTA_MANAGER_REBOOT_DELAY_DEFAULT_MS  2000u
 #define OTA_MANAGER_BLINK_PERIOD_DEFAULT_MS  1000u
 #define OTA_MANAGER_INIT_RETRY_MS            10000u
+#define OTA_MANAGER_CONFIRM_RETRY_MS         1000u
 #define OTA_MANAGER_STR_MAX_LEN              127u
 
 typedef enum ota_manager_status {
@@ -82,6 +83,8 @@ void ota_manager_deinit(void);
 void ota_manager_on_connected(tb_client_t *client);
 void ota_manager_on_disconnected(void);
 void ota_manager_request_check(void);
+/** @brief Request confirmation of the running image; retried until it succeeds. */
+void ota_manager_request_image_confirmation(void);
 void ota_manager_poll(void);
 
 /** @brief True while a download runs or a restart is pending. */

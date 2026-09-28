@@ -6,9 +6,9 @@
  *
  * Scope
  * -----
- * This component owns the validated LED policy for a single lamp output:
- *   - a validated requested state (`power` + `brightness_percent`),
- *   - the state that was actually applied to the PWM output,
+ * This component owns the validated LED policy for one PWM or RGB lamp:
+ *   - a validated requested state (`power`, `brightness_percent`, and RGB),
+ *   - the state that was actually applied to the PWM outputs,
  *   - conversion of brightness into a normalized PWM duty using
  *     overflow-safe integer arithmetic,
  *   - a fail-off contract: the output is off before initialization and
@@ -29,6 +29,8 @@
  *     state so the protocol view stays consistent.
  *   - Invalid input at the boundary (values above 100, NULL pointers) is
  *     rejected with an error; it is never wrapped, clamped or truncated.
+ *   - RGB channel values use the closed interval `0..255`; the master
+ *     brightness scales all three channels before they reach the HAL.
  *
  * Duty semantics
  * --------------
@@ -131,6 +133,9 @@ typedef uint32_t lamp_duty_t;
 /** @brief Maximum normalized duty (100.00 %; electrically on). */
 #define LAMP_DUTY_MAX ((lamp_duty_t)(LAMP_BRIGHTNESS_MAX * LAMP_DUTY_SCALE))
 
+/** @brief Maximum number of independently driven PWM lamp channels. */
+#define LAMP_CONTROL_MAX_CHANNELS 3u
+
 /* --------------------------------------------------------------------- */
 /* State types                                                           */
 /* --------------------------------------------------------------------- */
@@ -145,6 +150,9 @@ typedef uint32_t lamp_duty_t;
 typedef struct lamp_state {
     bool      power;              /**< Requested power state (true = on). */
     uint8_t   brightness_percent; /**< Requested brightness, 0..100. */
+    uint8_t   red;                /**< Red channel, 0..255 (RGB mode). */
+    uint8_t   green;              /**< Green channel, 0..255 (RGB mode). */
+    uint8_t   blue;               /**< Blue channel, 0..255 (RGB mode). */
 } lamp_state_t;
 
 /**
@@ -160,6 +168,9 @@ typedef struct lamp_applied_state {
     bool      power;              /**< Last accepted requested power state. */
     uint8_t   brightness_percent; /**< Last accepted requested brightness, 0..100. */
     bool      output_active;      /**< Electrically on (power && brightness > 0). */
+    uint8_t   red;                /**< Last accepted red channel. */
+    uint8_t   green;              /**< Last accepted green channel. */
+    uint8_t   blue;               /**< Last accepted blue channel. */
 } lamp_applied_state_t;
 
 /* --------------------------------------------------------------------- */
@@ -175,6 +186,8 @@ typedef struct lamp_applied_state {
  */
 typedef struct lamp_control_config {
     hal_pin_t      pin;          /**< PWM output pin.  Must not be #HAL_PIN_NONE. */
+    hal_pin_t      pins[LAMP_CONTROL_MAX_CHANNELS]; /**< RGB pins; pins[0] mirrors pin. */
+    uint8_t        channel_count; /**< 0/1 for PWM, 3 for RGB. */
     uint32_t       frequency_hz; /**< PWM frequency in hertz.  Must be non-zero. */
     hal_polarity_t polarity;     /**< Active polarity of the output (HAL polarity contract). */
 } lamp_control_config_t;

@@ -344,6 +344,42 @@ static void test_init_failure_retried(void)
     TEST_ASSERT_EQUAL(1, g_fw_mock.request_check_calls);
 }
 
+static void test_image_confirmation_retried_until_success(void)
+{
+    init_and_connect();
+    g_fw_mock.confirm_result = -1;
+    ota_manager_request_image_confirmation();
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(1, g_fw_mock.confirm_calls);
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(1, g_fw_mock.confirm_calls);
+
+    g_fw_mock.confirm_result = 0;
+    s_now_ms += OTA_MANAGER_CONFIRM_RETRY_MS;
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(2, g_fw_mock.confirm_calls);
+    s_now_ms += OTA_MANAGER_CONFIRM_RETRY_MS;
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(2, g_fw_mock.confirm_calls);
+}
+
+static void test_image_confirmation_waits_for_updater(void)
+{
+    const ota_manager_config_t cfg = make_cfg();
+    TEST_ASSERT_EQUAL(OTA_MANAGER_OK, ota_manager_init(&cfg));
+    g_fw_mock.init_result = -1;
+    ota_manager_on_connected(CLIENT_A);
+    ota_manager_request_image_confirmation();
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(0, g_fw_mock.confirm_calls);
+
+    g_fw_mock.init_result = 0;
+    s_now_ms += OTA_MANAGER_INIT_RETRY_MS;
+    ota_manager_poll();
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(1, g_fw_mock.confirm_calls);
+}
+
 static void test_defaults_applied(void)
 {
     ota_manager_config_t cfg = make_cfg();
@@ -370,6 +406,8 @@ int main(void)
     RUN_TEST(test_disconnect_during_download_aborts);
     RUN_TEST(test_reconnect_during_download_fails_then_reinits);
     RUN_TEST(test_init_failure_retried);
+    RUN_TEST(test_image_confirmation_retried_until_success);
+    RUN_TEST(test_image_confirmation_waits_for_updater);
     RUN_TEST(test_defaults_applied);
     return UNITY_END();
 }

@@ -129,12 +129,15 @@
 #include "app_config.h"
 #include "app_state.h"
 #include "device_identity.h"
+#include "factory_reset.h"
 #include "hal_types.h"
 #include "lamp_control.h"
 #include "lamp_fs.h"
 #include "mongoose_process.h"
 #include "mqtt_cfg.h"
 #include "network_manager.h"
+#include "osal_dir.h"
+#include "osal_file.h"
 #include "osal_task.h"
 #include "ota_manager.h"
 #include "sdkconfig.h"
@@ -149,6 +152,9 @@ static tb_client_t *s_tb_client;
 static atomic_bool s_tb_connected_pending;
 static bool s_tb_needs_provisioning;
 static tb_provisioning_config_t s_provisioning_config;
+static unsigned s_auth_reject_count;
+static bool s_reprovision_backoff_active;
+static uint32_t s_reprovision_retry_at_ms;
 
 static void thingsboard_on_connected(tb_client_t *client, void *user_data)
 {
@@ -231,6 +237,7 @@ static void ota_on_indicator(bool on, void *ctx)
     const lamp_state_t indicator = {
         .power = on,
         .brightness_percent = CONFIG_KLC_OTA_BLINK_BRIGHTNESS_PERCENT,
+        .red = 255u, .green = 255u, .blue = 255u,
     };
 
     (void)ctx;
@@ -299,6 +306,118 @@ static void init_ota_manager(const esp_app_desc_t *app)
  * now-credentialed station to TLS without a reboot.
  */
 static bool s_network_bringup_done;
+
+static int thingsboard_rssi(int *dbm)
+{
+    return network_manager_get_rssi(dbm);
+}
+
+#if CONFIG_KLC_FACTORY_RESET_ENABLE
+#define FACTORY_RESET_BLINK_COUNT 3u
+#define FACTORY_RESET_BLINK_MS    150u
+#define FACTORY_RESET_STATE_FILES_MAX 16u
+
+static void factory_reset_blink(void)
+{
+    const lamp_state_t on = {
+        .power = true, .brightness_percent = 100u,
+        .red = 255u, .green = 255u, .blue = 255u,
+    };
+    const lamp_state_t off = { .power = false };
+
+    (void)lamp_control_release_fail_off();
+    for (unsigned i = 0u; i < FACTORY_RESET_BLINK_COUNT; ++i) {
+        (void)lamp_control_apply_state(&on, NULL);
+        (void)osal_task_delay_ms(FACTORY_RESET_BLINK_MS);
+        (void)lamp_control_apply_state(&off, NULL);
+        (void)osal_task_delay_ms(FACTORY_RESET_BLINK_MS);
+    }
+}
+
+static bool factory_reset_clear_state_dir(void)
+{
+    for (unsigned i = 0u; i < FACTORY_RESET_STATE_FILES_MAX; ++i) {
+        osal_dirent_t entry;
+        char path[sizeof(LAMP_FS_DIR_STATE) + OSAL_MAX_PATH_LEN + 1u];
+        bool found = false;
+        const osal_dir_id_t dir = osal_dir_open(LAMP_FS_DIR_STATE);
+
+        if (dir < 0) {
+            return false;
+        }
+        while (osal_dir_read(dir, &entry) == OSAL_SUCCESS) {
+            if (entry.type == OSAL_DIRENT_TYPE_FILE) {
+                found = true;
+                break;
+            }
+        }
+        (void)osal_dir_close(dir);
+        if (!found) {
+            return true;
+        }
+        if (snprintf(path, sizeof(path), "%s/%s", LAMP_FS_DIR_STATE,
+                     entry.name) >= (int)sizeof(path) ||
+            osal_remove(path) != OSAL_SUCCESS) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool factory_reset_erase(void *context)
+{
+    (void)context;
+    factory_reset_blink();
+    (void)lamp_control_force_inactive();
+    if (!network_manager_erase_credentials()) {
+        ESP_LOGE(TAG, "Factory reset: Wi-Fi credential erase failed");
+        return false;
+    }
+    if (!factory_reset_clear_state_dir()) {
+        ESP_LOGE(TAG, "Factory reset: runtime state cleanup failed");
+        return false;
+    }
+    return true;
+}
+
+static void factory_reset_indicator(bool active, void *context)
+{
+    (void)context;
+    ESP_LOGI(TAG, "Factory reset button %s", active ? "held" : "released");
+}
+
+static void factory_reset_restart(void *context)
+{
+    (void)context;
+    ESP_LOGW(TAG, "Factory reset completed; restarting");
+    esp_restart();
+}
+
+static void init_factory_reset(void)
+{
+    const factory_reset_config_t config = {
+        .pin = (hal_pin_t)CONFIG_KLC_FACTORY_RESET_GPIO,
+        .active_low = CONFIG_KLC_FACTORY_RESET_ACTIVE_LOW,
+        .hold_ms = CONFIG_KLC_FACTORY_RESET_HOLD_MS,
+        .erase = factory_reset_erase,
+        .indicator = factory_reset_indicator,
+        .restart = factory_reset_restart,
+    };
+    if (factory_reset_init(&config) != FACTORY_RESET_OK) {
+        ESP_LOGE(TAG, "Factory reset initialization failed");
+    }
+}
+#endif
+
+static void poll_factory_reset(void)
+{
+#if CONFIG_KLC_FACTORY_RESET_ENABLE
+    /* An update in progress must not be interrupted by a factory reset. */
+    if (app_state_current() != APP_STATE_OTA) {
+        factory_reset_poll(osal_task_get_time_ms());
+    }
+#endif
+}
 
 /* --------------------------------------------------------------------- */
 /* Network adapter wiring (TASK-109)                                       */
@@ -506,6 +625,7 @@ static bool supervise_network_gate(void)
            (waited_ms < NETWORK_CONNECT_TIMEOUT_MS))
     {
         app_state_poll(); /* feed — this task is the single watchdog owner */
+        poll_factory_reset();
         /* TASK-139: consume a controller-opened-portal STARTED promptly so
          * the gate yields to PROVISIONING instead of waiting out the window
          * with the portal already up (see the doc comment above). */
@@ -544,7 +664,16 @@ static bool init_lamp_output(void)
      * option that is "not set" is simply not #defined, so the polarity is
      * selected in preprocessor context (undefined -> 0 in #if). */
     lamp_control_config_t config = {
+#if CONFIG_KLC_LAMP_TYPE_RGB
+        .pins = {
+            (hal_pin_t)CONFIG_KLC_LED_RGB_GPIO_R,
+            (hal_pin_t)CONFIG_KLC_LED_RGB_GPIO_G,
+            (hal_pin_t)CONFIG_KLC_LED_RGB_GPIO_B,
+        },
+        .channel_count = LAMP_CONTROL_MAX_CHANNELS,
+#else
         .pin          = (hal_pin_t)CONFIG_KLC_LED_PWM_GPIO,
+#endif
         .frequency_hz = (uint32_t)CONFIG_KLC_LED_PWM_FREQUENCY_HZ,
 #if CONFIG_KLC_LED_PWM_ACTIVE_LOW
         .polarity     = HAL_POLARITY_ACTIVE_LOW,
@@ -696,12 +825,16 @@ static bool initialize_thingsboard_client(const char *access_token,
                                           const char *device_name)
 {
     tb_client_config_t configured = {
-        .server_url = "mqtts://home-assistance.local:8883",
         .on_connect = thingsboard_on_connected,
         .on_disconnect = thingsboard_on_disconnected,
         .on_connect_failure = thingsboard_on_connect_failure,
     };
 
+    if (mqtt_cfg_get_server_url(configured.server_url,
+                                sizeof(configured.server_url)) != MQTT_CFG_OK) {
+        ESP_LOGE(TAG, "Configured ThingsBoard server URL unavailable");
+        return false;
+    }
     (void)snprintf(configured.access_token, sizeof(configured.access_token),
                    "%s", access_token);
     (void)snprintf(configured.client_id, sizeof(configured.client_id),
@@ -719,6 +852,7 @@ static bool initialize_thingsboard_client(const char *access_token,
     const tb_application_config_t application_config = {
         .client = s_tb_client,
         .sync_timeout_ms = CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS,
+        .rssi_dbm = thingsboard_rssi,
         .hardware = "ESP32",
     };
     tb_application_status_t application_status =
@@ -728,6 +862,49 @@ static bool initialize_thingsboard_client(const char *access_token,
                  (int)application_status);
         tb_client_deinit(s_tb_client);
         s_tb_client = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void destroy_thingsboard_session(void)
+{
+    if (s_tb_client == NULL) {
+        return;
+    }
+    tb_application_deinit();
+    tb_client_disconnect(s_tb_client);
+    tb_client_deinit(s_tb_client);
+    s_tb_client = NULL;
+}
+
+/**
+ * @brief Create the ThingsBoard client for the current mode (bootstrap
+ *        provisioning or validated device identity).
+ */
+static bool create_thingsboard_session(void)
+{
+    const char *token = "provision";
+    const char *client_id = s_provisioning_config.device_name;
+
+    if (!s_tb_needs_provisioning &&
+        (device_identity_token(&token) != DEVICE_IDENTITY_OK ||
+         device_identity_client_id(&client_id) != DEVICE_IDENTITY_OK ||
+         token == NULL || client_id == NULL || token[0] == '\0' ||
+         client_id[0] == '\0'))
+    {
+        ESP_LOGE(TAG, "Validated ThingsBoard identity unavailable");
+        return false;
+    }
+
+    /* The server URL comes from the applied broker document. */
+    if (!load_broker_tls_configuration() ||
+        !initialize_thingsboard_client(token, client_id, client_id)) {
+        return false;
+    }
+    /* tb_client_init() writes mqtt_config; re-apply so the verified snapshot matches. */
+    if (!load_broker_tls_configuration()) {
+        destroy_thingsboard_session();
         return false;
     }
     return true;
@@ -760,16 +937,8 @@ static bool load_configuration(void)
             return false;
         }
         s_tb_needs_provisioning = true;
-        if (!initialize_thingsboard_client("provision",
-                           "tb_provision_bootstrap",
-                           s_provisioning_config.device_name)) {
+        if (!create_thingsboard_session()) {
             ESP_LOGE(TAG, "Bootstrap ThingsBoard client initialization failed");
-            return false;
-        }
-        if (!load_broker_tls_configuration()) {
-            tb_application_deinit();
-            tb_client_deinit(s_tb_client);
-            s_tb_client = NULL;
             return false;
         }
         ESP_LOGI(TAG, "Bootstrap provisioning required before ThingsBoard "
@@ -777,27 +946,7 @@ static bool load_configuration(void)
         return true;
     }
 
-    const char *token = NULL;
-    const char *client_id = NULL;
-    if (device_identity_token(&token) != DEVICE_IDENTITY_OK ||
-        device_identity_client_id(&client_id) != DEVICE_IDENTITY_OK ||
-        token == NULL || client_id == NULL || token[0] == '\0' ||
-        client_id[0] == '\0')
-    {
-        ESP_LOGE(TAG, "Validated ThingsBoard identity unavailable");
-        return false;
-    }
-
-    if (!initialize_thingsboard_client(token, client_id, client_id)) {
-        return false;
-    }
-    if (!load_broker_tls_configuration()) {
-        tb_application_deinit();
-        tb_client_deinit(s_tb_client);
-        s_tb_client = NULL;
-        return false;
-    }
-    return true;
+    return create_thingsboard_session();
 }
 
 /* --------------------------------------------------------------------- */
@@ -822,21 +971,43 @@ static bool load_configuration(void)
  */
 static bool connect_verified_tls(void)
 {
-    if (s_tb_needs_provisioning) {
-    } else if (!device_identity_is_loaded()) {
+    if (s_reprovision_backoff_active) {
+        if ((int32_t)(osal_task_get_time_ms() - s_reprovision_retry_at_ms) < 0) {
+            return false;
+        }
+        s_reprovision_backoff_active = false;
+    }
+    if (!s_tb_needs_provisioning && !device_identity_is_loaded()) {
         ESP_LOGE(TAG, "Device identity unavailable; ThingsBoard session "
                       "blocked, output stays off");
+        return false;
+    }
+    if (s_tb_client == NULL && !create_thingsboard_session()) {
         return false;
     }
 
     mqtt_cfg_status_t status = mqtt_cfg_connect(NETWORK_CONNECT_TIMEOUT_MS);
     if (status != MQTT_CFG_OK)
     {
-        if (s_tb_needs_provisioning && s_tb_client != NULL) {
-            tb_application_deinit();
-            tb_client_disconnect(s_tb_client);
-            tb_client_deinit(s_tb_client);
-            s_tb_client = NULL;
+        if (status == MQTT_CFG_ERR_AUTH_REJECTED && !s_tb_needs_provisioning) {
+            ++s_auth_reject_count;
+            ESP_LOGW(TAG, "ThingsBoard credentials rejected (%u/%u)",
+                     s_auth_reject_count,
+                     (unsigned)CONFIG_KLC_AUTH_REJECT_REPROVISION_THRESHOLD);
+            if (s_auth_reject_count >= CONFIG_KLC_AUTH_REJECT_REPROVISION_THRESHOLD) {
+                s_auth_reject_count = 0u;
+                if (tb_provisioning_load(&s_provisioning_config) == TB_PROVISIONING_OK) {
+                    destroy_thingsboard_session();
+                    s_tb_needs_provisioning = true;
+                    ESP_LOGW(TAG, "Re-provisioning scheduled after auth rejection");
+                } else {
+                    ESP_LOGE(TAG, "Bootstrap provisioning credentials unavailable");
+                }
+            }
+        }
+        /* Bootstrap sessions are rebuilt by the next TLS attempt. */
+        if (s_tb_needs_provisioning) {
+            destroy_thingsboard_session();
         }
         ESP_LOGE(TAG, "Verified TLS connect failed: %d (%s)"
                       " (output forced off, ThingsBoard session blocked)",
@@ -850,8 +1021,14 @@ static bool connect_verified_tls(void)
             CONFIG_KLC_THINGSBOARD_PROVISION_TIMEOUT_MS);
         if (provisioning_status != TB_PROVISIONING_OK ||
             !load_device_identity()) {
-            ESP_LOGE(TAG, "Bootstrap ThingsBoard enrollment failed: %s",
-                     tb_provisioning_status_name(provisioning_status));
+            ESP_LOGE(TAG, "Bootstrap ThingsBoard enrollment failed: %s; "
+                          "retry in %u ms",
+                     tb_provisioning_status_name(provisioning_status),
+                     (unsigned)CONFIG_KLC_REPROVISION_BACKOFF_MS);
+            destroy_thingsboard_session();
+            s_reprovision_backoff_active = true;
+            s_reprovision_retry_at_ms =
+                osal_task_get_time_ms() + CONFIG_KLC_REPROVISION_BACKOFF_MS;
             return false;
         }
         const char *token = NULL;
@@ -862,9 +1039,7 @@ static bool connect_verified_tls(void)
             return false;
         }
         if (!load_broker_tls_configuration()) {
-            tb_application_deinit();
-            tb_client_deinit(s_tb_client);
-            s_tb_client = NULL;
+            destroy_thingsboard_session();
             return false;
         }
         s_tb_needs_provisioning = false;
@@ -873,6 +1048,8 @@ static bool connect_verified_tls(void)
             return false;
         }
     }
+
+    s_auth_reject_count = 0u;
 
     /* Valid identity + verified TLS: the ThingsBoard session is now ready
      * to enter the existing synchronization state. */
@@ -895,6 +1072,7 @@ static bool connect_verified_tls(void)
  */
 static void supervise_iteration(void)
 {
+    poll_factory_reset();
     /* Log the parked/gate states only ONCE per state entry so a degraded
      * device does not flood the log at the supervisor cadence. */
     static app_state_t s_last_reported = APP_STATE_BOOT;
@@ -1056,6 +1234,13 @@ static void supervise_iteration(void)
         break;
 
     case APP_STATE_TLS:
+        if (s_reprovision_backoff_active &&
+            (int32_t)(osal_task_get_time_ms() - s_reprovision_retry_at_ms) < 0)
+        {
+            /* Waiting out the re-provisioning backoff: no attempt, so no
+             * retry budget is consumed. */
+            break;
+        }
         if (connect_verified_tls())
         {
             (void)app_state_deliver(APP_EVENT_TLS_CONNECTED, APP_OWNER_MQTT);
@@ -1072,6 +1257,7 @@ static void supervise_iteration(void)
         {
             (void)app_state_deliver(APP_EVENT_SYNC_COMPLETE,
                                     APP_OWNER_THINGSBOARD);
+            ota_manager_request_image_confirmation();
             ota_manager_request_check();
         }
         else if (report_entry)
@@ -1119,6 +1305,13 @@ static void supervise_iteration(void)
                           "waiting for provisioning / reset / OTA");
         }
         s_last_exhausted = app_state_retry_exhausted();
+        /* A parked device restarts once the re-provisioning backoff expires. */
+        if (s_reprovision_backoff_active && s_last_exhausted &&
+            (int32_t)(osal_task_get_time_ms() - s_reprovision_retry_at_ms) >= 0)
+        {
+            ESP_LOGW(TAG, "Re-provisioning backoff elapsed; restarting");
+            esp_restart();
+        }
         break;
 
     case APP_STATE_FATAL:
@@ -1195,6 +1388,9 @@ void app_main(void)
          * run.  A PWM init failure must never block storage bring-up. */
         ESP_LOGW(TAG, "Lamp output unavailable; continuing with output off");
     }
+#if CONFIG_KLC_FACTORY_RESET_ENABLE
+    init_factory_reset();
+#endif
 
     /* Application state machine + watchdog (TASK-115).  The supervisor
      * loop below is the single watchdog-feeding task. */
