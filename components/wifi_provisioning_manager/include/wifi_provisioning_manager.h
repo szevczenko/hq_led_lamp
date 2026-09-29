@@ -52,10 +52,10 @@
  * --------------------------
  * The provisioning portal rides the shared Mongoose process that also hosts
  * MQTT/TLS.  start() REQUIRES the shared process to be running
- * (MongooseProcess_IsRunning) and fails cleanly otherwise; the adapter never
- * initializes or deinitializes the shared process.  stop() (and deinit())
- * only close the listeners owned by the provisioning portal and never tear
- * the shared process down.
+ * (MongooseProcess_IsRunning) and fails cleanly otherwise; the platform API
+ * never initializes or deinitializes the shared process. stop() (and
+ * deinit()) only close the provisioning listeners and never tear the shared
+ * process down.
  *
  * Threading contract
  * ------------------

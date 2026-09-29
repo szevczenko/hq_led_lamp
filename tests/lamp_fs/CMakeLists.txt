@@ -16,6 +16,7 @@ cmake_minimum_required(VERSION 3.16)
 project(hq_led_lamp_lamp_fs_tests LANGUAGES C)
 
 set(LAMP_FS_DIR      ${CMAKE_CURRENT_LIST_DIR}/../../components/lamp_fs)
+set(HQ_STORAGE_DIR   ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hq_storage)
 set(OSAL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/osal/include)
 set(OSAL_IMPL_DIR    ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/osal/posix)
 set(LAMP_CONTROL_UNITY_DIR ${CMAKE_CURRENT_LIST_DIR}/../lamp_control/unity)
@@ -24,11 +25,13 @@ add_executable(lamp_fs_tests
     ${CMAKE_CURRENT_LIST_DIR}/lamp_fs_test.c
     ${CMAKE_CURRENT_LIST_DIR}/osal_fs_mock.c
     ${LAMP_FS_DIR}/lamp_fs.c
+    ${HQ_STORAGE_DIR}/hq_storage.c
     ${LAMP_CONTROL_UNITY_DIR}/unity.c
 )
 
 target_include_directories(lamp_fs_tests PRIVATE
     ${LAMP_FS_DIR}/include
+    ${HQ_STORAGE_DIR}/include
     ${OSAL_INCLUDE_DIR}
     ${OSAL_IMPL_DIR}
     ${CMAKE_CURRENT_LIST_DIR}

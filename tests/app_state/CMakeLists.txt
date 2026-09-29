@@ -38,6 +38,7 @@ cmake_minimum_required(VERSION 3.16)
 project(hq_led_lamp_app_state_tests LANGUAGES C)
 
 set(APP_STATE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/app_state)
+set(HQ_APP_SERVICES_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hq_app_services)
 set(LAMP_CONTROL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/lamp_control/include)
 set(HAL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hal/include)
 set(OSAL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/osal/include)
@@ -51,11 +52,13 @@ add_executable(app_state_tests
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/osal_test_support.c
     ${APP_STATE_DIR}/app_state.c
+    ${HQ_APP_SERVICES_DIR}/hq_app_state.c
     ${LAMP_CONTROL_UNITY_DIR}/unity.c
 )
 
 target_include_directories(app_state_tests PRIVATE
     ${APP_STATE_DIR}/include
+    ${HQ_APP_SERVICES_DIR}/include
     ${LAMP_CONTROL_INCLUDE_DIR}
     ${HAL_INCLUDE_DIR}
     ${OSAL_INCLUDE_DIR}

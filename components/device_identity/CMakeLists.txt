@@ -17,7 +17,7 @@
 # include/device_identity.h.
 
 idf_component_register(
-    SRCS "device_identity.c"
+    SRCS "device_identity_facade.c"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES osal json app_config lamp_control
+    PRIV_REQUIRES osal json app_config lamp_control thingsboard
 )

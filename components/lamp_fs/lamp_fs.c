@@ -18,17 +18,11 @@
 
 #include "lamp_fs.h"
 
-#include <string.h>
-
-#include "osal_dir.h"
-#include "osal_error.h"
-#include "osal_mount.h"
+#include "hq_storage.h"
 
 /* --------------------------------------------------------------------- */
 /* Internal state                                                         */
 /* --------------------------------------------------------------------- */
-
-static bool s_mounted;
 
 /** @brief Directories that must exist after a successful bootstrap. */
 static const char *const s_required_dirs[] = {
@@ -44,11 +38,33 @@ static const char *const s_required_dirs[] = {
 /* Helpers                                                                */
 /* --------------------------------------------------------------------- */
 
-static void run_fail_safe(const lamp_fs_config_t *config)
+static void run_fail_safe(hq_storage_status_t status, void *user_data)
 {
+    const lamp_fs_config_t *config = user_data;
+
+    (void)status;
     if (config != NULL && config->fail_safe_cb != NULL)
     {
         config->fail_safe_cb();
+    }
+}
+
+static lamp_fs_status_t map_status(hq_storage_status_t status)
+{
+    switch (status)
+    {
+    case HQ_STORAGE_OK:
+        return LAMP_FS_OK;
+    case HQ_STORAGE_ERR_INVALID_ARGUMENT:
+        return LAMP_FS_ERR_INVALID_ARGUMENT;
+    case HQ_STORAGE_ERR_MOUNT:
+        return LAMP_FS_ERR_MOUNT;
+    case HQ_STORAGE_ERR_UNMOUNT:
+        return LAMP_FS_ERR_UNMOUNT;
+    case HQ_STORAGE_ERR_DIRECTORY:
+    case HQ_STORAGE_ERR_NOT_MOUNTED:
+    default:
+        return LAMP_FS_ERR_DIRECTORY;
     }
 }
 
@@ -58,7 +74,7 @@ static void run_fail_safe(const lamp_fs_config_t *config)
 
 bool lamp_fs_is_mounted(void)
 {
-    return s_mounted;
+    return hq_storage_is_mounted();
 }
 
 lamp_fs_status_t lamp_fs_ensure_dir(const char *logical_path)
@@ -68,83 +84,24 @@ lamp_fs_status_t lamp_fs_ensure_dir(const char *logical_path)
         return LAMP_FS_ERR_INVALID_ARGUMENT;
     }
 
-    if (!s_mounted)
-    {
-        return LAMP_FS_ERR_DIRECTORY;
-    }
-
-    int32_t rc = osal_mkdir(logical_path);
-    if (rc == OSAL_SUCCESS || rc == OSAL_ERR_NAME_TAKEN)
-    {
-        /* OSAL_ERR_NAME_TAKEN: the directory already exists — idempotent
-         * success, existing contents are untouched. */
-        return LAMP_FS_OK;
-    }
-
-    return LAMP_FS_ERR_DIRECTORY;
+    return map_status(hq_storage_ensure_dir(logical_path));
 }
 
 lamp_fs_status_t lamp_fs_init(const lamp_fs_config_t *config)
 {
-    s_mounted = false;
+    const hq_storage_config_t storage_config = {
+        .partition_label = LAMP_FS_PARTITION_LABEL,
+        .mount_point = LAMP_FS_MOUNT_POINT,
+        .directories = s_required_dirs,
+        .directory_count = LAMP_FS_REQUIRED_DIR_COUNT,
+        .on_failure = run_fail_safe,
+        .user_data = (void *)config,
+    };
 
-    int32_t rc = osal_mount(LAMP_FS_PARTITION_LABEL, LAMP_FS_MOUNT_POINT);
-    if (rc != OSAL_SUCCESS)
-    {
-        /* Safe failure: do not format, do not erase.  Existing storage —
-         * including device credentials — must survive this error.  Force
-         * the lamp output off and report the failure. */
-        run_fail_safe(config);
-        return LAMP_FS_ERR_MOUNT;
-    }
-
-    s_mounted = true;
-
-    for (size_t i = 0U; i < LAMP_FS_REQUIRED_DIR_COUNT; ++i)
-    {
-        lamp_fs_status_t status = lamp_fs_ensure_dir(s_required_dirs[i]);
-        if (status != LAMP_FS_OK)
-        {
-            /* Safe failure: keep whatever directories were created and all
-             * existing file contents, force the output off, report it. */
-            run_fail_safe(config);
-
-            /* Do not leave a hidden mount behind: unmount the volume so the
-             * OSAL backend state, lamp_fs_is_mounted() and a later retry of
-             * lamp_fs_init() stay consistent.  The storage contents are
-             * untouched by the unmount. */
-            int32_t unmount_rc = osal_unmount(LAMP_FS_MOUNT_POINT);
-            if (unmount_rc != OSAL_SUCCESS)
-            {
-                /* The unmount failed, so the backend volume is still
-                 * mounted.  Keep lamp_fs_is_mounted() consistent with that
-                 * (true) instead of reporting a mount that no longer
-                 * exists, and surface the unmount failure separately. */
-                s_mounted = true;
-                return LAMP_FS_ERR_UNMOUNT;
-            }
-
-            s_mounted = false;
-            return status;
-        }
-    }
-
-    return LAMP_FS_OK;
+    return map_status(hq_storage_init(&storage_config));
 }
 
 lamp_fs_status_t lamp_fs_deinit(void)
 {
-    if (!s_mounted)
-    {
-        return LAMP_FS_OK;
-    }
-
-    int32_t rc = osal_unmount(LAMP_FS_MOUNT_POINT);
-    if (rc != OSAL_SUCCESS)
-    {
-        return LAMP_FS_ERR_UNMOUNT;
-    }
-
-    s_mounted = false;
-    return LAMP_FS_OK;
+    return map_status(hq_storage_deinit());
 }

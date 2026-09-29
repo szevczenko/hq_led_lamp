@@ -130,18 +130,23 @@ void mqtt_app_mock_simulate_apply_config(void)
     {
         snapshot.cert_source = source;
         snapshot.cert_value = value;
+        snapshot.cert_resolved = mqtt_config_get_cert(MQTT_CONFIG_VALUE_CERT);
     }
     if (mqtt_config_get_cert_source(&source, &value,
                                     MQTT_CONFIG_VALUE_CLIENT_CERT))
     {
         snapshot.client_cert_source = source;
         snapshot.client_cert_value = value;
+        snapshot.client_cert_resolved =
+            mqtt_config_get_cert(MQTT_CONFIG_VALUE_CLIENT_CERT);
     }
     if (mqtt_config_get_cert_source(&source, &value,
                                     MQTT_CONFIG_VALUE_CLIENT_KEY))
     {
         snapshot.client_key_source = source;
         snapshot.client_key_value = value;
+        snapshot.client_key_resolved =
+            mqtt_config_get_cert(MQTT_CONFIG_VALUE_CLIENT_KEY);
     }
 
     /* Mirror the real apply-config handler (mqtt_app.c): the reconnect only

@@ -22,6 +22,7 @@ set(HAL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../platform/hq_platform/src/
 set(OSAL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../platform/hq_platform/src/osal/include)
 set(OSAL_IMPL_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../platform/hq_platform/src/osal/posix)
 set(WIFI_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../platform/hq_platform/src/wifi)
+set(NET_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../platform/hq_platform/src/hq_net/include)
 set(UNITY_DIR ${CMAKE_CURRENT_LIST_DIR}/../../lamp_control/unity)
 
 find_package(Threads REQUIRED)
@@ -32,6 +33,7 @@ add_executable(network_manager_concurrency_tests
     ${CMAKE_CURRENT_LIST_DIR}/../osal_test_support.c
     ${CMAKE_CURRENT_LIST_DIR}/../lamp_control_mock.c
     ${NETWORK_MANAGER_DIR}/network_manager.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../../platform/hq_platform/src/hq_net/hq_net.c
     ${UNITY_DIR}/unity.c
 )
 
@@ -42,6 +44,7 @@ target_include_directories(network_manager_concurrency_tests PRIVATE
     ${OSAL_INCLUDE_DIR}
     ${OSAL_IMPL_DIR}
     ${WIFI_INCLUDE_DIR}
+    ${NET_INCLUDE_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/..
     ${CMAKE_CURRENT_LIST_DIR}/../config
     ${UNITY_DIR}
@@ -53,6 +56,7 @@ target_include_directories(network_manager_concurrency_tests PRIVATE
 # STA-only startup, matching the main network-manager suite.
 target_compile_definitions(network_manager_concurrency_tests PRIVATE
     CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA=1
+    HQ_NET_TEST_OBSERVABILITY=1
 )
 
 target_compile_options(network_manager_concurrency_tests PRIVATE -Wall -Wextra -Werror -Wpedantic)

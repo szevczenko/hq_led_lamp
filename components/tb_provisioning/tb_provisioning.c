@@ -6,19 +6,12 @@
 
 #include "cJSON.h"
 #include "osal_file.h"
-#include "osal_task.h"
-#include "tb_provision.h"
+#include "tb_enrollment.h"
 
 #define IDENTITY_PATH "/config/identity.json"
 #define IDENTITY_TMP_PATH "/config/identity.json.tmp"
 #define IDENTITY_CLIENT_ID_MAX 64U
 #define IDENTITY_TOKEN_MAX 128U
-
-typedef struct {
-    volatile bool ready;
-    volatile bool valid;
-    char token[IDENTITY_TOKEN_MAX + 1U];
-} response_state_t;
 
 static bool printable_value(const char *value, size_t max_len, bool no_space)
 {
@@ -162,31 +155,8 @@ tb_provisioning_status_t tb_provisioning_load(tb_provisioning_config_t *config)
     return TB_PROVISIONING_OK;
 }
 
-static void response_callback(const char *json, void *user_data)
-{
-    response_state_t *state = (response_state_t *)user_data;
-    cJSON *root;
-    cJSON *status;
-    cJSON *type;
-    cJSON *value;
-    if (json == NULL || state == NULL) {
-        return;
-    }
-    root = cJSON_Parse(json);
-    status = root == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(root, "status");
-    type = root == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(root, "credentialsType");
-    value = root == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(root, "credentialsValue");
-    if (cJSON_IsString(status) && strcmp(status->valuestring, "SUCCESS") == 0 &&
-        cJSON_IsString(type) && strcmp(type->valuestring, "ACCESS_TOKEN") == 0 &&
-        cJSON_IsString(value) && printable_value(value->valuestring, IDENTITY_TOKEN_MAX, true)) {
-        (void)strncpy(state->token, value->valuestring, sizeof(state->token) - 1U);
-        state->valid = true;
-    }
-    state->ready = true;
-    cJSON_Delete(root);
-}
-
-static bool write_identity(const tb_provisioning_config_t *config, const char *token)
+static bool write_identity(const tb_provisioning_config_t *config,
+               const tb_enrollment_credentials_t *credentials)
 {
     cJSON *root = cJSON_CreateObject();
     char *json;
@@ -194,7 +164,8 @@ static bool write_identity(const tb_provisioning_config_t *config, const char *t
     bool success = false;
     if (root == NULL || cJSON_AddNumberToObject(root, "schema_version", 1) == NULL ||
         cJSON_AddStringToObject(root, "client_id", config->device_name) == NULL ||
-        cJSON_AddStringToObject(root, "access_token", token) == NULL) {
+        cJSON_AddStringToObject(root, "access_token",
+                    credentials->credentials_value) == NULL) {
         cJSON_Delete(root);
         return false;
     }
@@ -216,42 +187,37 @@ static bool write_identity(const tb_provisioning_config_t *config, const char *t
     return success;
 }
 
+static bool persist_identity(const tb_enrollment_credentials_t *credentials,
+                 void *user_data)
+{
+    return write_identity((const tb_provisioning_config_t *)user_data,
+                  credentials);
+}
+
 tb_provisioning_status_t tb_provisioning_enroll(
     tb_client_t *client, const tb_provisioning_config_t *config,
     uint32_t timeout_ms)
 {
-    response_state_t response = { 0 };
-    tb_provision_request_t request;
-    uint32_t start;
+    tb_enrollment_config_t enrollment_config;
+    tb_enrollment_status_t status;
     if (client == NULL || config == NULL || timeout_ms == 0U) {
         return TB_PROVISIONING_ERR_REQUEST;
     }
-    request = (tb_provision_request_t){
+    enrollment_config = (tb_enrollment_config_t){
         .device_name = config->device_name,
         .provision_device_key = config->provision_device_key,
         .provision_device_secret = config->provision_device_secret,
     };
-    if (tb_provision_request(client, &request, response_callback, &response,
-                             timeout_ms) != 0) {
+    status = tb_enrollment_enroll(client, &enrollment_config, timeout_ms,
+                       persist_identity, (void *)config, NULL, NULL);
+    switch (status) {
+    case TB_ENROLLMENT_OK:
+        return TB_PROVISIONING_OK;
+    case TB_ENROLLMENT_ERR_PERSIST:
+        return TB_PROVISIONING_ERR_PERSIST;
+    case TB_ENROLLMENT_ERR_RESPONSE:
+        return TB_PROVISIONING_ERR_RESPONSE;
+    default:
         return TB_PROVISIONING_ERR_REQUEST;
     }
-    start = osal_task_get_time_ms();
-    while (!response.ready &&
-           (uint32_t)(osal_task_get_time_ms() - start) < timeout_ms) {
-        osal_task_delay_ms(50U);
-    }
-    if (!response.ready || !response.valid) {
-        /* Unregister the callback before giving up: `response` is about to
-         * go out of scope, and a reply that arrives after this point must
-         * never be delivered into its (now stale) stack storage. */
-        tb_provision_cancel(client);
-        memset(response.token, 0, sizeof(response.token));
-        return TB_PROVISIONING_ERR_RESPONSE;
-    }
-    if (!write_identity(config, response.token)) {
-        memset(response.token, 0, sizeof(response.token));
-        return TB_PROVISIONING_ERR_PERSIST;
-    }
-    memset(response.token, 0, sizeof(response.token));
-    return TB_PROVISIONING_OK;
 }

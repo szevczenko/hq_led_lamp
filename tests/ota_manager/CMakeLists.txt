@@ -1,8 +1,7 @@
 # ota_manager host tests
 #
-# Compiles components/ota_manager against a controllable tb_firmware_update
-# double (tb_firmware_update_mock.c, which also stubs the two OSAL symbols
-# the module uses) and Unity.
+# Compiles the platform OTA manager through the KLC adapter against a
+# controllable tb_firmware_update double and Unity.
 #
 # Usage:
 #   cmake -S tests/ota_manager -B <build-dir>
@@ -13,6 +12,7 @@ cmake_minimum_required(VERSION 3.16)
 project(hq_led_lamp_ota_manager_tests LANGUAGES C)
 
 set(OTA_DIR          ${CMAKE_CURRENT_LIST_DIR}/../../components/ota_manager)
+set(TB_DIR           ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/thingsboard)
 set(TB_INCLUDE_DIR   ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/thingsboard/include)
 set(OSAL_DIR         ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/osal)
 set(UNITY_DIR        ${CMAKE_CURRENT_LIST_DIR}/../lamp_control/unity)
@@ -20,6 +20,7 @@ set(UNITY_DIR        ${CMAKE_CURRENT_LIST_DIR}/../lamp_control/unity)
 add_executable(ota_manager_tests
     ${CMAKE_CURRENT_LIST_DIR}/ota_manager_test.c
     ${CMAKE_CURRENT_LIST_DIR}/tb_firmware_update_mock.c
+    ${TB_DIR}/tb_ota_manager.c
     ${OTA_DIR}/ota_manager.c
     ${UNITY_DIR}/unity.c
 )

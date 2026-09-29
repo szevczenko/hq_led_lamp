@@ -1082,6 +1082,37 @@ static void test_portal_start_failure_records_failed_event(void)
                           wifi_provisioning_manager_poll_event());
 }
 
+static void test_event_queue_overflow_drops_oldest_in_fifo_order(void)
+{
+    wifi_provisioning_mock_config_t fail = {
+        .start_status_set = true,
+        .start_status = WIFI_HTTP_PROVISIONING_START_ERR_HTTP_BIND,
+    };
+    unsigned index;
+
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_OK,
+                          wifi_provisioning_manager_init());
+    wifi_provisioning_controller_mock_fire(
+        WIFI_PROVISIONING_CONTROLLER_AWAITING_CONNECT,
+        WIFI_PROVISIONING_CONTROLLER_PROVISIONING, 1u);
+    wifi_provisioning_mock_set_config(&fail);
+
+    /* STARTED plus nine FAILED outcomes overflows the platform's bounded
+     * queue. FIFO policy drops the oldest event, retaining eight failures. */
+    for (index = 0u; index < 9u; ++index)
+    {
+        TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_ERR_HTTP_BIND,
+                              wifi_provisioning_manager_start());
+    }
+    for (index = 0u; index < 8u; ++index)
+    {
+        TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_FAILED,
+                              wifi_provisioning_manager_poll_event());
+    }
+    TEST_ASSERT_EQUAL_INT(WIFI_PROVISIONING_MANAGER_EVENT_NONE,
+                          wifi_provisioning_manager_poll_event());
+}
+
 /* --------------------------------------------------------------------- */
 /* Test registry                                                          */
 /* --------------------------------------------------------------------- */
@@ -1118,6 +1149,7 @@ int main(void)
     RUN_TEST(test_stale_session_notification_discarded);
     RUN_TEST(test_poll_event_ordering_started_then_succeeded);
     RUN_TEST(test_portal_start_failure_records_failed_event);
+    RUN_TEST(test_event_queue_overflow_drops_oldest_in_fifo_order);
 
     return UNITY_END();
 }

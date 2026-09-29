@@ -8,5 +8,5 @@
 idf_component_register(
     SRCS "lamp_fs.c"
     INCLUDE_DIRS "include"
-    REQUIRES osal
+    REQUIRES hq_storage
 )

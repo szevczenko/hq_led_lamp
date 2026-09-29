@@ -90,6 +90,7 @@ set(TB_SOURCES
     ${TB_SRC_DIR}/tb_telemetry.c
     ${TB_SRC_DIR}/tb_attributes.c
     ${TB_SRC_DIR}/tb_rpc.c
+    ${TB_SRC_DIR}/tb_state_sync.c
     ${TB_SRC_DIR}/tb_provision.c
     ${TB_SRC_DIR}/tb_claim.c
     ${TB_SRC_DIR}/tb_firmware_update.c
@@ -115,6 +116,7 @@ add_executable(tb_application_tests
 
 target_include_directories(tb_application_tests PRIVATE
     ${TB_APP_DIR}/include
+    ${TB_SRC_DIR}/include
     ${TB_SRC_DIR}/include
     ${TB_TEST_MOCK_DIR}
     ${LAMP_CONTROL_INCLUDE_DIR}

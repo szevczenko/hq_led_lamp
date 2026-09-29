@@ -34,18 +34,21 @@ set(OSAL_INCLUDE_DIR ${OSAL_DIR}/include)
 set(OSAL_IMPL_DIR    ${OSAL_DIR}/posix)
 set(LITTLEFS_DIR     ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/third_party/littlefs)
 set(CJSON_DIR        ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/third_party/cJSON)
+set(APP_SERVICES_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hq_app_services)
 set(UNITY_DIR        ${CMAKE_CURRENT_LIST_DIR}/../lamp_control/unity)
 
 add_executable(app_config_tests
     ${CMAKE_CURRENT_LIST_DIR}/app_config_test.c
     ${CMAKE_CURRENT_LIST_DIR}/osal_file_mock.c
     ${APP_CONFIG_DIR}/app_config.c
+    ${APP_SERVICES_DIR}/hq_json_doc.c
     ${CJSON_DIR}/cJSON.c
     ${UNITY_DIR}/unity.c
 )
 
 target_include_directories(app_config_tests PRIVATE
     ${APP_CONFIG_DIR}/include
+    ${APP_SERVICES_DIR}/include
     ${OSAL_INCLUDE_DIR}
     ${OSAL_IMPL_DIR}
     ${CJSON_DIR}
@@ -77,6 +80,7 @@ message(STATUS "Tests: Building product configuration host test (app_config_test
 add_executable(app_config_posix_lfs_tests
     ${CMAKE_CURRENT_LIST_DIR}/app_config_lfs_test.c
     ${APP_CONFIG_DIR}/app_config.c
+    ${APP_SERVICES_DIR}/hq_json_doc.c
     ${OSAL_IMPL_DIR}/osal_file_impl.c
     ${OSAL_IMPL_DIR}/osal_dir_impl.c
     ${OSAL_IMPL_DIR}/osal_mount_impl.c
@@ -90,6 +94,7 @@ add_executable(app_config_posix_lfs_tests
 
 target_include_directories(app_config_posix_lfs_tests PRIVATE
     ${APP_CONFIG_DIR}/include
+    ${APP_SERVICES_DIR}/include
     ${OSAL_INCLUDE_DIR}
     ${OSAL_IMPL_DIR}
     ${LITTLEFS_DIR}

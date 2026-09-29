@@ -546,6 +546,43 @@ static void test_valid_sync_via_attribute_response(void)
     TEST_ASSERT_EQUAL_UINT(80u, state.brightness_percent);
 }
 
+static void test_client_init_preserves_verified_transport(void)
+{
+    tb_client_config_t config = {
+        .server_url = "mqtt://untrusted.example:1883",
+        .access_token = "rotated-token",
+        .client_id = "runtime-client-id",
+    };
+
+    tb_client_deinit(s_client);
+    s_client = NULL;
+    mqtt_config_set_string("mqtts://trusted.example:8883",
+                           MQTT_CONFIG_VALUE_ADDRESS);
+    mqtt_config_set_string("configured-client-id",
+                           MQTT_CONFIG_VALUE_CLIENT_ID);
+    mqtt_app_mock_set_verified_config(true);
+
+    TEST_ASSERT_EQUAL_INT(0, tb_client_init(&s_client, &config));
+    TEST_ASSERT_EQUAL_STRING("mqtts://trusted.example:8883",
+                             mqtt_config_get_string(
+                                 MQTT_CONFIG_VALUE_ADDRESS));
+    TEST_ASSERT_EQUAL_STRING("configured-client-id",
+                             mqtt_config_get_string(
+                                 MQTT_CONFIG_VALUE_CLIENT_ID));
+    TEST_ASSERT_EQUAL_STRING("rotated-token",
+                             mqtt_config_get_string(
+                                 MQTT_CONFIG_VALUE_USERNAME));
+    TEST_ASSERT_EQUAL_INT(0, tb_client_update_credentials(
+                                 s_client, "refreshed-token",
+                                 "runtime-updated-client-id"));
+    TEST_ASSERT_EQUAL_STRING("refreshed-token",
+                             mqtt_config_get_string(
+                                 MQTT_CONFIG_VALUE_USERNAME));
+    TEST_ASSERT_EQUAL_STRING("configured-client-id",
+                             mqtt_config_get_string(
+                                 MQTT_CONFIG_VALUE_CLIENT_ID));
+}
+
 static void test_empty_sync_response_uses_safe_initial_state(void)
 {
     uint32_t request_id;
@@ -2041,6 +2078,7 @@ int main(void)
     RUN_TEST(test_mixed_update_applies_lamp_state_and_raises_hint);
     RUN_TEST(test_output_suspended_stores_then_resume_reapplies);
     RUN_TEST(test_resume_without_sync_forces_off);
+    RUN_TEST(test_client_init_preserves_verified_transport);
     RUN_TEST(test_valid_sync_via_attribute_response);
     RUN_TEST(test_empty_sync_response_uses_safe_initial_state);
     RUN_TEST(test_valid_sync_via_shared_update);

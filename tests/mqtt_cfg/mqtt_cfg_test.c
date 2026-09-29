@@ -1070,6 +1070,20 @@ static void test_generic_save_path_cannot_bypass_verified_gate(void)
 
     mqtt_app_mock_simulate_connect();
     TEST_ASSERT_EQUAL_INT(MQTT_CFG_OK, mqtt_cfg_connect(0u));
+    TEST_ASSERT_TRUE(mqtt_config_verified_is_current());
+
+    /* ThingsBoard owns token rotation, but not the broker/TLS transport. */
+    TEST_ASSERT_TRUE(mqtt_config_set_string("rotated-access-token",
+                                             MQTT_CONFIG_VALUE_USERNAME));
+    TEST_ASSERT_TRUE(mqtt_config_set_string("",
+                                             MQTT_CONFIG_VALUE_PASSWORD));
+    TEST_ASSERT_TRUE(mqtt_config_verified_is_current());
+    TEST_ASSERT_EQUAL_STRING("mqtts://thingsboard.home.arpa:8883",
+                             mqtt_config_get_string(
+                                 MQTT_CONFIG_VALUE_ADDRESS));
+    TEST_ASSERT_EQUAL_STRING("klc-kitchen-01",
+                             mqtt_config_get_string(
+                                 MQTT_CONFIG_VALUE_CLIENT_ID));
     init_before = mqtt_app_mock_init_calls();
     (void)lamp_mock_reset();
 

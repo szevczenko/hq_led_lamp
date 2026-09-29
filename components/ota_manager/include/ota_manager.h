@@ -60,6 +60,7 @@ typedef uint32_t (*ota_manager_now_fn_t)(void);
 typedef void (*ota_manager_event_fn_t)(ota_manager_event_t event, void *ctx);
 typedef void (*ota_manager_indicator_fn_t)(bool on, void *ctx);
 typedef void (*ota_manager_restart_fn_t)(void);
+typedef int (*ota_manager_confirm_fn_t)(tb_client_t *client, void *ctx);
 
 typedef struct ota_manager_config {
     const char *title;               /**< Running firmware title (required). */
@@ -70,10 +71,13 @@ typedef struct ota_manager_config {
     uint32_t check_period_ms;        /**< Periodic check; 0 = disabled. */
     uint32_t reboot_delay_ms;        /**< Delay before restart; 0 = default. */
     uint32_t blink_period_ms;        /**< Indicator half period; 0 = default. */
+    uint32_t init_retry_ms;          /**< Updater initialization retry; 0 = default. */
+    uint32_t confirm_retry_ms;       /**< Health confirmation retry; 0 = default. */
     ota_manager_now_fn_t now_ms;     /**< Clock; NULL = OSAL monotonic clock. */
     ota_manager_event_fn_t on_event; /**< May be NULL. */
     ota_manager_indicator_fn_t on_indicator; /**< May be NULL. */
     ota_manager_restart_fn_t restart; /**< Required. */
+    ota_manager_confirm_fn_t confirm_health; /**< Optional confirmation hook. */
     void *ctx;                       /**< Passed to on_event/on_indicator. */
 } ota_manager_config_t;
 

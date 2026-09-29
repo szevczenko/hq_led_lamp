@@ -23,6 +23,8 @@ static int s_event_count;
 static int s_indicator_calls;
 static bool s_indicator_on;
 static int s_restart_calls;
+static int s_confirm_cb_calls;
+static int s_confirm_cb_result;
 
 static uint32_t test_now(void)
 {
@@ -51,6 +53,14 @@ static void test_restart(void)
     s_restart_calls++;
 }
 
+static int test_confirm_health(tb_client_t *client, void *ctx)
+{
+    (void)client;
+    (void)ctx;
+    s_confirm_cb_calls++;
+    return s_confirm_cb_result;
+}
+
 static ota_manager_config_t make_cfg(void)
 {
     const ota_manager_config_t cfg = {
@@ -62,6 +72,8 @@ static ota_manager_config_t make_cfg(void)
         .check_period_ms = CHECK_PERIOD_MS,
         .reboot_delay_ms = REBOOT_DELAY_MS,
         .blink_period_ms = BLINK_PERIOD_MS,
+        .init_retry_ms = OTA_MANAGER_INIT_RETRY_MS,
+        .confirm_retry_ms = OTA_MANAGER_CONFIRM_RETRY_MS,
         .now_ms = test_now,
         .on_event = test_on_event,
         .on_indicator = test_on_indicator,
@@ -92,6 +104,8 @@ void setUp(void)
     s_indicator_calls = 0;
     s_indicator_on = false;
     s_restart_calls = 0;
+    s_confirm_cb_calls = 0;
+    s_confirm_cb_result = 0;
 }
 
 void tearDown(void)
@@ -326,14 +340,15 @@ static void test_reconnect_during_download_fails_then_reinits(void)
 
 static void test_init_failure_retried(void)
 {
-    const ota_manager_config_t cfg = make_cfg();
+    ota_manager_config_t cfg = make_cfg();
+    cfg.init_retry_ms = 300u;
     TEST_ASSERT_EQUAL(OTA_MANAGER_OK, ota_manager_init(&cfg));
     g_fw_mock.init_result = -1;
     ota_manager_on_connected(CLIENT_A);
     TEST_ASSERT_EQUAL(1, g_fw_mock.init_calls);
 
     g_fw_mock.init_result = 0;
-    s_now_ms += OTA_MANAGER_INIT_RETRY_MS - 1u;
+    s_now_ms += 299u;
     ota_manager_poll();
     TEST_ASSERT_EQUAL(1, g_fw_mock.init_calls);
     s_now_ms += 1u;
@@ -380,6 +395,30 @@ static void test_image_confirmation_waits_for_updater(void)
     TEST_ASSERT_EQUAL(1, g_fw_mock.confirm_calls);
 }
 
+static void test_confirmation_callback_retried_until_success(void)
+{
+    ota_manager_config_t cfg = make_cfg();
+    cfg.confirm_retry_ms = 250u;
+    cfg.confirm_health = test_confirm_health;
+    TEST_ASSERT_EQUAL(OTA_MANAGER_OK, ota_manager_init(&cfg));
+    ota_manager_on_connected(CLIENT_A);
+    s_confirm_cb_result = -1;
+    ota_manager_request_image_confirmation();
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(1, s_confirm_cb_calls);
+    TEST_ASSERT_EQUAL(0, g_fw_mock.confirm_calls);
+
+    s_now_ms += 249u;
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(1, s_confirm_cb_calls);
+    s_confirm_cb_result = 0;
+    s_now_ms += 1u;
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(2, s_confirm_cb_calls);
+    ota_manager_poll();
+    TEST_ASSERT_EQUAL(2, s_confirm_cb_calls);
+}
+
 static void test_defaults_applied(void)
 {
     ota_manager_config_t cfg = make_cfg();
@@ -408,6 +447,7 @@ int main(void)
     RUN_TEST(test_init_failure_retried);
     RUN_TEST(test_image_confirmation_retried_until_success);
     RUN_TEST(test_image_confirmation_waits_for_updater);
+    RUN_TEST(test_confirmation_callback_retried_until_success);
     RUN_TEST(test_defaults_applied);
     return UNITY_END();
 }

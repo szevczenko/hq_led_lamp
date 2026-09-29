@@ -1,8 +1,9 @@
 # mqtt_cfg — MQTT/TLS broker configuration (TASK-110)
 
-Loads and validates the broker/TLS document `/config/mqtt.json` and
-configures the Mongoose/ThingsBoard **verified TLS transport** through the
-existing `mqtt_config` API (never direct sockets).
+Loads and validates the strict broker/TLS document `/config/mqtt.json`.
+Platform `mqtt_config` owns verified transport application, immutable
+snapshots, reconnect gating and URL retrieval; this product adapter retains
+schema validation, identity-token resolution and product fail-off callbacks.
 
 ## Document (`/config/mqtt.json`, schema v1)
 
@@ -38,14 +39,17 @@ sizes are bounded (file ≤ 2048 bytes).
 
 ## Verified-transport guarantees
 
-`mqtt_cfg_apply()` always configures:
+`mqtt_cfg_apply()` delegates transport setup to `mqtt_config_apply_verified()`,
+which enforces and retains:
 
 - address `mqtts://<hostname>:<port>`,
 - SSL enabled, skip-verify explicitly disabled (hostname verification on),
 - the CA from the logical `/cert` path — resolved by the OSAL backend onto
   the LittleFS mount consistently (the component never re-bases paths),
 - mTLS client cert/key only for `auth_mode: "mtls"` (cleared otherwise),
-- a getter-based self-check of every applied value.
+- a platform-owned snapshot of the address, client ID and resolved certificate
+  material, checked both before connect and before generic config-triggered
+  reconnects.
 
 ## Fail-off
 

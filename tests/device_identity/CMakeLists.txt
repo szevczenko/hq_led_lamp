@@ -46,13 +46,17 @@ set(OSAL_INCLUDE_DIR    ${OSAL_DIR}/include)
 set(OSAL_IMPL_DIR       ${OSAL_DIR}/posix)
 set(LITTLEFS_DIR        ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/third_party/littlefs)
 set(CJSON_DIR           ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/third_party/cJSON)
+set(APP_SERVICES_DIR    ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hq_app_services)
+set(TB_DIR              ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/thingsboard)
 set(OSAL_COMMON_DIR     ${OSAL_DIR}/common)
 set(UNITY_DIR           ${CMAKE_CURRENT_LIST_DIR}/../lamp_control/unity)
 
 add_executable(device_identity_tests
     ${CMAKE_CURRENT_LIST_DIR}/device_identity_test.c
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_mock.c
-    ${DEVICE_IDENTITY_DIR}/device_identity.c
+    ${DEVICE_IDENTITY_DIR}/device_identity_facade.c
+    ${APP_SERVICES_DIR}/hq_json_doc.c
+    ${TB_DIR}/tb_identity.c
     ${APP_CONFIG_DIR}/app_config.c
     ${OSAL_IMPL_DIR}/osal_file_impl.c
     ${OSAL_IMPL_DIR}/osal_dir_impl.c
@@ -68,6 +72,8 @@ add_executable(device_identity_tests
 
 target_include_directories(device_identity_tests PRIVATE
     ${DEVICE_IDENTITY_DIR}/include
+    ${APP_SERVICES_DIR}/include
+    ${TB_DIR}/include
     ${APP_CONFIG_DIR}/include
     ${LAMP_CONTROL_INCLUDE_DIR}
     ${HAL_INCLUDE_DIR}

@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "lamp_fs.h"
+#include "hq_storage.h"
 #include "osal_error.h"
 #include "osal_fs_mock.h"
 
@@ -50,6 +51,7 @@ static void record_fail_safe(void)
 
 void setUp(void)
 {
+    (void)hq_storage_deinit();
     osal_fs_mock_reset();
     s_fail_safe_calls = 0;
 }
@@ -91,6 +93,26 @@ static void test_first_mount_without_callback(void)
     TEST_ASSERT_EQUAL_INT(LAMP_FS_OK, lamp_fs_init(NULL));
     TEST_ASSERT_TRUE(lamp_fs_is_mounted());
     TEST_ASSERT_EQUAL_INT(3, osal_fs_mock_mkdir_calls());
+}
+
+static void test_hq_storage_accepts_project_specific_layout(void)
+{
+    const char *const directories[] = { "/project-config", "/project-data" };
+    const hq_storage_config_t config = {
+        .partition_label = "project-data",
+        .mount_point = "/project-storage",
+        .directories = directories,
+        .directory_count = 2U,
+    };
+    char path[OSAL_MAX_PATH_LEN_MOCK];
+
+    TEST_ASSERT_EQUAL_INT(HQ_STORAGE_OK, hq_storage_init(&config));
+    TEST_ASSERT_TRUE(hq_storage_is_mounted());
+    TEST_ASSERT_EQUAL_INT(2, osal_fs_mock_mkdir_calls());
+    TEST_ASSERT_TRUE(osal_fs_mock_mkdir_path(0, path, sizeof(path)));
+    TEST_ASSERT_EQUAL_STRING("/project-config", path);
+    TEST_ASSERT_TRUE(osal_fs_mock_mkdir_path(1, path, sizeof(path)));
+    TEST_ASSERT_EQUAL_STRING("/project-data", path);
 }
 
 /* --------------------------------------------------------------------- */
@@ -313,6 +335,7 @@ int main(void)
 
     RUN_TEST(test_first_mount_creates_directories);
     RUN_TEST(test_first_mount_without_callback);
+    RUN_TEST(test_hq_storage_accepts_project_specific_layout);
     RUN_TEST(test_existing_directories_are_idempotent);
     RUN_TEST(test_partially_existing_directories);
     RUN_TEST(test_mount_failure_forces_fail_safe);

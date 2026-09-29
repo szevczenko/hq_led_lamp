@@ -45,6 +45,7 @@
 
 #include "lamp_control.h"
 #include "lamp_control_mock.h"
+#include "hq_net.h"
 #include "network_manager.h"
 #include "osal_error.h"
 #include "osal_test_support.h"
@@ -220,14 +221,21 @@ static void test_rssi_reported_only_when_connected(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
     int dbm = 0;
+    int quality_rssi = 0;
+    uint8_t quality = 0u;
 
     TEST_ASSERT_NOT_EQUAL(NETWORK_OK, network_manager_get_rssi(&dbm));
+    TEST_ASSERT_FALSE(hq_net_get_link_quality(&quality, &quality_rssi));
     TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_start(&cb));
     wifi_mgmt_mock_set_connected(false);
     TEST_ASSERT_NOT_EQUAL(NETWORK_OK, network_manager_get_rssi(&dbm));
     wifi_mgmt_mock_set_connected(true);
     TEST_ASSERT_EQUAL_INT(NETWORK_OK, network_manager_get_rssi(&dbm));
     TEST_ASSERT_EQUAL_INT(-55, dbm);
+    TEST_ASSERT_TRUE(hq_net_get_link_quality(&quality, &quality_rssi));
+    TEST_ASSERT_EQUAL_UINT8(90u, quality);
+    TEST_ASSERT_EQUAL_INT(-55, quality_rssi);
+    TEST_ASSERT_FALSE(hq_net_get_link_quality(NULL, &quality_rssi));
     TEST_ASSERT_NOT_EQUAL(NETWORK_OK, network_manager_get_rssi(NULL));
 }
 
@@ -561,7 +569,7 @@ static void test_repeated_connect_events_deliver_each_time(void)
 /* 6. Stale callbacks after stop                                          */
 /* --------------------------------------------------------------------- */
 
-static void test_late_event_after_stop_is_dropped_but_fails_off(void)
+static void test_late_event_after_stop_is_dropped(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
 
@@ -590,12 +598,11 @@ static void test_late_event_after_stop_is_dropped_but_fails_off(void)
     late_cb(WIFI_MGMT_EVENT_CONNECTED, NULL);
     TEST_ASSERT_EQUAL_UINT(connected_before, s_app.connected_calls);
 
-    /* A late disconnect-class event still performs the idempotent
-     * (safe-by-construction) lamp fail-off before it is dropped. */
+    /* A stale event is rejected by hq_net before any application callback
+     * or policy hook runs. */
     unsigned fail_off_before = lamp_mock_force_inactive_calls();
     late_cb(WIFI_MGMT_EVENT_DISCONNECTED, NULL);
-    TEST_ASSERT_EQUAL_UINT(fail_off_before + 1U,
-                           lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL_UINT(fail_off_before, lamp_mock_force_inactive_calls());
     TEST_ASSERT_EQUAL_UINT(disconnected_before, s_app.disconnected_calls);
 }
 
@@ -642,14 +649,13 @@ static void test_stale_token_from_previous_session_is_dropped(void)
                                               old_token));
     TEST_ASSERT_EQUAL_UINT(connected_before, s_app.connected_calls);
 
-    /* A late DISCONNECT with the old token also drops the application
-     * callback; the (idempotent, safe) lamp fail-off still happens. */
+    /* A late DISCONNECT with the old token is rejected before application
+     * policy or callback delivery. */
     TEST_ASSERT_EQUAL_INT(
         1, wifi_mgmt_mock_emit_with_user_data(WIFI_MGMT_EVENT_DISCONNECTED,
                                               old_token));
     TEST_ASSERT_EQUAL_UINT(disconnected_before, s_app.disconnected_calls);
-    TEST_ASSERT_EQUAL_UINT(fail_off_before + 1U,
-                           lamp_mock_force_inactive_calls());
+    TEST_ASSERT_EQUAL_UINT(fail_off_before, lamp_mock_force_inactive_calls());
 
     /* Positive control: the new session's token is still delivered. */
     TEST_ASSERT_EQUAL_INT(
@@ -1223,7 +1229,7 @@ int main(void)
     RUN_TEST(test_reconnect_redrives_connect_request_only_when_not_connected);
 
     /* 6. stale callbacks */
-    RUN_TEST(test_late_event_after_stop_is_dropped_but_fails_off);
+    RUN_TEST(test_late_event_after_stop_is_dropped);
     RUN_TEST(test_stale_token_from_previous_session_is_dropped);
     RUN_TEST(test_stop_disarms_and_unsubscribes);
     RUN_TEST(test_stop_is_idempotent);

@@ -1,16 +1,9 @@
 # wifi_provisioning_manager — product-owned Wi-Fi provisioning adapter
 # (TASK-126)
 #
-# ESP-IDF component registration.  The adapter narrows the platform
-# provisioning application (wifi_http_provisioning.h) plus the automatic
-# fallback controller (wifi_provisioning_controller.h, TASK-131/132), the
-# shared Mongoose process and the Wi-Fi manager saved-credentials query down
-# to the documented product contract: init/deinit, idempotent serialized
-# start/stop (stop also ends the controller lifecycle — grace timer cancelled,
-# temporary AP retired), a portal state query, an is-portal-active query, the
-# has-saved-credentials provisioning decision and the controller outcome
-# event queue (STARTED/SUCCEEDED/FAILED, consumed by the TASK-133
-# supervisor via wifi_provisioning_manager_poll_event()).
+# ESP-IDF compatibility facade over the generic platform provisioning API.
+# It preserves the product status/state/event enums while the platform owns
+# controller callbacks, event polling, and portal lifecycle controls.
 #
 # Dependency policy — every platform dependency is PRIVATE:
 #   - `wifi_provisioning` provides the platform provisioning application

@@ -8,11 +8,9 @@
  *     API, bounded at file and field level, parsed with a strict cJSON
  *     schema (unknown and duplicate members rejected) and then validated
  *     against the verified-TLS-only policy,
- *   - the transport is configured exclusively through the existing
- *     Mongoose configuration API (mqtt_config.h): address, SSL, skip-verify
- *     and certificate sources.  mqtt_config resolves the logical /cert
- *     paths through the OSAL backend onto the LittleFS mount, so the
- *     component never touches sockets or the TLS stack directly,
+ *   - the strict document adapter delegates verified transport application,
+ *     immutable snapshots and reconnect gating to the platform mqtt_config
+ *     API.  The component never touches sockets or the TLS stack directly,
  *   - every configuration/application/connection failure forces the lamp
  *     output inactive (fail-off) before the error is returned.
  */
@@ -68,18 +66,6 @@ static bool s_verified_applied = false;
  * after all setters and self-checks succeed and is compared immediately before
  * every connect attempt.
  */
-static mqtt_cfg_t s_applied_cfg;
-
-/** @brief Material captured from the LittleFS-backed config at apply time. */
-typedef struct {
-    size_t length;
-    char bytes[MQTT_CERT_MAX_SIZE];
-} mqtt_cfg_cert_snapshot_t;
-
-static mqtt_cfg_cert_snapshot_t s_applied_ca;
-static mqtt_cfg_cert_snapshot_t s_applied_client_cert;
-static mqtt_cfg_cert_snapshot_t s_applied_client_key;
-
 /**
  * @brief Module-owned lock serializing the verified-transport lifecycle.
  *
@@ -788,211 +774,9 @@ static mqtt_cfg_status_t mqtt_cfg_validate_fields(const mqtt_cfg_t *cfg)
     return MQTT_CFG_OK;
 }
 
-/**
- * @brief Verify that the mutable mqtt_config state is still the applied state.
- *
- * mqtt_config exposes setters for the whole product, so an applied latch by
- * itself cannot protect the transport.  This check deliberately compares all
- * transport/security fields against the accepted snapshot, including the
- * logical certificate paths and resolved certificate material.  A mismatch
- * invalidates the latch at the caller and requires a fresh validated apply.
- */
-static bool mqtt_cfg_applied_cert_matches(
-    mqtt_config_value_t key, const char *expected_path, bool required,
-    const mqtt_cfg_cert_snapshot_t *expected_material)
-{
-    mqtt_cert_source_t source = MQTT_CERT_SOURCE_NONE;
-    const char *value = NULL;
-    const char *resolved;
-    size_t resolved_len;
-
-    if (!mqtt_config_get_cert_source(&source, &value, key))
-    {
-        return false;
-    }
-
-    if (!required)
-    {
-        return source == MQTT_CERT_SOURCE_NONE &&
-               (value == NULL || value[0] == '\0');
-    }
-
-    resolved = mqtt_config_get_cert(key);
-    if (source != MQTT_CERT_SOURCE_FILE_PATH || value == NULL ||
-        !mqtt_cfg_path_under_cert(value) || expected_path == NULL ||
-        strcmp(value, expected_path) != 0 || resolved == NULL ||
-        expected_material == NULL || resolved[0] == '\0')
-    {
-        return false;
-    }
-
-    /* mqtt_config exposes the resolved LittleFS material, not merely its
-     * logical path.  Compare the complete bounded buffer captured after the
-     * successful apply so replacing a file at the same path cannot bypass
-     * the verified-apply gate. */
-    resolved_len = strlen(resolved);
-    return resolved_len == expected_material->length &&
-           memcmp(resolved, expected_material->bytes, resolved_len) == 0;
-}
-
-static bool mqtt_cfg_capture_cert(mqtt_config_value_t key,
-                                  mqtt_cfg_cert_snapshot_t *snapshot)
-{
-    const char *resolved;
-    size_t length;
-
-    if (snapshot == NULL)
-    {
-        return false;
-    }
-    resolved = mqtt_config_get_cert(key);
-    if (resolved == NULL || resolved[0] == '\0')
-    {
-        return false;
-    }
-    length = strlen(resolved);
-    if (length >= sizeof(snapshot->bytes))
-    {
-        return false;
-    }
-    memcpy(snapshot->bytes, resolved, length + 1u);
-    snapshot->length = length;
-    return true;
-}
-
 static bool mqtt_cfg_applied_transport_matches(void)
 {
-    char expected_address[MQTT_CONFIG_STR_SIZE];
-    const char *address;
-    const char *client_id;
-    bool ssl = false;
-    bool skip_verify = true;
-    int expected_len = -1;
-
-    if (mqtt_cfg_validate_fields(&s_applied_cfg) != MQTT_CFG_OK)
-    {
-        return false;
-    }
-    /* The live address is stored by the platform in an MQTT_CONFIG_STR_SIZE
-     * buffer, so format the expected address into a buffer of exactly that
-     * bound; a formatted address that would not round-trip through the
-     * platform storage can never match and is treated as a mismatch. */
-    expected_len = snprintf(expected_address, sizeof(expected_address),
-                            MQTT_CFG_ADDRESS_FMT, s_applied_cfg.hostname,
-                            (unsigned)s_applied_cfg.port);
-    if (expected_len < 0 || (size_t)expected_len >= sizeof(expected_address))
-    {
-        return false;
-    }
-
-    address = mqtt_config_get_string(MQTT_CONFIG_VALUE_ADDRESS);
-    client_id = mqtt_config_get_string(MQTT_CONFIG_VALUE_CLIENT_ID);
-    if (address == NULL || strcmp(address, expected_address) != 0 ||
-        client_id == NULL || strcmp(client_id, s_applied_cfg.client_id) != 0 ||
-        !mqtt_config_get_bool(&ssl, MQTT_CONFIG_VALUE_SSL) || !ssl ||
-        !mqtt_config_get_bool(&skip_verify, MQTT_CONFIG_VALUE_SKIP_VERIFY) ||
-        skip_verify)
-    {
-        return false;
-    }
-
-    if (!mqtt_cfg_applied_cert_matches(MQTT_CONFIG_VALUE_CERT,
-                                       s_applied_cfg.ca_path, true,
-                                       &s_applied_ca))
-    {
-        return false;
-    }
-
-    if (s_applied_cfg.auth_mode == MQTT_CFG_AUTH_MTLS)
-    {
-        return mqtt_cfg_applied_cert_matches(
-                   MQTT_CONFIG_VALUE_CLIENT_CERT,
-                   s_applied_cfg.client_cert_path, true,
-                   &s_applied_client_cert) &&
-               mqtt_cfg_applied_cert_matches(
-                   MQTT_CONFIG_VALUE_CLIENT_KEY,
-                   s_applied_cfg.client_key_path, true,
-                   &s_applied_client_key);
-    }
-
-    return mqtt_cfg_applied_cert_matches(MQTT_CONFIG_VALUE_CLIENT_CERT,
-                                         NULL, false, NULL) &&
-           mqtt_cfg_applied_cert_matches(MQTT_CONFIG_VALUE_CLIENT_KEY,
-                                         NULL, false, NULL);
-}
-
-/**
- * @brief Verified-owner validation gate for the generic apply-config path
- *        (TASK-121 platform gate; TASK-110 finding 4).
- *
- * The platform invokes this callback on the Mongoose poll thread from the
- * mqtt_config_save() -> MQTT_CMD_TYPE_APPLY_CONFIG handler with an owned
- * snapshot of the exact values the reconnect would use.  Only a candidate
- * identical to the module's verified applied state is approved; anything
- * else — SSL off, skip-verify on, raw or relocated certificate material, a
- * different (e.g. plaintext or IP) address, a different client identifier
- * — is rejected, so no caller can make the transport reconnect from
- * unverified values.  The platform fails closed when no callback is
- * registered, and on rejection it leaves the transport disconnected and
- * notifies the failure observer, which fails the lamp off (see
- * mqtt_cfg_on_connect_failure()).
- */
-static bool mqtt_cfg_config_gate(const mqtt_config_snapshot_t *candidate)
-{
-    char expected_address[MQTT_CONFIG_STR_SIZE];
-    bool accepted = false;
-    int expected_len = -1;
-
-    mqtt_cfg_lock();
-    if (candidate != NULL && s_verified_applied &&
-        mqtt_cfg_validate_fields(&s_applied_cfg) == MQTT_CFG_OK)
-    {
-        /* The candidate address is an owned copy of the platform's own
-         * MQTT_CONFIG_STR_SIZE storage, so the expected address is formatted
-         * into a buffer of exactly that bound.  A formatted address that
-         * would not round-trip through the platform storage (snprintf return
-         * >= buffer size) can never match a candidate and is rejected
-         * explicitly instead of silently truncating the local copy. */
-        expected_len = snprintf(expected_address, sizeof(expected_address),
-                                MQTT_CFG_ADDRESS_FMT, s_applied_cfg.hostname,
-                                (unsigned)s_applied_cfg.port);
-
-        if (expected_len >= 0 &&
-            (size_t)expected_len < sizeof(expected_address) &&
-            candidate->address != NULL &&
-            strcmp(candidate->address, expected_address) == 0 &&
-            candidate->client_id != NULL &&
-            strcmp(candidate->client_id, s_applied_cfg.client_id) == 0 &&
-            candidate->ssl_enabled && !candidate->skip_verify &&
-            candidate->cert_source == MQTT_CERT_SOURCE_FILE_PATH &&
-            candidate->cert_value != NULL &&
-            mqtt_cfg_path_under_cert(candidate->cert_value) &&
-            strcmp(candidate->cert_value, s_applied_cfg.ca_path) == 0)
-        {
-            if (s_applied_cfg.auth_mode == MQTT_CFG_AUTH_MTLS)
-            {
-                accepted =
-                    candidate->client_cert_source ==
-                        MQTT_CERT_SOURCE_FILE_PATH &&
-                    candidate->client_cert_value != NULL &&
-                    strcmp(candidate->client_cert_value,
-                           s_applied_cfg.client_cert_path) == 0 &&
-                    candidate->client_key_source ==
-                        MQTT_CERT_SOURCE_FILE_PATH &&
-                    candidate->client_key_value != NULL &&
-                    strcmp(candidate->client_key_value,
-                           s_applied_cfg.client_key_path) == 0;
-            }
-            else
-            {
-                accepted =
-                    candidate->client_cert_source == MQTT_CERT_SOURCE_NONE &&
-                    candidate->client_key_source == MQTT_CERT_SOURCE_NONE;
-            }
-        }
-    }
-    mqtt_cfg_unlock();
-    return accepted;
+    return mqtt_config_verified_is_current();
 }
 
 mqtt_cfg_status_t mqtt_cfg_validate(const mqtt_cfg_t *cfg)
@@ -1007,6 +791,7 @@ mqtt_cfg_status_t mqtt_cfg_validate(const mqtt_cfg_t *cfg)
          * transport.  Otherwise a caller could load a bad document, observe
          * fail-off, and then reconnect stale transport state. */
         s_verified_applied = false;
+        mqtt_config_invalidate_verified();
     }
     mqtt_cfg_unlock();
 
@@ -1034,6 +819,7 @@ mqtt_cfg_status_t mqtt_cfg_load(mqtt_cfg_t *out)
          * contract); an invalid argument is a failure like any other. */
         mqtt_cfg_lock();
         s_verified_applied = false;
+        mqtt_config_invalidate_verified();
         mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_INVALID_ARGUMENT;
@@ -1093,6 +879,7 @@ mqtt_cfg_status_t mqtt_cfg_load(mqtt_cfg_t *out)
 fail:
     mqtt_cfg_lock();
     s_verified_applied = false;
+    mqtt_config_invalidate_verified();
     mqtt_cfg_unlock();
     cJSON_Delete(root);
     free(json);
@@ -1106,31 +893,13 @@ fail:
 /* Apply                                                                  */
 /* --------------------------------------------------------------------- */
 
-static bool mqtt_cfg_apply_cert_source(mqtt_config_value_t key,
-                                       const char *path)
-{
-    return mqtt_config_set_cert_source(MQTT_CERT_SOURCE_FILE_PATH, path, key);
-}
-
 mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
 {
     char address[MQTT_CFG_HOSTNAME_MAX_LEN + 16u];
     mqtt_cfg_status_t status;
-    bool flag = false;
-    mqtt_cfg_cert_snapshot_t ca_snapshot = { 0 };
-    mqtt_cfg_cert_snapshot_t client_cert_snapshot = { 0 };
-    mqtt_cfg_cert_snapshot_t client_key_snapshot = { 0 };
-    const char *str = NULL;
-    mqtt_cert_source_t source = MQTT_CERT_SOURCE_NONE;
-    const char *value = NULL;
-
-    /* Register this module as the verified configuration owner (TASK-121
-     * gate, finding 4): the generic mqtt_config_save() reconnect path can
-     * only restart the transport with values this callback approves
-     * (fail-closed otherwise), so no other caller — hq_cmd_mqtt or any
-     * direct mqtt_config setter — can reconnect from unverified values.
-     * Registration is idempotent and thread-safe. */
-    mqtt_app_set_config_validation_callback(mqtt_cfg_config_gate);
+    const char *access_token = NULL;
+    mqtt_verified_config_t verified = { 0 };
+    mqtt_verified_config_status_t apply_status;
 
     /* A new apply invalidates and stops any old session before its transport
      * values can be replaced.  This is intentionally done even when the new
@@ -1152,6 +921,7 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
                           memory_order_relaxed);
     s_verified_applied = false;
     mqtt_cfg_unlock();
+    mqtt_config_invalidate_verified();
 
     if (mqtt_app_is_connected())
     {
@@ -1159,12 +929,6 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
     }
     mqtt_app_deinit();
 
-    /* Every apply attempt re-arms the connect gate: a rejected (even
-     * partially applied) configuration must never leave a usable transport
-     * state that mqtt_cfg_connect() could start.  The validated apply
-     * sequence (field validation, setters, self-check and snapshot publish)
-     * runs under the module lock, so a concurrent connect() can never read
-     * half-applied mqtt_config values (finding 2). */
     mqtt_cfg_lock();
     s_verified_applied = false;
 
@@ -1176,154 +940,59 @@ mqtt_cfg_status_t mqtt_cfg_apply(const mqtt_cfg_t *cfg)
         return status;
     }
 
-    /* The transport configuration service must be initialized before its
-     * setters are used (idempotent; mqtt_app_init() also calls it). */
-    mqtt_config_init();
-
     if (cfg->auth_mode == MQTT_CFG_AUTH_ACCESS_TOKEN)
     {
-        const char *access_token = NULL;
-
         if (device_identity_token(&access_token) != DEVICE_IDENTITY_OK ||
-            access_token == NULL || access_token[0] == '\0' ||
-            !mqtt_config_set_string(access_token,
-                                    MQTT_CONFIG_VALUE_USERNAME) ||
-            !mqtt_config_set_string("", MQTT_CONFIG_VALUE_PASSWORD))
+            access_token == NULL || access_token[0] == '\0')
         {
             mqtt_cfg_unlock();
             mqtt_cfg_fail_off();
             return MQTT_CFG_ERR_APPLY;
         }
     }
-    else if (cfg->auth_mode == MQTT_CFG_AUTH_NONE &&
-             (!mqtt_config_set_string("", MQTT_CONFIG_VALUE_USERNAME) ||
-             !mqtt_config_set_string("", MQTT_CONFIG_VALUE_PASSWORD))
-    )
+    int written = snprintf(address, sizeof(address), MQTT_CFG_ADDRESS_FMT,
+                           cfg->hostname, (unsigned)cfg->port);
+    if (written < 0 || (size_t)written >= sizeof(address))
     {
         mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_APPLY;
     }
 
-    if (snprintf(address, sizeof(address), MQTT_CFG_ADDRESS_FMT,
-                 cfg->hostname, (unsigned)cfg->port) < 0)
+    verified.address = address;
+    verified.client_id = cfg->client_id;
+    verified.username = cfg->auth_mode == MQTT_CFG_AUTH_ACCESS_TOKEN
+                            ? access_token
+                            : (cfg->auth_mode == MQTT_CFG_AUTH_NONE ? "" : NULL);
+    verified.password = cfg->auth_mode == MQTT_CFG_AUTH_ACCESS_TOKEN ||
+                                 cfg->auth_mode == MQTT_CFG_AUTH_NONE
+                             ? ""
+                             : NULL;
+    verified.ca_path = cfg->ca_path;
+    verified.client_cert_path = cfg->auth_mode == MQTT_CFG_AUTH_MTLS
+                                    ? cfg->client_cert_path
+                                    : NULL;
+    verified.client_key_path = cfg->auth_mode == MQTT_CFG_AUTH_MTLS
+                                   ? cfg->client_key_path
+                                   : NULL;
+
+    apply_status = mqtt_config_apply_verified(&verified);
+    if (apply_status != MQTT_VERIFIED_CONFIG_OK)
     {
         mqtt_cfg_unlock();
         mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_APPLY;
-    }
-
-    if (!mqtt_config_set_string(address, MQTT_CONFIG_VALUE_ADDRESS) ||
-        !mqtt_config_set_string(cfg->client_id, MQTT_CONFIG_VALUE_CLIENT_ID) ||
-        !mqtt_config_set_bool(true, MQTT_CONFIG_VALUE_SSL) ||
-        !mqtt_config_set_bool(false, MQTT_CONFIG_VALUE_SKIP_VERIFY))
-    {
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_APPLY;
-    }
-
-    /* The CA is mandatory and must resolve to a readable file under /cert:
-     * a missing/unreadable CA fails the application with the CA-path error
-     * (never a generic apply error, and never a disabled verification). */
-    if (!mqtt_cfg_apply_cert_source(MQTT_CONFIG_VALUE_CERT, cfg->ca_path))
-    {
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_CA_PATH;
-    }
-
-    if (cfg->auth_mode == MQTT_CFG_AUTH_MTLS)
-    {
-        if (!mqtt_cfg_apply_cert_source(MQTT_CONFIG_VALUE_CLIENT_CERT,
-                                        cfg->client_cert_path) ||
-            !mqtt_cfg_apply_cert_source(MQTT_CONFIG_VALUE_CLIENT_KEY,
-                                        cfg->client_key_path))
-        {
-            mqtt_cfg_unlock();
-            mqtt_cfg_fail_off();
+        if (apply_status == MQTT_VERIFIED_CONFIG_CA_ERROR)
+            return MQTT_CFG_ERR_CA_PATH;
+        if (apply_status == MQTT_VERIFIED_CONFIG_CLIENT_CERT_ERROR)
             return MQTT_CFG_ERR_CERT_PATH;
-        }
-    }
-    else
-    {
-        /* Clear any previously applied mTLS material so a downgraded
-         * configuration cannot silently keep sending a client cert. */
-        bool ok = mqtt_config_set_cert_source(MQTT_CERT_SOURCE_NONE, NULL,
-                                              MQTT_CONFIG_VALUE_CLIENT_CERT);
-        ok = ok && mqtt_config_set_cert_source(MQTT_CERT_SOURCE_NONE, NULL,
-                                               MQTT_CONFIG_VALUE_CLIENT_KEY);
-        if (!ok)
-        {
-            mqtt_cfg_unlock();
-            mqtt_cfg_fail_off();
-            return MQTT_CFG_ERR_APPLY;
-        }
-    }
-
-    /* Self-check through the getters: the accepted configuration must
-     * always be visible as verified TLS. */
-    str = mqtt_config_get_string(MQTT_CONFIG_VALUE_ADDRESS);
-    if (str == NULL || strcmp(str, address) != 0)
-    {
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_APPLY;
     }
-    if (!mqtt_config_get_bool(&flag, MQTT_CONFIG_VALUE_SSL) || !flag)
-    {
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_APPLY;
-    }
-    if (!mqtt_config_get_bool(&flag, MQTT_CONFIG_VALUE_SKIP_VERIFY) || flag)
-    {
-        /* skip_verify must never be on for an accepted configuration. */
-        (void)mqtt_config_set_bool(false, MQTT_CONFIG_VALUE_SKIP_VERIFY);
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_APPLY;
-    }
-    if (!mqtt_config_get_cert_source(&source, &value,
-                                     MQTT_CONFIG_VALUE_CERT) ||
-        source != MQTT_CERT_SOURCE_FILE_PATH)
-    {
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_CA_PATH;
-    }
-    if (value == NULL || strcmp(value, cfg->ca_path) != 0 ||
-        !mqtt_cfg_capture_cert(MQTT_CONFIG_VALUE_CERT, &ca_snapshot))
-    {
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_CA_PATH;
-    }
 
-    if (cfg->auth_mode == MQTT_CFG_AUTH_MTLS &&
-        (!mqtt_cfg_capture_cert(MQTT_CONFIG_VALUE_CLIENT_CERT,
-                                &client_cert_snapshot) ||
-         !mqtt_cfg_capture_cert(MQTT_CONFIG_VALUE_CLIENT_KEY,
-                                &client_key_snapshot)))
-    {
-        mqtt_cfg_unlock();
-        mqtt_cfg_fail_off();
-        return MQTT_CFG_ERR_CERT_PATH;
-    }
-
-    /* All setters and self-checks succeeded.  Copy the accepted fields into
-     * module-owned storage before opening the connect gate.  The caller's
-     * mqtt_cfg_t may be reused or changed after this point, but the transport
-     * can only be connected against this validated snapshot. */
-    s_applied_cfg = *cfg;
-    s_applied_ca = ca_snapshot;
-    s_applied_client_cert = client_cert_snapshot;
-    s_applied_client_key = client_key_snapshot;
     s_verified_applied = true;
     mqtt_cfg_unlock();
 
     osal_log_info("mqtt_cfg: verified transport configured: %s client_id=%s",
-                  address, s_applied_cfg.client_id);
+              address, cfg->client_id);
     return MQTT_CFG_OK;
 }
 
@@ -1341,7 +1010,8 @@ mqtt_cfg_status_t mqtt_cfg_load_and_apply(void)
 
 mqtt_cfg_status_t mqtt_cfg_get_server_url(char *out, size_t out_size)
 {
-    int written;
+    char verified_url[MQTT_CONFIG_STR_SIZE];
+    size_t url_len;
 
     if (out == NULL || out_size == 0u) {
         return MQTT_CFG_ERR_INVALID_ARGUMENT;
@@ -1352,13 +1022,20 @@ mqtt_cfg_status_t mqtt_cfg_get_server_url(char *out, size_t out_size)
         out[0] = '\0';
         return MQTT_CFG_ERR_NOT_APPLIED;
     }
-    written = snprintf(out, out_size, "mqtts://%s:%u", s_applied_cfg.hostname,
-                       (unsigned)s_applied_cfg.port);
+    if (!mqtt_config_get_verified_server_url(verified_url,
+                                             sizeof(verified_url)))
+    {
+        mqtt_cfg_unlock();
+        out[0] = '\0';
+        return MQTT_CFG_ERR_NOT_APPLIED;
+    }
     mqtt_cfg_unlock();
-    if (written < 0 || (size_t)written >= out_size) {
+    url_len = strlen(verified_url);
+    if (url_len >= out_size) {
         out[0] = '\0';
         return MQTT_CFG_ERR_BOUNDS;
     }
+    memcpy(out, verified_url, url_len + 1u);
     return MQTT_CFG_OK;
 }
 
@@ -1426,7 +1103,7 @@ static void mqtt_cfg_on_connect_failure(mqtt_connect_failure_reason_t reason)
 
 mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
 {
-    const char *address;
+    char address[MQTT_CONFIG_STR_SIZE];
     uint32_t waited = 0u;
 
     /* Only a fully applied verified configuration may start the transport.
@@ -1450,7 +1127,8 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_NOT_APPLIED;
     }
-    if (!mqtt_cfg_applied_transport_matches())
+    if (!mqtt_cfg_applied_transport_matches() ||
+        !mqtt_config_get_verified_server_url(address, sizeof(address)))
     {
         osal_log_error("mqtt_cfg: applied transport snapshot mismatch");
         /* A mutation of any Mongoose value is treated exactly like a failed
@@ -1464,7 +1142,6 @@ mqtt_cfg_status_t mqtt_cfg_connect(uint32_t timeout_ms)
         mqtt_cfg_fail_off();
         return MQTT_CFG_ERR_NOT_APPLIED;
     }
-    address = mqtt_config_get_string(MQTT_CONFIG_VALUE_ADDRESS);
     mqtt_cfg_unlock();
 
     /* Always discard a session that may have been started by another

@@ -37,29 +37,14 @@
 #include "osal_file.h"
 
 #include "cJSON.h"
+#include "hq_json_doc.h"
 
 /* --------------------------------------------------------------------- */
 /* Constants                                                              */
 /* --------------------------------------------------------------------- */
 
-/** @brief Temporary file suffix. */
-#define APP_CONFIG_TMP_SUFFIX ".tmp"
-
-/** @brief Last-known-good file suffix. */
+/** @brief Recovery file suffixes written by hq_json_doc_commit(). */
 #define APP_CONFIG_GOOD_SUFFIX ".good"
-
-/** @brief Last-known-good staging file suffix. */
-#define APP_CONFIG_GOOD_TMP_SUFFIX ".good.tmp"
-
-/**
- * @brief Last-known-good preservation suffix.
- *
- * During the two-promotion commit sequence the previous "<live>.good" is
- * atomically moved here until the live promotion is known to have
- * succeeded; a failed live promotion restores it, and a crash in between
- * leaves a valid (if stale) backup here that the load path can still
- * recover from.
- */
 #define APP_CONFIG_GOOD_OLD_SUFFIX ".good.old"
 
 /** @brief Replacement text for redacted secret values. */
@@ -251,151 +236,6 @@ static app_config_status_t read_whole_file(const char *path,
     buf[total] = '\0';
     *out_len = total;
     return APP_CONFIG_OK;
-}
-
-/**
- * @brief Read a whole file WITHOUT a preliminary osal_stat().
- *
- * Phase rule (TASK-108 round 4, review issue 3): only the commit path's own
- * initial, unambiguous osal_stat() of the live path may establish the
- * missing-file branch.  A read helper that re-stats the path can observe a
- * fresh "missing" status after the existence check and misreport a
- * stat-confirmed file as NOT_FOUND, letting the commit replace a document
- * it never successfully read.  This helper therefore opens the file
- * directly: any open/read/close failure is a transient I/O error
- * (#APP_CONFIG_ERR_IO), and an oversize document is detected by the probe
- * read (#APP_CONFIG_ERR_BOUNDS) instead of by a size stat.
- *
- * @param[out] buf     Buffer receiving the NUL-terminated contents.
- * @param[in]  cap     Buffer capacity in bytes (must exceed the bound).
- * @param[out] out_len Length of the contents (excluding the terminator).
- */
-static app_config_status_t read_confirmed_file(const char *path,
-                                               char *buf,
-                                               size_t cap,
-                                               size_t *out_len)
-{
-    if ((path == NULL) || (buf == NULL) || (cap == 0U) || (out_len == NULL))
-    {
-        return APP_CONFIG_ERR_INVALID_ARGUMENT;
-    }
-
-    *out_len = 0U;
-    buf[0] = '\0';
-
-    osal_file_id_t fd =
-        osal_open_create(path, OSAL_FILE_FLAG_NONE, OSAL_READ_ONLY);
-    if (fd < 0)
-    {
-        /* The caller's osal_stat() confirmed the file EXISTS, so an open
-         * failure is a transient storage error — never an absence. */
-        return APP_CONFIG_ERR_IO;
-    }
-
-    size_t total = 0U;
-    app_config_status_t status = APP_CONFIG_OK;
-
-    /* Read until EOF with the same probe budget as read_whole_file(): a
-     * file holding more than APP_CONFIG_MAX_FILE_BYTES is detected by a
-     * real byte beyond the bound rather than by a second stat(). */
-    while (total <= APP_CONFIG_MAX_FILE_BYTES)
-    {
-        size_t want = (total < APP_CONFIG_MAX_FILE_BYTES)
-                          ? (APP_CONFIG_MAX_FILE_BYTES - total)
-                          : 1U;
-        const size_t room = cap - 1U;
-        if (want > room)
-        {
-            want = room;
-        }
-
-        const int32_t nread = osal_read(fd, buf + total, want);
-        if (nread < 0)
-        {
-            status = APP_CONFIG_ERR_IO;
-            break;
-        }
-        if (nread == 0)
-        {
-            break; /* EOF */
-        }
-        total += (size_t)nread;
-    }
-    const int32_t close_rc = osal_close(fd);
-
-    if (status != APP_CONFIG_OK)
-    {
-        return status;
-    }
-    if (close_rc != OSAL_SUCCESS)
-    {
-        return APP_CONFIG_ERR_IO;
-    }
-
-    if (total > APP_CONFIG_MAX_FILE_BYTES)
-    {
-        /* The probe read succeeded: the file holds real data beyond the
-         * advertised maximum, so it is oversized (never accept it and never
-         * terminate the buffer past its allocated capacity). */
-        return APP_CONFIG_ERR_BOUNDS;
-    }
-
-    buf[total] = '\0';
-    *out_len = total;
-    return APP_CONFIG_OK;
-}
-
-/**
- * @brief Write @p len bytes to @p path, replacing any existing content.
- *
- * osal_close() is the flush/durability point: the OSAL file API exposes no
- * separate flush primitive, and close pushes the written data out of the
- * filesystem's write-back cache.
- */
-static bool write_whole_file(const char *path, const char *data, size_t len)
-{
-    if ((path == NULL) || ((data == NULL) && (len > 0U)))
-    {
-        return false;
-    }
-
-    osal_file_id_t fd = osal_open_create(
-        path,
-        (osal_file_flag_t)(OSAL_FILE_FLAG_CREATE | OSAL_FILE_FLAG_TRUNCATE),
-        OSAL_WRITE_ONLY);
-    if (fd < 0)
-    {
-        return false;
-    }
-
-    bool ok = true;
-    size_t offset = 0U;
-
-    while (ok && (offset < len))
-    {
-        const int32_t nwritten = osal_write(fd, data + offset, len - offset);
-        if (nwritten <= 0)
-        {
-            ok = false; /* Interrupted write: partial data stays behind. */
-        }
-        else
-        {
-            offset += (size_t)nwritten;
-        }
-    }
-
-    if (osal_close(fd) != OSAL_SUCCESS)
-    {
-        ok = false;
-    }
-
-    return ok;
-}
-
-/** @brief Best-effort remove; "already gone" counts as success. */
-static void remove_quiet(const char *path)
-{
-    (void)osal_remove(path);
 }
 
 /* --------------------------------------------------------------------- */
@@ -1196,6 +1036,36 @@ static app_config_status_t check_commit_version(app_config_doc_kind_t kind,
     return APP_CONFIG_OK;
 }
 
+static hq_json_doc_status_t app_config_platform_validator(
+    const char *json, size_t json_len, void *context)
+{
+    app_config_doc_kind_t kind = *(const app_config_doc_kind_t *)context;
+    app_config_status_t status = validate_stored_len(kind, json, json_len,
+                                                      NULL);
+    if (status == APP_CONFIG_OK) {
+        return HQ_JSON_DOC_OK;
+    }
+    return status == APP_CONFIG_ERR_BOUNDS ? HQ_JSON_DOC_ERR_BOUNDS
+                                           : HQ_JSON_DOC_ERR_MALFORMED;
+}
+
+static app_config_status_t app_config_platform_commit(
+    app_config_doc_kind_t kind, const char *json)
+{
+    hq_json_doc_status_t status = hq_json_doc_commit(
+        app_config_doc_path(kind), json, strlen(json),
+        APP_CONFIG_MAX_FILE_BYTES, app_config_platform_validator, &kind);
+    switch (status) {
+        case HQ_JSON_DOC_OK: return APP_CONFIG_OK;
+        case HQ_JSON_DOC_ERR_ARGUMENT: return APP_CONFIG_ERR_INVALID_ARGUMENT;
+        case HQ_JSON_DOC_ERR_NOT_FOUND: return APP_CONFIG_ERR_NOT_FOUND;
+        case HQ_JSON_DOC_ERR_MALFORMED: return APP_CONFIG_ERR_MALFORMED;
+        case HQ_JSON_DOC_ERR_BOUNDS: return APP_CONFIG_ERR_BOUNDS;
+        case HQ_JSON_DOC_ERR_UNSUPPORTED: return APP_CONFIG_ERR_UNSUPPORTED;
+        default: return APP_CONFIG_ERR_IO;
+    }
+}
+
 /* --------------------------------------------------------------------- */
 /* Migration hook                                                         */
 /* --------------------------------------------------------------------- */
@@ -1295,298 +1165,6 @@ static app_config_status_t migrate_json(app_config_doc_kind_t kind,
 /* Commit machinery (validated, atomic replacement)                        */
 /* --------------------------------------------------------------------- */
 
-/** @brief Path buffer size (matches OSAL_MAX_PATH_LEN). */
-#define APP_CONFIG_PATH_CAP OSAL_MAX_PATH_LEN
-
-/**
- * @brief Classify an osal_rename() failure precisely.
- *
- * Only a backend that does not implement rename
- * (OSAL_ERR_OPERATION_NOT_SUPPORTED / OSAL_ERR_NOT_IMPLEMENTED) yields
- * APP_CONFIG_ERR_UNSUPPORTED; every other failure (storage exhaustion,
- * transient filesystem error, ...) is APP_CONFIG_ERR_IO.  The distinction
- * matters: UNSUPPORTED means "atomic replacement is impossible on this
- * backend", IO means "retrying later can succeed".  The rule applies to
- * every promotion step (live file and last-known-good copy alike).
- */
-static app_config_status_t rename_classify(int32_t rc)
-{
-    if ((rc == OSAL_ERR_OPERATION_NOT_SUPPORTED) ||
-        (rc == OSAL_ERR_NOT_IMPLEMENTED))
-    {
-        return APP_CONFIG_ERR_UNSUPPORTED;
-    }
-    return APP_CONFIG_ERR_IO;
-}
-
-/**
- * @brief Store an already-validated JSON document through the safe path.
- *
- * Steps (normative, see the header):
- *   1. write "<live>.tmp", flush/close,
- *   2. read the temporary file back and re-validate it (length-aware),
- *   3. if the live file exists and validates, refresh the last-known-good
- *      copy with a transactional two-promotion sequence:
- *        a. copy "<live>" to "<live>.good.tmp", read that staging copy
- *           back and validate it,
- *        b. atomically move the previous "<live>.good" to
- *           "<live>.good.old" (preserving it until the live promotion is
- *           known to succeed; a missing previous backup is not an error —
- *           the first commit has nothing to archive),
- *        c. atomically replace "<live>.good" with the staged copy,
- *        d. atomically replace the live file with "<live>.tmp".
- *      If step (d) fails, the pre-commit storage state is restored: when a
- *      previous "<live>.good" existed it is atomically moved back from
- *      "<live>.good.old" (step (c) had only archived the still-valid live
- *      document, so nothing is lost even without the restore), and when NO
- *      previous backup existed the backup freshly promoted by step (c) is
- *      removed again — a failed commit must not leave a "<live>.good"
- *      behind that did not exist before.  Either way BOTH the previous
- *      live document and its previous last-known-good copy (including its
- *      absence) remain exactly as they were.  Without atomic rename
- *      support every promotion is refused (APP_CONFIG_ERR_UNSUPPORTED): a
- *      copy-then-remove fallback could truncate the only valid copy
- *      mid-copy, so a non-atomic replacement path is never used.  A
- *      staging/validation failure aborts before the previous
- *      "<live>.good" is ever touched, and a failed preservation rename
- *      never removes "<live>.good.old": a rename that failed moved
- *      nothing, so the "<live>.good.old" of an earlier interrupted
- *      transaction remains a valid recovery source (the pre-commit
- *      "<live>.good" was not moved either, so nothing was lost).
- *   4. on success remove "<live>.good.old" (best effort): the transaction
- *      has atomically established the new live/backup state, so any
- *      preserved pre-commit backup — including a stale one left by an
- *      earlier interrupted transaction — is superseded.
- *
- * Any failure leaves the previous live document and its last-known-good
- * copy intact (best-effort temporary file cleanup aside).  A crash between
- * the promotions leaves a valid — if stale — "<live>.good.old", which the
- * load path can still recover from.
- */
-static app_config_status_t commit_json(app_config_doc_kind_t kind,
-                                       const char *json)
-{
-    char tmp_path[OSAL_MAX_PATH_LEN];
-    char good_path[OSAL_MAX_PATH_LEN];
-    char good_tmp_path[OSAL_MAX_PATH_LEN];
-    char good_old_path[OSAL_MAX_PATH_LEN];
-
-    if (!build_variant_path(kind, APP_CONFIG_TMP_SUFFIX, tmp_path,
-                            sizeof(tmp_path)) ||
-        !build_variant_path(kind, APP_CONFIG_GOOD_SUFFIX, good_path,
-                            sizeof(good_path)) ||
-        !build_variant_path(kind, APP_CONFIG_GOOD_TMP_SUFFIX, good_tmp_path,
-                            sizeof(good_tmp_path)) ||
-        !build_variant_path(kind, APP_CONFIG_GOOD_OLD_SUFFIX, good_old_path,
-                            sizeof(good_old_path)))
-    {
-        return APP_CONFIG_ERR_INVALID_ARGUMENT;
-    }
-
-    const char *live_path = app_config_doc_path(kind);
-
-    char *buf = malloc(APP_CONFIG_WORK_BUF_BYTES);
-    if (buf == NULL)
-    {
-        return APP_CONFIG_ERR_IO;
-    }
-
-    app_config_status_t status = APP_CONFIG_OK;
-    size_t len = 0U;
-
-    /* Step 1: temporary write + flush/close. */
-    if (!write_whole_file(tmp_path, json, strlen(json)))
-    {
-        remove_quiet(tmp_path);
-        free(buf);
-        return APP_CONFIG_ERR_IO;
-    }
-
-    /* Step 2: read back and validate (length-aware) what actually reached
-     * the storage. */
-    status = read_whole_file(tmp_path, buf, APP_CONFIG_WORK_BUF_BYTES, &len);
-    if (status == APP_CONFIG_OK)
-    {
-        status = validate_stored_len(kind, buf, len, NULL);
-    }
-    if (status != APP_CONFIG_OK)
-    {
-        remove_quiet(tmp_path);
-        free(buf);
-        return status;
-    }
-
-    /* Step 3: last-known-good update, only from a currently valid live
-     * file, staged through "<live>.good.tmp" and validated there before
-     * any promotion.  A corrupt live file is never archived; a failing
-     * staging copy never destroys the previous "<live>.good". */
-    osal_fstat_t st;
-    const int32_t stat_rc = osal_stat(live_path, &st);
-    bool good_preserved = false; /* previous ".good" now at ".good.old". */
-    bool good_promoted = false;  /* staged copy promoted to ".good".     */
-
-    if (stat_rc == OSAL_SUCCESS)
-    {
-        /* Phase rule: only the osal_stat() above establishes existence.
-         * read_confirmed_file() never re-stats, so a live file that was
-         * stat-confirmed can NEVER be misreported as missing here; every
-         * open/read failure is a transient APP_CONFIG_ERR_IO and aborts
-         * the commit BEFORE any promotion (a stat-confirmed live document
-         * is never skipped, never treated as absent, and never replaced
-         * while it cannot be read — otherwise a transient error could
-         * silently discard the only copy that has not been archived yet). */
-        const app_config_status_t live_status = read_confirmed_file(
-            live_path, buf, APP_CONFIG_WORK_BUF_BYTES, &len);
-
-        if (live_status == APP_CONFIG_ERR_IO)
-        {
-            remove_quiet(tmp_path);
-            free(buf);
-            return APP_CONFIG_ERR_IO;
-        }
-
-        app_config_status_t arch_status = live_status;
-        if ((arch_status == APP_CONFIG_OK) &&
-            (validate_stored_len(kind, buf, len, NULL) != APP_CONFIG_OK))
-        {
-            arch_status = APP_CONFIG_ERR_MALFORMED;
-        }
-
-        if (arch_status == APP_CONFIG_OK)
-        {
-            /* Stage the copy, then read it back and validate it BEFORE the
-             * previous last-known-good copy is replaced. */
-            const int32_t cp_rc = osal_cp(live_path, good_tmp_path);
-            if (cp_rc != OSAL_SUCCESS)
-            {
-                remove_quiet(good_tmp_path);
-                remove_quiet(tmp_path);
-                free(buf);
-                return APP_CONFIG_ERR_IO;
-            }
-
-            app_config_status_t good_status = read_whole_file(
-                good_tmp_path, buf, APP_CONFIG_WORK_BUF_BYTES, &len);
-            if ((good_status == APP_CONFIG_OK) &&
-                (validate_stored_len(kind, buf, len, NULL) != APP_CONFIG_OK))
-            {
-                good_status = APP_CONFIG_ERR_MALFORMED;
-            }
-            if (good_status != APP_CONFIG_OK)
-            {
-                /* Keep the previous "<live>.good": it remains the only
-                 * validated recovery source. */
-                remove_quiet(good_tmp_path);
-                remove_quiet(tmp_path);
-                free(buf);
-                return APP_CONFIG_ERR_IO;
-            }
-
-            /* Promotion 3b: preserve the previous "<live>.good" at
-             * "<live>.good.old" until the live promotion is known to have
-             * succeeded.  A missing previous backup is not an error (the
-             * first commit has nothing to archive); any other rename
-             * failure aborts with the previous "<live>.good" untouched
-             * (a failed rename never moved it).  "<live>.good.old" is NOT
-             * removed here: a failed rename moved nothing, so a
-             * "<live>.good.old" left by an earlier interrupted transaction
-             * is still a valid recovery source that must survive this
-             * abort. */
-            const int32_t preserve_rc = osal_rename(good_path, good_old_path);
-            if (preserve_rc != OSAL_SUCCESS)
-            {
-                if (!status_is_missing(preserve_rc))
-                {
-                    remove_quiet(good_tmp_path);
-                    remove_quiet(tmp_path);
-                    free(buf);
-                    return rename_classify(preserve_rc);
-                }
-                /* No previous "<live>.good" exists: nothing to preserve. */
-            }
-            else
-            {
-                good_preserved = true;
-            }
-
-            /* Promotion 3c: atomically publish the staged copy.  Without
-             * atomic rename the promotion is refused: a copy-then-remove
-             * fallback could truncate the only validated recovery source
-             * mid-copy, so the previous "<live>.good" is preserved as-is.
-             * Failures are classified exactly like the live rename. */
-            const int32_t good_rc = osal_rename(good_tmp_path, good_path);
-            if (good_rc != OSAL_SUCCESS)
-            {
-                if (good_preserved)
-                {
-                    /* Restore the previous backup atomically.  Best
-                     * effort: if even the restore fails, the previous
-                     * backup still exists at "<live>.good.old" and remains
-                     * a valid recovery source for the load path. */
-                    (void)osal_rename(good_old_path, good_path);
-                }
-                remove_quiet(good_tmp_path);
-                remove_quiet(tmp_path);
-                free(buf);
-                return rename_classify(good_rc);
-            }
-            good_promoted = true;
-        }
-        /* A corrupt live file falls through: the commit repairs it, and the
-         * previous ".good" (if any) remains the recovery source. */
-    }
-    else if (!status_is_missing(stat_rc))
-    {
-        remove_quiet(tmp_path);
-        free(buf);
-        return APP_CONFIG_ERR_IO;
-    }
-
-    /* Step 4: atomic replacement of the live file.  Without rename support
-     * the live file is never overwritten non-atomically: a copy-then-remove
-     * fallback could leave the live document truncated/invalid if the copy
-     * is interrupted, which the storage contract forbids ("invalid data
-     * cannot replace valid live configuration"). */
-    const int32_t rename_rc = osal_rename(tmp_path, live_path);
-    if (rename_rc != OSAL_SUCCESS)
-    {
-        if (good_preserved)
-        {
-            /* The last-known-good promotion already succeeded, so the
-             * preserved copy is the ONLY remaining copy of the pre-commit
-             * ".good" and must be atomically restored: a failed commit may
-             * not lose the previous last-known-good. */
-            (void)osal_rename(good_old_path, good_path);
-        }
-        else if (good_promoted)
-        {
-            /* No previous ".good" existed (the preservation rename found
-             * nothing to archive), but step 3c already published this
-             * commit's backup as "<live>.good".  The failed commit must
-             * not change the pre-commit storage state, and the pre-commit
-             * state had NO backup: remove the freshly promoted copy so a
-             * failed commit cannot leave a "<live>.good" behind that did
-             * not exist before. */
-            remove_quiet(good_path);
-        }
-        remove_quiet(tmp_path);
-        free(buf);
-        return rename_classify(rename_rc);
-    }
-
-    if (good_preserved)
-    {
-        /* The transaction completed: ".good" now holds the previously live
-         * document, so the preserved pre-commit backup is superseded.
-         * Best-effort removal; a leftover is harmless (a stale, valid
-         * recovery source the load path still accepts). */
-        remove_quiet(good_old_path);
-    }
-
-    free(buf);
-    return APP_CONFIG_OK;
-}
-
 /** @brief Validate, serialize and store a typed document (safe path). */
 static app_config_status_t commit_kind(app_config_doc_kind_t kind,
                                        const void *doc)
@@ -1623,7 +1201,7 @@ static app_config_status_t commit_kind(app_config_doc_kind_t kind,
     }
     if (status == APP_CONFIG_OK)
     {
-        status = commit_json(kind, json);
+        status = app_config_platform_commit(kind, json);
     }
 
     free(json);
@@ -1826,7 +1404,7 @@ static app_config_status_t load_kind(app_config_doc_kind_t kind, void *doc)
             /* Restore the live file from the validated backup.  The bytes
              * are exactly the content that just validated. */
             const app_config_status_t commit_status =
-                commit_json(kind, validated);
+                app_config_platform_commit(kind, validated);
             if (commit_status == APP_CONFIG_OK)
             {
                 /* Only now that the backup is atomically restored is the
@@ -1944,7 +1522,7 @@ app_config_status_t app_config_migrate_stored(app_config_doc_kind_t kind)
                                           APP_CONFIG_WORK_BUF_BYTES);
                     if (status == APP_CONFIG_OK)
                     {
-                        status = commit_json(kind, mig);
+                        status = app_config_platform_commit(kind, mig);
                     }
                     free(mig);
                 }
@@ -2131,6 +1709,8 @@ static bool redact_children(cJSON *parent)
 
 size_t app_config_redact(const char *json, char *out, size_t out_cap)
 {
+    return hq_json_doc_redact(json, out, out_cap);
+
     if ((json == NULL) || (out == NULL) || (out_cap == 0U))
     {
         return 0U;

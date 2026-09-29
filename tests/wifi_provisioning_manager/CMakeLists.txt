@@ -56,6 +56,7 @@ add_executable(wifi_provisioning_manager_tests
     ${CMAKE_CURRENT_LIST_DIR}/wifi_mgmt_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/osal_test_support.c
     ${WIFI_PROVISIONING_MANAGER_DIR}/wifi_provisioning_manager.c
+    ${WIFI_PROVISIONING_DIR}/wifi_provisioning.c
     ${UNITY_DIR}/unity.c
 )
 
@@ -74,6 +75,8 @@ target_include_directories(wifi_provisioning_manager_tests PRIVATE
 # Test/host-build-only adapter surface (runtime listener-URL overrides).
 target_compile_definitions(wifi_provisioning_manager_tests PRIVATE
     WIFI_PROVISIONING_MANAGER_TEST_OBSERVABILITY=1
+    WIFI_PROVISIONING_TEST_OBSERVABILITY=1
+    CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=1
 )
 
 # Match the platform project's strict host-test flags where Unity tolerates

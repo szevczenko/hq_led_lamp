@@ -70,6 +70,7 @@
 #include "tb_attributes.h"
 #include "tb_client.h"
 #include "tb_rpc.h"
+#include "tb_state_sync.h"
 #include "tb_telemetry.h"
 
 #ifdef ESP_PLATFORM
@@ -108,95 +109,57 @@
 /* Internal module state                                                  */
 /* --------------------------------------------------------------------- */
 
-/** @brief Synchronization session state (see header contract). */
-typedef enum tb_app_state {
-    TB_APP_STATE_INACTIVE = 0, /**< Disconnected or retries exhausted; output off. */
-    TB_APP_STATE_SYNCING,      /**< Connected; one subscribe/request attempt in flight. */
-    TB_APP_STATE_BACKOFF,      /**< Connected; last attempt failed; bounded delay before retry. */
-    TB_APP_STATE_SYNCED        /**< Connected; a complete valid state is applied. */
-} tb_app_state_t;
-
-/**
- * @brief Token handed to the in-flight attribute request.
- *
- * Identifies the exact session+attempt a callback belongs to.  The module
- * only ever has one outstanding request, so a single module-owned token is
- * sufficient and stays valid for the whole attempt.
- */
-typedef struct tb_app_attempt_token {
-    uint32_t session; /**< Session the request was issued in. */
-    uint32_t attempt; /**< Attempt number within that session. */
-} tb_app_attempt_token_t;
-
 typedef struct tb_app_module {
     bool               initialized;
     bool               connected;
+    bool               output_suspended;
     tb_client_t       *client;
-    uint32_t           sync_timeout_ms;
-    uint32_t           retry_initial_ms;
-    uint32_t           retry_max_ms;
-    uint32_t           max_retries;
-    tb_application_now_fn_t now_fn;
     tb_application_rssi_fn_t rssi_fn;
     osal_mutex_id_t    lock;
-
-    /* Synchronization state machine (guarded by lock). */
-    tb_app_state_t     state;
-    uint32_t           session;        /**< Monotonic per-connection session id. */
-    uint32_t           attempt;        /**< Current attempt number in the session. */
-    uint32_t           retries;        /**< Consecutive failed attempts in the session. */
-    uint32_t           attempt_deadline_ms; /**< Sync window end of the in-flight attempt. */
-    uint32_t           backoff_until_ms;    /**< Earliest time the next retry may start. */
-    uint32_t           backoff_delay_ms;    /**< Current backoff delay (doubles per failure). */
-    bool               attempt_resolved;    /**< In-flight request already completed (duplicate guard). */
-    tb_app_attempt_token_t request_token;   /**< Token of the in-flight request. */
 
     /* Last applied complete valid state (for telemetry/reporting). */
     lamp_state_t       applied;
     bool               has_applied;
+    bool               rpc_state_changed;
+    lamp_state_t       rpc_state_pending;
 
     /* Telemetry / health reporting (TASK-114). */
     uint32_t           telemetry_period_ms; /**< Bounded periodic interval (0 = default). */
     char               hardware[TB_APPLICATION_HARDWARE_MAX_LEN + 1u];     /**< Safe-charset copy. */
-    uint32_t           last_telemetry_ms;  /**< Last telemetry publish time (rate limit). */
 
     /* Firmware update cooperation. */
     bool               firmware_hint;      /**< fw_* shared attributes changed. */
-    bool               output_suspended;   /**< OTA indicator owns the output. */
 } tb_app_module_t;
 
 static tb_app_module_t s_tb;
 
-/* Forward declarations (defined below; the transport function references
- * them before their definitions). */
-static void tb_app_on_shared_update(const char *json_payload,
-                                    void *user_data);
-static void tb_app_on_attr_response(tb_request_result_t result,
-                                    const char *json_response,
-                                    void *user_data);
 static bool tb_app_is_connected(void);
 
-static void tb_app_publish_applied_attributes(void)
+static void tb_app_publish_applied_attributes(const void *state,
+                                              void *user_data)
 {
+    const lamp_state_t *applied = (const lamp_state_t *)state;
     char json[160];
     int written;
 
-    if (!tb_app_is_connected() || !s_tb.has_applied) {
+    (void)user_data;
+    if (applied == NULL || !s_tb.connected || s_tb.client == NULL ||
+        !tb_client_is_connected(s_tb.client)) {
         return;
     }
 #if CONFIG_KLC_LAMP_TYPE_RGB
     written = snprintf(json, sizeof(json),
                        "{\"power\":%s,\"brightness\":%u,\"red\":%u,"
                        "\"green\":%u,\"blue\":%u}",
-                       s_tb.applied.power ? "true" : "false",
-                       (unsigned)s_tb.applied.brightness_percent,
-                       (unsigned)s_tb.applied.red,
-                       (unsigned)s_tb.applied.green,
-                       (unsigned)s_tb.applied.blue);
+                       applied->power ? "true" : "false",
+                       (unsigned)applied->brightness_percent,
+                       (unsigned)applied->red,
+                       (unsigned)applied->green,
+                       (unsigned)applied->blue);
 #else
     written = snprintf(json, sizeof(json), "{\"power\":%s,\"brightness\":%u}",
-                       s_tb.applied.power ? "true" : "false",
-                       (unsigned)s_tb.applied.brightness_percent);
+                       applied->power ? "true" : "false",
+                       (unsigned)applied->brightness_percent);
 #endif
     if (written > 0 && (size_t)written < sizeof(json)) {
         (void)tb_attributes_send_json(s_tb.client, json);
@@ -207,33 +170,10 @@ static void tb_app_publish_applied_attributes(void)
 /* Helpers (all internal helpers expect the lock held unless noted)        */
 /* --------------------------------------------------------------------- */
 
-static uint32_t tb_app_now_ms(void)
-{
-    if (s_tb.now_fn != NULL)
-    {
-        return s_tb.now_fn();
-    }
-    return osal_task_get_time_ms();
-}
-
 static bool tb_app_is_connected(void)
 {
     return s_tb.connected && (s_tb.client != NULL) &&
            tb_client_is_connected(s_tb.client);
-}
-
-static uint32_t tb_app_clamp(uint32_t value, uint32_t min_value,
-                             uint32_t max_value)
-{
-    if (value < min_value)
-    {
-        return min_value;
-    }
-    if (value > max_value)
-    {
-        return max_value;
-    }
-    return value;
 }
 
 /**
@@ -318,16 +258,17 @@ static void tb_app_copy_telemetry_string(const char *src, char *dst,
  * last-publish timestamp is advanced so the poll()-driven periodic publish
  * stays rate-limited to `telemetry_period_ms`.
  */
-static void tb_app_publish_telemetry(void)
+static void tb_app_publish_telemetry(void *user_data)
 {
     lamp_applied_state_t applied;
     lamp_duty_t duty = LAMP_DUTY_MIN;
     char buf[TB_APPLICATION_TELEMETRY_MAX_BYTES];
     int n;
-    const uint32_t now = tb_app_now_ms();
 
     /* Suppress while disconnected: never queue, never publish. */
-    if (!s_tb.initialized || !tb_app_is_connected())
+    (void)user_data;
+    if (!s_tb.initialized || !s_tb.connected || s_tb.client == NULL ||
+        !tb_client_is_connected(s_tb.client))
     {
         return;
     }
@@ -378,7 +319,6 @@ static void tb_app_publish_telemetry(void)
     {
         osal_log_error("[tb_app] telemetry serialization overflow; "
                        "publish suppressed");
-        s_tb.last_telemetry_ms = now;
         return;
     }
 
@@ -387,7 +327,6 @@ static void tb_app_publish_telemetry(void)
         /* Best-effort: report and keep the periodic cadence. */
         osal_log_warning("[tb_app] telemetry publish failed");
     }
-    s_tb.last_telemetry_ms = now;
 }
 
 /**
@@ -399,8 +338,9 @@ static void tb_app_publish_telemetry(void)
  * attempt can never be followed by a re-enabled output until a complete
  * valid state arrives.
  */
-static void tb_app_fail_off(void)
+static void tb_app_fail_off(void *user_data)
 {
+    (void)user_data;
     lamp_status_t status = lamp_control_force_inactive();
     if (status != LAMP_OK)
     {
@@ -417,208 +357,49 @@ static void tb_app_fail_off(void)
  * failure the output is forced inactive and an error is returned; the
  * caller schedules the bounded retry in that case.
  */
-static lamp_status_t tb_app_apply_state(const lamp_state_t *desired)
+static bool tb_app_apply_state(const void *state, bool output_suspended,
+                               void *user_data)
 {
+    const lamp_state_t *desired = (const lamp_state_t *)state;
     lamp_status_t status;
 
-    if (s_tb.output_suspended)
+    (void)user_data;
+    if (desired == NULL) {
+        return false;
+    }
+    if (output_suspended)
     {
+        osal_mutex_take(s_tb.lock);
         s_tb.applied = *desired;
         s_tb.has_applied = true;
+        osal_mutex_give(s_tb.lock);
         osal_log_info("[tb_app] desired state stored while output is "
                       "suspended: power=%s brightness=%u",
                       desired->power ? "on" : "off",
                       (unsigned)desired->brightness_percent);
-        tb_app_publish_applied_attributes();
-        return LAMP_OK;
+        return true;
     }
 
     (void)lamp_control_release_fail_off();
     status = lamp_control_apply_state(desired, NULL);
     if (status == LAMP_OK)
     {
+        osal_mutex_take(s_tb.lock);
         s_tb.applied = *desired;
         s_tb.has_applied = true;
+        osal_mutex_give(s_tb.lock);
         osal_log_info("[tb_app] applied complete valid desired state: "
                       "power=%s brightness=%u",
                       desired->power ? "on" : "off",
                       (unsigned)desired->brightness_percent);
-                tb_app_publish_applied_attributes();
-        /* Successful state change: publish the applied-state telemetry.  The
-         * lock is held here (both sync callbacks call us under the lock). */
-        tb_app_publish_telemetry();
     }
     else
     {
         osal_log_error("[tb_app] lamp apply failed: %d (fail-off)",
                        (int)status);
-        tb_app_fail_off();
+        tb_app_fail_off(NULL);
     }
-    return status;
-}
-
-/**
- * @brief Mark the current attempt as failed: fail-off + bounded backoff.
- *
- * Called with the lock held.  Consumes the in-flight attempt, forces the
- * output inactive, increments the retry counter and either schedules the
- * next (bounded) retry or — when the retry budget for this session is
- * exhausted — parks the module in INACTIVE until the next connect.
- */
-static void tb_app_fail_attempt(void)
-{
-    tb_app_fail_off();
-
-    s_tb.attempt_resolved = true;
-
-    if (!tb_app_is_connected())
-    {
-        /* The transport is gone; the disconnect path owns the reset. */
-        s_tb.state = TB_APP_STATE_INACTIVE;
-        return;
-    }
-
-    s_tb.retries++;
-    if (s_tb.retries >= s_tb.max_retries)
-    {
-        /* Bounded retry budget exhausted for this session: the module
-         * stops retrying and waits for the next reconnect (which starts a
-         * fresh session and a fresh budget).  The output stays off. */
-        osal_log_warning("[tb_app] sync retry budget exhausted (%u); "
-                         "output stays off until reconnect",
-                         (unsigned)s_tb.retries);
-        s_tb.state = TB_APP_STATE_INACTIVE;
-        return;
-    }
-
-    if (s_tb.backoff_delay_ms == 0u)
-    {
-        s_tb.backoff_delay_ms = s_tb.retry_initial_ms;
-    }
-    else
-    {
-        uint64_t doubled = (uint64_t)s_tb.backoff_delay_ms * 2u;
-        if (doubled > (uint64_t)s_tb.retry_max_ms)
-        {
-            doubled = (uint64_t)s_tb.retry_max_ms;
-        }
-        s_tb.backoff_delay_ms = (uint32_t)doubled;
-    }
-
-    s_tb.backoff_until_ms = tb_app_now_ms() + s_tb.backoff_delay_ms;
-    s_tb.state = TB_APP_STATE_BACKOFF;
-    osal_log_warning("[tb_app] sync attempt failed (retries=%u); "
-                     "retry in %u ms",
-                     (unsigned)s_tb.retries,
-                     (unsigned)s_tb.backoff_delay_ms);
-}
-
-/**
- * @brief Arm a fresh synchronization attempt.
- *
- * Called with the lock held.  Increments the attempt number, publishes a
- * fresh request token (session identity), sets the bounded sync window
- * deadline and moves to SYNCING.  The subscribe/request transport calls are
- * performed by the caller with the lock released.
- */
-static void tb_app_start_attempt(void)
-{
-    s_tb.attempt++;
-    s_tb.attempt_resolved = false;
-    s_tb.request_token.session = s_tb.session;
-    s_tb.request_token.attempt = s_tb.attempt;
-    s_tb.attempt_deadline_ms = tb_app_now_ms() + s_tb.sync_timeout_ms;
-    s_tb.state = TB_APP_STATE_SYNCING;
-}
-
-/**
- * @brief Subscribe to shared updates and request both attributes (one op).
- *
- * Must be called with the lock RELEASED: the platform may invoke the
- * response callback synchronously on an error path, and the callbacks take
- * the lock themselves.
- *
- * @return 0 on full success; non-zero when the subscribe or the request
- *         could not be issued (the caller then fails the attempt).
- */
-static int tb_app_transport_subscribe_and_request(void)
-{
-    /* The platform request API takes `const char *keys[]`, so the array
-     * element type must not add another const qualifier. */
-    static const char *TB_APP_KEYS[] = {
-        TB_APPLICATION_KEY_POWER,
-        TB_APPLICATION_KEY_BRIGHTNESS,
-#if CONFIG_KLC_LAMP_TYPE_RGB
-        TB_APPLICATION_KEY_RED,
-        TB_APPLICATION_KEY_GREEN,
-        TB_APPLICATION_KEY_BLUE,
-#endif
-    };
-    static const char *TB_APP_CLIENT_KEYS[] = {
-        TB_APPLICATION_KEY_POWER,
-        TB_APPLICATION_KEY_BRIGHTNESS,
-#if CONFIG_KLC_LAMP_TYPE_RGB
-        TB_APPLICATION_KEY_RED,
-        TB_APPLICATION_KEY_GREEN,
-        TB_APPLICATION_KEY_BLUE,
-#endif
-    };
-    const size_t num_keys =
-        sizeof(TB_APP_KEYS) / sizeof(TB_APP_KEYS[0]);
-    int rc;
-
-    /* Subscribe to updates on every successful connection. */
-    rc = tb_attributes_subscribe(s_tb.client,
-                                 tb_app_on_shared_update,
-                                 (void *)(uintptr_t)s_tb.session);
-    if (rc != 0)
-    {
-        osal_log_error("[tb_app] shared-attribute subscribe failed: %d",
-                       rc);
-        return rc;
-    }
-
-    /* Request both authoritative attributes as one synchronization
-     * operation; the transport itself bounds the attempt with its own
-     * timeout, and the module additionally enforces the sync window in
-     * tb_application_poll(). */
-    rc = tb_attributes_request(
-        s_tb.client, TB_APP_CLIENT_KEYS,
-        sizeof(TB_APP_CLIENT_KEYS) / sizeof(TB_APP_CLIENT_KEYS[0]),
-        TB_APP_KEYS, num_keys,
-        tb_app_on_attr_response, &s_tb.request_token,
-        s_tb.sync_timeout_ms);
-    if (rc != 0)
-    {
-        osal_log_error("[tb_app] shared-attribute request failed: %d", rc);
-        return rc;
-    }
-
-    return 0;
-}
-
-/**
- * @brief Issue the transport calls for the already-armed attempt.
- *
- * The caller arms the attempt under the lock and releases it before this
- * runs (the platform may invoke the response callback synchronously on an
- * error path, and the callbacks take the lock themselves).  On an immediate
- * transport failure the current attempt is failed under the lock again.
- */
-static void tb_app_run_transport(void)
-{
-    int rc = tb_app_transport_subscribe_and_request();
-
-    if (rc != 0)
-    {
-        osal_mutex_take(s_tb.lock);
-        if (s_tb.initialized && (s_tb.state == TB_APP_STATE_SYNCING) &&
-            !s_tb.attempt_resolved)
-        {
-            tb_app_fail_attempt();
-        }
-        osal_mutex_give(s_tb.lock);
-    }
+    return status == LAMP_OK;
 }
 
 /* --------------------------------------------------------------------- */
@@ -826,7 +607,9 @@ static bool tb_app_is_ota_only_update(const char *json)
 
     if (is_firmware)
     {
+        osal_mutex_take(s_tb.lock);
         s_tb.firmware_hint = true;
+        osal_mutex_give(s_tb.lock);
         osal_log_info("[tb_app] firmware attributes changed; firmware "
                       "check requested");
     }
@@ -872,202 +655,47 @@ static bool tb_app_parse_initial_state(const char *json, lamp_state_t *out)
     return true;
 }
 
-/* --------------------------------------------------------------------- */
-/* Transport callbacks (run on the transport thread)                      */
-/* --------------------------------------------------------------------- */
-
-/**
- * @brief Shared-attribute update callback (from tb_attributes_subscribe).
- *
- * Sessions, duplicates and stale delivery are rejected here:
- *   - a callback from a session that is not the current one, or while the
- *     module/transport is not connected, is stale and dropped (output
- *     unchanged),
- *   - a payload that is not a complete valid desired state is rejected
- *     with fail-off and a bounded backoff retry,
- *   - a complete valid update identical to the last applied state is a
- *     duplicate retransmission and is ignored,
- *   - a complete valid update (current session) is applied immediately;
- *     after synchronization the applied state stays authoritative.
- */
-static void tb_app_on_shared_update(const char *json_payload,
-                                    void *user_data)
+static tb_state_sync_parse_result_t tb_app_parse_state_callback(
+    const char *json, tb_state_sync_source_t source, void *state_out,
+    void *user_data)
 {
-    const uint32_t token_session =
-        (uint32_t)(uintptr_t)user_data;
-    lamp_state_t desired;
-
-    osal_mutex_take(s_tb.lock);
-
-    if (!s_tb.initialized || !tb_app_is_connected() ||
-        (s_tb.state == TB_APP_STATE_INACTIVE))
-    {
-        /* Stale callback (previous session or leftover after disconnect):
-         * dropped; the output is already off for this session. */
-        osal_mutex_give(s_tb.lock);
-        return;
+    bool valid = false;
+    (void)user_data;
+    if (source == TB_STATE_SYNC_SOURCE_CLIENT) {
+        valid = tb_app_parse_state_scope(json, "client", state_out);
+        if (valid) {
+            osal_log_info("[tb_app] sync source=client");
+        }
+    } else if (source == TB_STATE_SYNC_SOURCE_SHARED) {
+        valid = tb_app_parse_state_scope(json, "shared", state_out);
+        if (valid) {
+            osal_log_info("[tb_app] sync source=shared");
+        }
+    } else if (source == TB_STATE_SYNC_SOURCE_DEFAULT) {
+        valid = tb_app_parse_initial_state(json, state_out);
+        if (valid) {
+            osal_log_info("[tb_app] sync source=default");
+        }
+    } else {
+        if (json != NULL && tb_app_is_ota_only_update(json)) {
+            return TB_STATE_SYNC_PARSE_IGNORED;
+        }
+        valid = tb_app_parse_state(json, state_out);
     }
-
-    /* Session identity: the subscription token must match the current
-     * session (guards updates from a previous subscribe cycle). */
-    if (token_session != s_tb.session)
-    {
-        osal_log_warning("[tb_app] dropped update from stale session");
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if (json_payload == NULL)
-    {
-        tb_app_fail_attempt();
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if (tb_app_is_ota_only_update(json_payload))
-    {
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if (!tb_app_parse_state(json_payload, &desired))
-    {
-        /* Invalid or partial data: reject and fail safe — output off. */
-        osal_log_warning("[tb_app] rejected invalid/partial update");
-        tb_app_fail_attempt();
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if ((s_tb.state == TB_APP_STATE_SYNCED) && s_tb.has_applied &&
-        (desired.power == s_tb.applied.power) &&
-        (desired.brightness_percent == s_tb.applied.brightness_percent) &&
-        (desired.red == s_tb.applied.red) &&
-        (desired.green == s_tb.applied.green) &&
-        (desired.blue == s_tb.applied.blue))
-    {
-        /* Duplicate retransmission of the already-applied complete state:
-         * no-op (duplicates never re-apply and never enable the output). */
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    /* Complete valid state for the current session: apply it.  When this
-     * happens while an attribute request is still in flight, the attempt is
-     * considered resolved so the (older snapshot) response cannot overwrite
-     * the authoritative update. */
-    if (s_tb.state == TB_APP_STATE_SYNCING)
-    {
-        s_tb.attempt_resolved = true;
-    }
-    if (tb_app_apply_state(&desired) == LAMP_OK)
-    {
-        s_tb.retries = 0u;
-        s_tb.state = TB_APP_STATE_SYNCED;
-    }
-    else
-    {
-        tb_app_fail_attempt();
-    }
-
-    osal_mutex_give(s_tb.lock);
+    return valid ? TB_STATE_SYNC_PARSE_VALID : TB_STATE_SYNC_PARSE_INVALID;
 }
 
-/**
- * @brief Attribute request response callback (from tb_attributes_request_shared).
- *
- * Applies only the single first complete valid response for the current
- * attempt of the current session:
- *   - a callback whose session/attempt token does not match the current
- *     attempt is stale or late and is dropped,
- *   - a second callback for an already-resolved attempt is a duplicate and
- *     is dropped,
- *   - a timeout/error result, a missing response or a response that is not
- *     a complete valid desired state fails the attempt (fail-off + bounded
- *     backoff retry),
- *   - a CANCELLED result is owned by the disconnect path (the fail-off and
- *     session reset happen in on_disconnected).
- */
-static void tb_app_on_attr_response(tb_request_result_t result,
-                                    const char *json_response,
-                                    void *user_data)
+static bool tb_app_states_equal(const void *left, const void *right,
+                                void *user_data)
 {
-    const tb_app_attempt_token_t *token =
-        (const tb_app_attempt_token_t *)user_data;
-    lamp_state_t desired;
-
-    osal_mutex_take(s_tb.lock);
-
-    if (!s_tb.initialized || (s_tb.state != TB_APP_STATE_SYNCING))
-    {
-        /* Stale/late callback from a previous session or after the attempt
-         * was already failed/consumed: dropped, output unchanged. */
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    /* Session identity: session + attempt must match the current request. */
-    if ((token == NULL) ||
-        (token->session != s_tb.session) ||
-        (token->attempt != s_tb.attempt))
-    {
-        osal_log_warning("[tb_app] dropped stale/late response");
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    /* Duplicate: the current attempt already completed. */
-    if (s_tb.attempt_resolved)
-    {
-        osal_log_warning("[tb_app] dropped duplicate response");
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if (result == TB_REQUEST_RESULT_CANCELLED)
-    {
-        /* The transport is being torn down; on_disconnected owns the
-         * fail-off and the session reset. */
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if ((result != TB_REQUEST_RESULT_SUCCESS) || (json_response == NULL))
-    {
-        /* Timeout or transport error: the sync window failed. */
-        osal_log_warning("[tb_app] sync timeout/error (result=%d)",
-                         (int)result);
-        tb_app_fail_attempt();
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if (tb_app_parse_state_scope(json_response, "client", &desired)) {
-        osal_log_info("[tb_app] sync source=client");
-    } else if (tb_app_parse_state_scope(json_response, "shared", &desired)) {
-        osal_log_info("[tb_app] sync source=shared");
-    } else if (tb_app_parse_initial_state(json_response, &desired)) {
-        osal_log_info("[tb_app] sync source=default");
-    } else
-    {
-        osal_log_warning("[tb_app] rejected invalid/partial sync response");
-        tb_app_fail_attempt();
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    s_tb.attempt_resolved = true;
-    if (tb_app_apply_state(&desired) == LAMP_OK)
-    {
-        s_tb.retries = 0u;
-        s_tb.state = TB_APP_STATE_SYNCED;
-    }
-    else
-    {
-        tb_app_fail_attempt();
-    }
-
-    osal_mutex_give(s_tb.lock);
+    const lamp_state_t *left_state = (const lamp_state_t *)left;
+    const lamp_state_t *right_state = (const lamp_state_t *)right;
+    (void)user_data;
+    return left_state->power == right_state->power &&
+           left_state->brightness_percent == right_state->brightness_percent &&
+           left_state->red == right_state->red &&
+           left_state->green == right_state->green &&
+           left_state->blue == right_state->blue;
 }
 /* --------------------------------------------------------------------- */
 /* Server-side RPC control (TASK-113)                                     */
@@ -1168,37 +796,16 @@ static void tb_app_rpc_respond_success(uint32_t request_id,
 }
 
 /**
- * @brief Build and publish a structured error response.
+ * @brief Publish a structured error response (shared platform format).
  *
- * @p error is one of the documented classes ("unknown method",
- * "invalid payload", "hardware failure"); @p reason carries the validation
- * detail for invalid payloads and @p method echoes the offending method
- * name for unknown methods (bounded before it reaches this point).
+ * @p error is one of the documented classes ("invalid payload",
+ * "hardware failure"); @p reason carries the validation detail.
  */
 static void tb_app_rpc_respond_error(uint32_t request_id, const char *error,
                                      const char *reason, const char *method)
 {
-    cJSON *root;
-
-    root = cJSON_CreateObject();
-    if (root == NULL)
-    {
-        return;
-    }
-
-    cJSON_AddBoolToObject(root, "success", false);
-    cJSON_AddStringToObject(root, "error", error);
-    if (reason != NULL)
-    {
-        cJSON_AddStringToObject(root, "reason", reason);
-    }
-    if (method != NULL)
-    {
-        cJSON_AddStringToObject(root, "method", method);
-    }
-
-    tb_app_rpc_respond(request_id, root);
-    cJSON_Delete(root);
+    (void)tb_state_sync_respond_rpc_error(s_tb.client, request_id, error,
+                                          reason, method);
 }
 
 /**
@@ -1233,7 +840,9 @@ static void tb_app_rpc_apply_and_respond(uint32_t request_id,
     {
         s_tb.applied = *desired;
         s_tb.has_applied = true;
-        tb_app_publish_applied_attributes();
+        s_tb.rpc_state_pending = *desired;
+        s_tb.rpc_state_changed = true;
+        tb_app_publish_applied_attributes(desired, NULL);
         (void)lamp_control_get_applied_state(&applied);
         tb_app_rpc_respond_success(request_id, desired, &applied);
         return;
@@ -1250,10 +859,11 @@ static void tb_app_rpc_apply_and_respond(uint32_t request_id,
      * detection) stay consistent across the sync and RPC channels. */
     s_tb.applied = *desired;
     s_tb.has_applied = true;
+    s_tb.rpc_state_pending = *desired;
+    s_tb.rpc_state_changed = true;
 
-    tb_app_publish_applied_attributes();
+    tb_app_publish_applied_attributes(desired, NULL);
     tb_app_rpc_respond_success(request_id, desired, &applied);
-    tb_app_publish_telemetry();
 }
 
 /**
@@ -1375,12 +985,10 @@ static bool tb_app_rpc_parse_rgb_partial(const cJSON *params, lamp_state_t *out)
     }
     return any;
 }
-#endif
 
 static void tb_app_rpc_handle_set_color(uint32_t request_id,
                                         const cJSON *params)
 {
-#if CONFIG_KLC_LAMP_TYPE_RGB
     lamp_state_t desired;
 
     if (!tb_app_rpc_current_state(&desired)) {
@@ -1393,11 +1001,8 @@ static void tb_app_rpc_handle_set_color(uint32_t request_id,
         return;
     }
     tb_app_rpc_apply_and_respond(request_id, &desired);
-#else
-    (void)params;
-    tb_app_rpc_respond_error(request_id, "unknown method", NULL, "setColor");
-#endif
 }
+#endif
 
 /** @brief `setPower` handler: requires a boolean `power`. */
 static void tb_app_rpc_handle_set_power(uint32_t request_id,
@@ -1553,33 +1158,52 @@ static void tb_app_rpc_handle_get_state(uint32_t request_id,
                                &applied);
 }
 
+/* The engine enforces the documented limits before calling handlers. */
+#if (TB_APPLICATION_RPC_METHOD_MAX_LEN != TB_STATE_SYNC_MAX_RPC_METHOD_LEN) || \
+    (TB_APPLICATION_RPC_PARAMS_MAX_LEN != TB_STATE_SYNC_MAX_RPC_PAYLOAD_BYTES)
+#error "tb_application RPC limits must match tb_state_sync"
+#endif
+
+typedef void (*tb_app_rpc_handler_t)(uint32_t request_id,
+                                     const cJSON *params);
+
+typedef struct tb_app_rpc_method {
+    const char *name;
+    tb_app_rpc_handler_t handler;
+} tb_app_rpc_method_t;
+
+static tb_app_rpc_method_t s_rpc_methods[] = {
+    { TB_APPLICATION_RPC_METHOD_SET_POWER, tb_app_rpc_handle_set_power },
+    { TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS,
+      tb_app_rpc_handle_set_brightness },
+    { TB_APPLICATION_RPC_METHOD_SET_STATE, tb_app_rpc_handle_set_state },
+#if CONFIG_KLC_LAMP_TYPE_RGB
+    { TB_APPLICATION_RPC_METHOD_SET_COLOR, tb_app_rpc_handle_set_color },
+#endif
+    { TB_APPLICATION_RPC_METHOD_GET_STATE, tb_app_rpc_handle_get_state },
+};
+
 /**
- * @brief Server RPC callback (from tb_rpc_subscribe_server, transport
- *        thread).
+ * @brief Server RPC callback registered per method with tb_state_sync.
  *
- * The complete validation pipeline for the four documented methods:
- *   - requests that arrive while the module/transport is not connected or
- *     after deinit are dropped (nothing is applied or reported),
- *   - the method name and the params payload are length-bounded BEFORE any
- *     parsing or comparison,
- *   - an empty/missing method or an oversized method is an invalid payload,
- *   - any method other than the four documented ones is an unknown method
- *     (its bounded name is echoed in the error response),
- *   - params must parse as a JSON object; per-method handlers then enforce
- *     the required fields, exact JSON types and the brightness range,
- *   - a validated set applies the hardware BEFORE any success response and
- *     publishes telemetry only on success; getState reads state.
+ * The engine has already bounded the method name and params payload and
+ * answered unknown methods.  This callback drops stale requests, requires
+ * params to be a JSON object and runs the method handler (which enforces
+ * required fields, exact types and ranges) under the module lock.
  */
 static void tb_app_on_server_rpc(const char *method, const char *params_json,
                                  uint32_t request_id, void *user_data)
 {
-    const char *method_name = (method != NULL) ? method : "";
-    size_t method_len;
+    const tb_app_rpc_method_t *entry = user_data;
     cJSON *params = NULL;
+    bool state_changed;
+    bool publish_telemetry;
+    lamp_state_t pending_state;
 
-    (void)user_data;
+    (void)method;
 
     osal_mutex_take(s_tb.lock);
+    s_tb.rpc_state_changed = false;
     if (!s_tb.initialized || !tb_app_is_connected())
     {
         /* Stale request after disconnect/teardown: dropped, output and
@@ -1589,46 +1213,7 @@ static void tb_app_on_server_rpc(const char *method, const char *params_json,
         return;
     }
 
-    /* Bounded method: reject before any parsing or comparison. */
-    method_len = strlen(method_name);
-    if (method_len == 0u)
-    {
-        tb_app_rpc_respond_error(request_id, "invalid payload",
-                                 "missing method", NULL);
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-    if (method_len > TB_APPLICATION_RPC_METHOD_MAX_LEN)
-    {
-        tb_app_rpc_respond_error(request_id, "invalid payload",
-                                 "method too long", NULL);
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    /* Bounded payload: reject before parsing the params object. */
-    if ((params_json != NULL) &&
-        (strlen(params_json) > TB_APPLICATION_RPC_PARAMS_MAX_LEN))
-    {
-        tb_app_rpc_respond_error(request_id, "invalid payload",
-                                 "payload too long", NULL);
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    if ((strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_POWER) != 0) &&
-        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS) != 0) &&
-        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_STATE) != 0) &&
-        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_COLOR) != 0) &&
-        (strcmp(method_name, TB_APPLICATION_RPC_METHOD_GET_STATE) != 0))
-    {
-        tb_app_rpc_respond_error(request_id, "unknown method", NULL,
-                                 method_name);
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    params = cJSON_Parse((params_json != NULL) ? params_json : "{}");
+    params = cJSON_Parse(params_json);
     if (params == NULL)
     {
         tb_app_rpc_respond_error(request_id, "invalid payload",
@@ -1645,53 +1230,19 @@ static void tb_app_on_server_rpc(const char *method, const char *params_json,
         return;
     }
 
-    if (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_POWER) == 0)
-    {
-        tb_app_rpc_handle_set_power(request_id, params);
-    }
-    else if (strcmp(method_name,
-                    TB_APPLICATION_RPC_METHOD_SET_BRIGHTNESS) == 0)
-    {
-        tb_app_rpc_handle_set_brightness(request_id, params);
-    }
-    else if (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_STATE) == 0)
-    {
-        tb_app_rpc_handle_set_state(request_id, params);
-    }
-    else if (strcmp(method_name, TB_APPLICATION_RPC_METHOD_SET_COLOR) == 0)
-    {
-        tb_app_rpc_handle_set_color(request_id, params);
-    }
-    else
-    {
-        tb_app_rpc_handle_get_state(request_id, params);
-    }
+    entry->handler(request_id, params);
 
     cJSON_Delete(params);
+    state_changed = s_tb.rpc_state_changed;
+    pending_state = s_tb.rpc_state_pending;
+    publish_telemetry = !s_tb.output_suspended;
+    s_tb.rpc_state_changed = false;
     osal_mutex_give(s_tb.lock);
-}
-
-/**
- * @brief (Re-)arm the server-side RPC control subscription.
- *
- * Called after every successful connection with the module lock released.
- * The platform tb_rpc subscription is idempotent (one server callback
- * total), so reconnecting simply keeps the armed callback; a transport
- * that lost its subscriptions gets them re-registered here.
- */
-static void tb_app_subscribe_rpc(void)
-{
-    int rc;
-
-    if (!s_tb.initialized || (s_tb.client == NULL))
-    {
-        return;
-    }
-
-    rc = tb_rpc_subscribe_server(s_tb.client, tb_app_on_server_rpc, NULL);
-    if (rc != 0)
-    {
-        osal_log_warning("[tb_app] server RPC subscribe failed: %d", rc);
+    if (state_changed) {
+        (void)tb_state_sync_record_state(&pending_state);
+        if (publish_telemetry) {
+            tb_state_sync_note_state_change();
+        }
     }
 }
 
@@ -1703,6 +1254,17 @@ tb_application_status_t tb_application_init(
     const tb_application_config_t *config)
 {
     osal_status_t os_rc;
+    tb_state_sync_status_t sync_status;
+    tb_state_sync_config_t sync_config = { 0 };
+    static const char *const state_keys[] = {
+        TB_APPLICATION_KEY_POWER,
+        TB_APPLICATION_KEY_BRIGHTNESS,
+#if CONFIG_KLC_LAMP_TYPE_RGB
+        TB_APPLICATION_KEY_RED,
+        TB_APPLICATION_KEY_GREEN,
+        TB_APPLICATION_KEY_BLUE,
+#endif
+    };
 
     if ((config == NULL) || (config->client == NULL))
     {
@@ -1729,81 +1291,76 @@ tb_application_status_t tb_application_init(
         return TB_APPLICATION_ERR_ALREADY_INITIALIZED;
     }
 
-    /* Bounded configuration: defaults for zeros, clamps for extremes. */
     s_tb.client = config->client;
-    s_tb.sync_timeout_ms =
-        tb_app_clamp((config->sync_timeout_ms == 0u)
-                         ? TB_APPLICATION_SYNC_TIMEOUT_DEFAULT_MS
-                         : config->sync_timeout_ms,
-                     TB_APPLICATION_SYNC_TIMEOUT_MIN_MS,
-                     TB_APPLICATION_SYNC_TIMEOUT_MAX_MS);
-    s_tb.retry_initial_ms =
-        tb_app_clamp((config->retry_initial_delay_ms == 0u)
-                         ? TB_APPLICATION_RETRY_INITIAL_DELAY_DEFAULT_MS
-                         : config->retry_initial_delay_ms,
-                     TB_APPLICATION_RETRY_DELAY_MIN_MS,
-                     TB_APPLICATION_RETRY_DELAY_MAX_MS);
-    s_tb.retry_max_ms =
-        tb_app_clamp((config->retry_max_delay_ms == 0u)
-                         ? TB_APPLICATION_RETRY_MAX_DELAY_DEFAULT_MS
-                         : config->retry_max_delay_ms,
-                     TB_APPLICATION_RETRY_DELAY_MIN_MS,
-                     TB_APPLICATION_RETRY_DELAY_MAX_MS);
-    if (s_tb.retry_max_ms < s_tb.retry_initial_ms)
-    {
-        s_tb.retry_max_ms = s_tb.retry_initial_ms;
-    }
-    s_tb.max_retries = (config->max_retries == 0u)
-                           ? TB_APPLICATION_MAX_RETRIES_DEFAULT
-                           : config->max_retries;
-    s_tb.now_fn = config->now_ms;
     s_tb.rssi_fn = config->rssi_dbm;
-    s_tb.telemetry_period_ms =
-        tb_app_clamp((config->telemetry_period_ms == 0u)
-                         ? TB_APPLICATION_TELEMETRY_PERIOD_DEFAULT_MS
-                         : config->telemetry_period_ms,
-                     TB_APPLICATION_TELEMETRY_PERIOD_MIN_MS,
-                     TB_APPLICATION_TELEMETRY_PERIOD_MAX_MS);
     tb_app_copy_telemetry_string(config->hardware, s_tb.hardware,
                                  sizeof(s_tb.hardware));
 
     s_tb.connected = false;
-    s_tb.state = TB_APP_STATE_INACTIVE;
-    s_tb.session = 0u;
-    s_tb.attempt = 0u;
-    s_tb.retries = 0u;
-    s_tb.attempt_deadline_ms = 0u;
-    s_tb.backoff_until_ms = 0u;
-    s_tb.backoff_delay_ms = 0u;
-    s_tb.attempt_resolved = true;
-    memset(&s_tb.request_token, 0, sizeof(s_tb.request_token));
+    s_tb.output_suspended = false;
     memset(&s_tb.applied, 0, sizeof(s_tb.applied));
     s_tb.has_applied = false;
-    s_tb.last_telemetry_ms = 0u;
+    s_tb.rpc_state_changed = false;
     s_tb.firmware_hint = false;
-    s_tb.output_suspended = false;
 
     s_tb.initialized = true;
     osal_mutex_give(s_tb.lock);
+
+    sync_config.client = config->client;
+    sync_config.client_keys = state_keys;
+    sync_config.client_key_count = sizeof(state_keys) / sizeof(state_keys[0]);
+    sync_config.shared_keys = state_keys;
+    sync_config.shared_key_count = sizeof(state_keys) / sizeof(state_keys[0]);
+    sync_config.max_payload_bytes = TB_APPLICATION_MAX_PAYLOAD_BYTES;
+    sync_config.state_size = sizeof(lamp_state_t);
+    sync_config.sync_timeout_ms = config->sync_timeout_ms;
+    sync_config.retry_initial_delay_ms = config->retry_initial_delay_ms;
+    sync_config.retry_max_delay_ms = config->retry_max_delay_ms;
+    sync_config.max_retries = config->max_retries;
+    sync_config.telemetry_period_ms = config->telemetry_period_ms;
+    sync_config.now_ms = config->now_ms;
+    sync_config.parse_state = tb_app_parse_state_callback;
+    sync_config.apply_state = tb_app_apply_state;
+    sync_config.states_equal = tb_app_states_equal;
+    sync_config.force_inactive = tb_app_fail_off;
+    sync_config.publish_applied_attributes =
+        tb_app_publish_applied_attributes;
+    sync_config.publish_telemetry = tb_app_publish_telemetry;
+    sync_config.user_data = &s_tb;
+    sync_status = tb_state_sync_init(&sync_config);
+    for (size_t i = 0u; sync_status == TB_STATE_SYNC_OK &&
+                        i < sizeof(s_rpc_methods) / sizeof(s_rpc_methods[0]);
+         ++i) {
+        if (tb_state_sync_register_rpc_handler(s_rpc_methods[i].name,
+                                               tb_app_on_server_rpc,
+                                               &s_rpc_methods[i]) != 0) {
+            sync_status = TB_STATE_SYNC_ERR_NO_RESOURCE;
+        }
+    }
+    if (sync_status != TB_STATE_SYNC_OK) {
+        tb_state_sync_deinit();
+        osal_mutex_take(s_tb.lock);
+        s_tb.initialized = false;
+        s_tb.client = NULL;
+        osal_mutex_give(s_tb.lock);
+        return sync_status == TB_STATE_SYNC_ERR_ALREADY_INITIALIZED
+                   ? TB_APPLICATION_ERR_ALREADY_INITIALIZED
+                   : TB_APPLICATION_ERR_NOT_INITIALIZED;
+    }
     return TB_APPLICATION_OK;
 }
 
 void tb_application_deinit(void)
 {
-    /* No-op (with a NULL lock) when init() never succeeded. */
-    if (s_tb.lock == NULL)
-    {
+    if (s_tb.lock == NULL) {
         return;
     }
-
+    tb_state_sync_deinit();
     osal_mutex_take(s_tb.lock);
-    if (s_tb.initialized)
-    {
-        s_tb.initialized = false;
-        s_tb.connected = false;
-        s_tb.state = TB_APP_STATE_INACTIVE;
-        s_tb.attempt_resolved = true;
-    }
+    s_tb.initialized = false;
+    s_tb.connected = false;
+    s_tb.output_suspended = false;
+    s_tb.client = NULL;
     osal_mutex_give(s_tb.lock);
 }
 
@@ -1819,35 +1376,13 @@ void tb_application_on_connected(tb_client_t *client)
     }
 
     osal_mutex_take(s_tb.lock);
-    if (!s_tb.initialized || (client != s_tb.client))
-    {
+    if (!s_tb.initialized || client != s_tb.client) {
         osal_mutex_give(s_tb.lock);
         return;
     }
-
-    /* Fresh session: invalidates every token of the previous session, resets
-     * the retry budget and re-synchronizes from scratch on every connect.
-     * The output stays off until a complete valid state arrives for this
-     * new session (no output is enabled before valid synchronization). */
-    s_tb.session++;
-    s_tb.retries = 0u;
-    s_tb.backoff_delay_ms = 0u;
     s_tb.connected = true;
-    tb_app_start_attempt();
-
-    /* Connect trigger (TASK-114): publish the health telemetry record right
-     * away.  The lamp output is still off (fresh fail-off until a complete
-     * valid state arrives), which is exactly what the record reports.  This
-     * runs with the lock held like every other telemetry publish. */
-    tb_app_publish_telemetry();
     osal_mutex_give(s_tb.lock);
-
-    tb_app_run_transport();
-
-    /* Server-side RPC control (TASK-113): transient service/test control
-     * over the same lamp.  The platform subscription is idempotent, so
-     * reconnecting simply (re-)arms the single server-RPC callback. */
-    tb_app_subscribe_rpc();
+    tb_state_sync_on_connected(client);
 }
 
 void tb_application_on_disconnected(tb_client_t *client)
@@ -1858,79 +1393,20 @@ void tb_application_on_disconnected(tb_client_t *client)
     }
 
     osal_mutex_take(s_tb.lock);
-    if (!s_tb.initialized || (client != s_tb.client))
-    {
+    if (!s_tb.initialized || client != s_tb.client) {
         osal_mutex_give(s_tb.lock);
         return;
     }
-
-    /* Transport loss: invalidate the session (all in-flight callbacks
-     * become stale), park the machine and force the lamp output inactive.
-     * The fail-off ALWAYS happens on disconnect regardless of progress. */
-    s_tb.session++;
-    s_tb.state = TB_APP_STATE_INACTIVE;
-    s_tb.attempt_resolved = true;
     s_tb.connected = false;
-    tb_app_fail_off();
+    osal_mutex_give(s_tb.lock);
+    tb_state_sync_on_disconnected(client);
     osal_log_warning("[tb_app] transport lost; lamp forced off, "
                      "sync session invalidated");
-
-    osal_mutex_give(s_tb.lock);
 }
 
 void tb_application_poll(tb_client_t *client)
 {
-    bool run_attempt = false;
-
-    if (client == NULL)
-    {
-        return;
-    }
-
-    osal_mutex_take(s_tb.lock);
-    if (!s_tb.initialized || (client != s_tb.client) ||
-        (s_tb.state == TB_APP_STATE_INACTIVE) || !tb_app_is_connected())
-    {
-        /* Inactive/disconnected: the disconnect path owns everything; the
-         * next connect restarts synchronization. */
-        osal_mutex_give(s_tb.lock);
-        return;
-    }
-
-    const uint32_t now = tb_app_now_ms();
-
-    if ((s_tb.state == TB_APP_STATE_SYNCING) && !s_tb.attempt_resolved &&
-        (now >= s_tb.attempt_deadline_ms))
-    {
-        /* The bounded sync window expired without a complete valid
-         * response: fail-off + bounded backoff, then retry. */
-        osal_log_warning("[tb_app] sync window expired; staying off");
-        tb_app_fail_attempt();
-    }
-
-    if ((s_tb.state == TB_APP_STATE_BACKOFF) &&
-        (now >= s_tb.backoff_until_ms))
-    {
-        tb_app_start_attempt();
-        run_attempt = true;
-    }
-
-    /* Periodic health telemetry (TASK-114): while connected, publish at most
-     * once per telemetry_period_ms.  Every successful publish (connect and
-     * change triggers included) advances the last-publish timestamp, so a
-     * burst of changes or a fast poll loop can never produce more than one
-     * periodic publish per period.  Disconnected suppression is enforced by
-     * the early return above (state == INACTIVE or transport down). */
-    if ((uint32_t)(now - s_tb.last_telemetry_ms) >= s_tb.telemetry_period_ms)
-    {
-        tb_app_publish_telemetry();
-    }
-    osal_mutex_give(s_tb.lock);
-
-    if (run_attempt)
-    {
-        tb_app_run_transport();
-    }
+    tb_state_sync_poll(client);
 }
 
 /* --------------------------------------------------------------------- */
@@ -1939,15 +1415,7 @@ void tb_application_poll(tb_client_t *client)
 
 bool tb_application_is_synchronized(tb_client_t *client)
 {
-    bool synced;
-
-    osal_mutex_take(s_tb.lock);
-    synced = s_tb.initialized && (s_tb.state == TB_APP_STATE_SYNCED) &&
-             ((client == NULL) || (client == s_tb.client)) &&
-             tb_app_is_connected();
-    osal_mutex_give(s_tb.lock);
-
-    return synced;
+    return tb_state_sync_is_synchronized(client);
 }
 
 tb_application_status_t tb_application_get_desired_state(
@@ -2004,38 +1472,19 @@ bool tb_application_take_firmware_hint(void)
 
 void tb_application_set_output_suspended(bool suspended)
 {
-    if (s_tb.lock == NULL)
-    {
+    if (s_tb.lock == NULL) {
         return;
     }
     osal_mutex_take(s_tb.lock);
-    if (!s_tb.initialized || (s_tb.output_suspended == suspended))
-    {
+    if (!s_tb.initialized || s_tb.output_suspended == suspended) {
         osal_mutex_give(s_tb.lock);
         return;
     }
-
     s_tb.output_suspended = suspended;
     if (suspended)
     {
         osal_log_info("[tb_app] lamp output suspended (OTA indicator)");
     }
-    else if ((s_tb.state == TB_APP_STATE_SYNCED) && s_tb.has_applied &&
-             tb_app_is_connected())
-    {
-        osal_log_info("[tb_app] lamp output resumed; re-applying desired "
-                      "state");
-        const lamp_state_t desired = s_tb.applied;
-        if (tb_app_apply_state(&desired) != LAMP_OK)
-        {
-            tb_app_fail_attempt();
-        }
-    }
-    else
-    {
-        osal_log_info("[tb_app] lamp output resumed without a synchronized "
-                      "state; output stays off");
-        tb_app_fail_off();
-    }
     osal_mutex_give(s_tb.lock);
+    tb_state_sync_set_output_suspended(suspended);
 }

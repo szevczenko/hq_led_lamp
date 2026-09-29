@@ -902,11 +902,6 @@ static bool create_thingsboard_session(void)
         !initialize_thingsboard_client(token, client_id, client_id)) {
         return false;
     }
-    /* tb_client_init() writes mqtt_config; re-apply so the verified snapshot matches. */
-    if (!load_broker_tls_configuration()) {
-        destroy_thingsboard_session();
-        return false;
-    }
     return true;
 }
 

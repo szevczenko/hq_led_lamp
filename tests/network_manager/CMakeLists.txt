@@ -30,6 +30,7 @@ set(HAL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hal
 set(OSAL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/osal/include)
 set(OSAL_IMPL_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/osal/posix)
 set(WIFI_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/wifi)
+set(NET_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hq_net/include)
 set(LAMP_CONTROL_UNITY_DIR ${CMAKE_CURRENT_LIST_DIR}/../lamp_control/unity)
 
 find_package(Threads REQUIRED)
@@ -40,6 +41,7 @@ add_executable(network_manager_tests
     ${CMAKE_CURRENT_LIST_DIR}/osal_test_support.c
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_mock.c
     ${NETWORK_MANAGER_DIR}/network_manager.c
+    ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hq_net/hq_net.c
     ${LAMP_CONTROL_UNITY_DIR}/unity.c
 )
 
@@ -50,6 +52,7 @@ target_include_directories(network_manager_tests PRIVATE
     ${OSAL_INCLUDE_DIR}
     ${OSAL_IMPL_DIR}
     ${WIFI_INCLUDE_DIR}
+    ${NET_INCLUDE_DIR}
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/config
     ${LAMP_CONTROL_UNITY_DIR}
@@ -63,6 +66,7 @@ target_include_directories(network_manager_tests PRIVATE
 # cover the STA-only retry path and explicitly select fresh state for AP+STA.
 target_compile_definitions(network_manager_tests PRIVATE
     CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA=1
+    HQ_NET_TEST_OBSERVABILITY=1
 )
 
 # Match the platform project's strict host-test flags where Unity tolerates
