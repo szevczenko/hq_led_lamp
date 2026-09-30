@@ -22,3 +22,42 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
           pip install kconfiglib --quiet && idf.py build
+
+  host-tests:
+    name: Host unit and integration tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install host test dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libssl-dev
+
+      - name: Build and run product host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          projects=(
+            lamp_control
+            app_config
+            app_state
+            device_identity
+            lamp_fs
+            mqtt_cfg
+            network_manager
+            network_manager/concurrency
+            tb_application
+            wifi_provisioning_manager
+          )
+          for project in "${projects[@]}"; do
+            build_dir="build/host-tests/${project//\//_}"
+            cmake -S "tests/$project" -B "$build_dir"
+            cmake --build "$build_dir" --parallel
+            ctest --test-dir "$build_dir" --output-on-failure
+          done
+
+      - name: Run development PKI tests
+        run: python3 server/scripts/test_pki.py

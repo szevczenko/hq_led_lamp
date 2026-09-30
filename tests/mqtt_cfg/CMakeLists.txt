@@ -28,6 +28,7 @@ cmake_minimum_required(VERSION 3.16)
 project(hq_led_lamp_mqtt_cfg_tests LANGUAGES C)
 
 set(MQTT_CFG_DIR     ${CMAKE_CURRENT_LIST_DIR}/../../components/mqtt_cfg)
+set(DEVICE_IDENTITY_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/device_identity/include)
 set(LAMP_CONTROL_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/lamp_control/include)
 set(DEVICE_IDENTITY_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../components/device_identity/include)
 set(HAL_INCLUDE_DIR  ${CMAKE_CURRENT_LIST_DIR}/../../platform/hq_platform/src/hal/include)
@@ -48,6 +49,7 @@ find_package(Threads REQUIRED)
 # ---------------------------------------------------------------------------
 add_executable(mqtt_cfg_tests
     ${CMAKE_CURRENT_LIST_DIR}/mqtt_cfg_test.c
+    ${CMAKE_CURRENT_LIST_DIR}/device_identity_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/mqtt_app_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/device_identity_mock.c
@@ -71,6 +73,7 @@ add_executable(mqtt_cfg_tests
 
 target_include_directories(mqtt_cfg_tests PRIVATE
     ${MQTT_CFG_DIR}/include
+    ${DEVICE_IDENTITY_INCLUDE_DIR}
     ${LAMP_CONTROL_INCLUDE_DIR}
     ${DEVICE_IDENTITY_INCLUDE_DIR}
     ${HAL_INCLUDE_DIR}
@@ -123,6 +126,7 @@ set(MONGOOSE_POSIX_DIR ${MONGOOSE_DIR}/posix)
 
 add_executable(mqtt_cfg_tls_it_tests
     ${CMAKE_CURRENT_LIST_DIR}/mqtt_cfg_tls_it_test.c
+    ${CMAKE_CURRENT_LIST_DIR}/device_identity_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/lamp_control_mock.c
     ${CMAKE_CURRENT_LIST_DIR}/device_identity_mock.c
     ${MQTT_CFG_DIR}/mqtt_cfg.c
@@ -151,6 +155,7 @@ add_executable(mqtt_cfg_tls_it_tests
 
 target_include_directories(mqtt_cfg_tls_it_tests PRIVATE
     ${MQTT_CFG_DIR}/include
+    ${DEVICE_IDENTITY_INCLUDE_DIR}
     ${LAMP_CONTROL_INCLUDE_DIR}
     ${DEVICE_IDENTITY_INCLUDE_DIR}
     ${HAL_INCLUDE_DIR}
