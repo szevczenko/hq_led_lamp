@@ -276,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     if key_copy.is_file():
         actual = mode_of(key_copy)
         perms.append(f"server_key.pem container={actual:04o}")
-        if actual != 0o644:
+        if actual != 0o640:
             perm_ok = False
     env_file = SERVER_DIR / ".env"
     if env_file.is_file():

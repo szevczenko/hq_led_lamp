@@ -99,7 +99,10 @@ class TestGenerationAndValidation(PkiScratch):
         self.assertEqual(mode_of(self.certs / "server.key"), 0o600)
         self.assertEqual(mode_of(self.certs / "ca.crt"), 0o644)
         self.assertEqual(mode_of(self.certs / "server.crt"), 0o644)
-        self.assertEqual(mode_of(self.certs / "server_key.pem"), 0o644)
+        self.assertEqual(mode_of(self.certs / "server_key.pem"), 0o640)
+        acl = run(["getfacl", "-p", str(self.certs / "server_key.pem")])
+        self.assertEqual(acl.returncode, 0, acl.stderr)
+        self.assertIn("user:799:r--", acl.stdout)
 
     def test_device_trust_anchor_has_no_private_key(self) -> None:
         ca_crt = (self.certs / "ca.crt").read_text(encoding="utf-8")

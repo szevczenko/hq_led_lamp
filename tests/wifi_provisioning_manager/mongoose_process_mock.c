@@ -7,6 +7,7 @@
 #include "mongoose_process_mock.h"
 
 #include <pthread.h>
+#include <string.h>
 
 #include "mongoose_process.h"
 

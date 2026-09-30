@@ -22,9 +22,14 @@ include(${HQ_REPO_ROOT}/cmake/configure.cmake)
 include(${HQ_REPO_ROOT}/cmake/esp.cmake)
 include(${HQ_REPO_ROOT}/cmake/modules.cmake)
 
+set(KLC_WIFI_AP_NAME "$ENV{KLC_WIFI_AP_NAME}" CACHE STRING
+    "Provisioning AP SSID for this device build")
+set(KLC_WIFI_AP_PASSWORD "$ENV{KLC_WIFI_AP_PASSWORD}" CACHE STRING
+    "Provisioning AP password for this device build")
+
 add_compile_definitions(
-    WIFI_AP_NAME="Kitchen_LED"
-    WIFI_AP_PASSWORD="SuperTrudne1!-_"
+    WIFI_AP_NAME="${KLC_WIFI_AP_NAME}"
+    WIFI_AP_PASSWORD="${KLC_WIFI_AP_PASSWORD}"
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

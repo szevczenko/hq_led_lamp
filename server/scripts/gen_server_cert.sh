@@ -9,8 +9,8 @@
 # Produces in server/certs/:
 #   server.crt       leaf certificate signed by ca.crt
 #   server.pem       leaf + CA chain (ThingsBoard MQTT TLS listener :8883)
-#   server_key.pem   server private key copy for the containers (mode 644,
-#                    read-only bind-mounted; see server/README.md notes)
+#   server_key.pem   server private key copy for the containers (mode 600 with
+#                    a read ACL for the ThingsBoard UID)
 #   server.ext       signing profile (audit trail, non-secret)
 #   ca.srl           CA serial counter (created by -CAcreateserial)
 #
@@ -120,18 +120,22 @@ openssl x509 -req -in server.csr \
 cat server.crt ca.crt > server.pem
 cp server.key server_key.pem
 
-# Permissions: private keys 600 on the host; server_key.pem is 644 because
-# the ThingsBoard container (unprivileged uid 799) must read it over the
-# read-only ./certs bind mount. It is a throwaway development key inside the
-# git-ignored directory; see server/README.md for the rationale.
+# Keep the key owner-only and grant only the ThingsBoard container UID read
+# access through a filesystem ACL. This requires the host `acl` package.
 chmod 600 ca.key server.key
-chmod 644 server_key.pem
+chmod 600 server_key.pem
+if ! command -v setfacl >/dev/null 2>&1; then
+    echo "gen_server_cert.sh: setfacl is required to protect server_key.pem" >&2
+    exit 1
+fi
+setfacl -b server_key.pem
+setfacl -m u:799:r-- server_key.pem
 chmod 644 ca.crt server.crt server.pem server.ext
 
 echo "Server certificate issued in $CERT_DIR:"
 echo "  server.crt     SAN DNS:${DNS_NAME}, $server_days days (signed by ca.crt)"
 echo "  server.pem     leaf + CA chain for ThingsBoard :8883"
-echo "  server_key.pem private key copy for the containers (mode 644)"
+echo "  server_key.pem private key copy for the containers (mode 600, UID 799 ACL)"
 echo "  server.ext     signing profile (audit)"
 echo "Next: docker compose restart thingsboard caddy, then"
 echo "      python3 server/scripts/check_pki.py"

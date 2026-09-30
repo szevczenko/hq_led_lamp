@@ -78,6 +78,7 @@ void wifi_hal_mock_min_inject_event(wifi_hal_event_t event,
     if (has_ip)
     {
         ip_info = data->ip_info;
+        s_ctx.ip_info = ip_info;
     }
     mock_unlock();
 
@@ -88,12 +89,6 @@ void wifi_hal_mock_min_inject_event(wifi_hal_event_t event,
 
     cb(event, data, user_data);
 
-    if (has_ip)
-    {
-        mock_lock();
-        s_ctx.ip_info = ip_info;
-        mock_unlock();
-    }
 }
 
 unsigned wifi_hal_mock_min_connect_calls(void)

@@ -51,6 +51,8 @@ jobs:
             network_manager/concurrency
             tb_application
             wifi_provisioning_manager
+            ota_manager
+            factory_reset
           )
           for project in "${projects[@]}"; do
             build_dir="build/host-tests/${project//\//_}"

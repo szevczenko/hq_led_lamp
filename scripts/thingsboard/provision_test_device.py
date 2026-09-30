@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -20,9 +21,15 @@ from thingsboard_client import ThingsBoardError, ThingsBoardRestClient
 DEFAULT_BASE_URL = "http://home-assistance.local:8080"
 DEFAULT_DEVICE_NAME = "klc-test-01"
 DEFAULT_DEVICE_PROFILE = "default"
+DEVICE_NAME_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 
 
 def token_path(device_name: str) -> Path:
+    if re.fullmatch(DEVICE_NAME_RE, device_name) is None:
+        raise ValueError(
+            "device name must be 1-64 ASCII letters, digits, '.', '_' or '-' "
+            "and start with alphanumeric"
+        )
     return Path(__file__).resolve().parent / f".{device_name}.token"
 
 
@@ -34,7 +41,7 @@ def find_or_create_device(client: ThingsBoardRestClient, name: str, profile: str
 
 
 def provision(client: ThingsBoardRestClient, device_name: str, device_profile: str) -> tuple[str, str]:
-    """Returns (device_id, access_token) without ever logging the token."""
+    """Returns (device_id, token-file path) without ever logging the token."""
     device = find_or_create_device(client, device_name, device_profile)
     device_id = device["id"]["id"]
     credentials = client.get_device_credentials(device_id)

@@ -10,7 +10,7 @@ from pathlib import Path
 from thingsboard_client import ThingsBoardError, ThingsBoardRestClient
 
 DEFAULT_BASE_URL = "http://home-assistance.local:8080"
-DEFAULT_API_KEY_FILE = "/home/dima/projects/hq_workspace/thingboard_tenant_api_key"
+DEFAULT_API_KEY_FILE = Path(__file__).resolve().parents[2] / "thingboard_tenant_api_key"
 
 
 def read_api_key(path: Path) -> str:

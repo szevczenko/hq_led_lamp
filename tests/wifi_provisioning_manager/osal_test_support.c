@@ -167,12 +167,12 @@ void osal_log_printf(const char *level, const char *format, ...)
     va_start(args, format);
     int body = vsnprintf(line + n, sizeof(line) - (size_t)n, format, args);
     va_end(args);
-    if (body < 0)
+    if (body < 0 || (size_t)body >= sizeof(line) - (size_t)n)
     {
         return;
     }
 
-    size_t written = (size_t)(n + body);
+    size_t written = (size_t)n + (size_t)body;
     if (written >= (LOG_CAP_BYTES - 1U))
     {
         /* Drop overlong lines entirely rather than truncating them: a

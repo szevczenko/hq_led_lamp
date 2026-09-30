@@ -12,7 +12,7 @@
 # Also produces the PEM server credentials for the ThingsBoard MQTT TLS
 # listener (port 8883):
 #   server/certs/server.pem       server certificate + dev CA chain
-#   server/certs/server_key.pem   server private key (mode 0644, container)
+#   server/certs/server_key.pem   server private key (mode 0600 + UID 799 ACL)
 #
 # The PKI phases are split into dedicated, individually callable scripts
 # (see server/PKI.md):

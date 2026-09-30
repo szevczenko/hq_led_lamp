@@ -113,7 +113,7 @@ CRLs if revocation is ever implemented), never end-entity traffic.
 | Key Usage          | `digitalSignature, keyEncipherment`                      |
 | Basic Constraints  | critical, `CA:FALSE`                                     |
 | Lifetime           | 825 days (~27 months), capped by the CA validity         |
-| File permissions   | `server.key` 0600, `server.crt` 0644, `server_key.pem` 0644 |
+| File permissions   | `server.key` 0600, `server.crt` 0644, `server_key.pem` 0640 + ACL for uid 799 |
 
 The leaf has no CA capability, no code/email signing, and no extra names:
 it can only authenticate the ThingsBoard TLS endpoints.
@@ -127,7 +127,7 @@ it can only authenticate the ThingsBoard TLS endpoints.
 | `server/certs/ca.key`         | 0600  | CA signing key. Stays on this host. **Never** distributed. |
 | `server/certs/ca.crt`         | 0644  | Root certificate. Public. This is the **only** PKI file devices receive (as `/cert/ca.crt`). |
 | `server/certs/server.key`     | 0600  | Server private key. Host-only; handed to containers only via `server_key.pem` bind mount. |
-| `server/certs/server_key.pem` | 0644  | Container copy of the server key (read by ThingsBoard uid 799 over the read-only `./certs` bind mount). |
+| `server/certs/server_key.pem` | 0640 + ACL for uid 799 | Container copy of the server key (read by ThingsBoard uid 799 over the read-only `./certs` bind mount). |
 | `server/certs/server.crt`     | 0644  | Server certificate. Public. |
 | `server/certs/server.pem`     | 0644  | `server.crt` + `ca.crt` chain. Public. |
 | `server/certs/server.csr`     | 0644  | Signing request. Public; kept for audit/renewal. |
@@ -135,10 +135,9 @@ it can only authenticate the ThingsBoard TLS endpoints.
 | `server/.env`                 | 0600  | Secrets (PostgreSQL password). Owner-only. |
 | `server/data/postgres`        | —     | Durable database state, git-ignored. |
 
-Policy: private keys are owner-only on the host (0600). The only exception is
-`server_key.pem` (0644), which must be readable by the unprivileged
-ThingsBoard container over the read-only bind mount — it is a throwaway
-development key inside a git-ignored directory, so this is acceptable here.
+Policy: private keys are owner-only on the host (0600). `server_key.pem` keeps
+that mode and grants only uid 799 read access through a filesystem ACL. Install
+the host `acl` package before generating the development certificates.
 Production keys follow a stricter, hardware-backed policy (see §6).
 
 ---
@@ -227,7 +226,7 @@ validation of the generated material. Each check and its expected outcome:
 | CA profile                   | `PASS` — `CA:TRUE`, `keyCertSign,cRLSign` | Root is a pure trust anchor. |
 | server profile               | `PASS` — `CA:FALSE`, `digitalSignature,keyEncipherment`, `serverAuth` | Leaf is TLS-server-only. |
 | lifetime policy              | `PASS` — nothing expired, server ≤ CA, within 825-day caps | Renewal discipline is enforced. |
-| file permissions             | `PASS` — keys 0600, certs 0644, `server_key.pem` 0644, `.env` 0600 | No world-readable private keys. |
+| file permissions             | `PASS` — keys 0600, certs 0644, `server_key.pem` 0640 + UID 799 ACL, `.env` 0600 | No world-readable private keys. |
 | no private keys on devices/committed | `PASS` — no `PRIVATE KEY` in device artifacts, git tracks no `.key`/`.pem`/`.p12` | Devices/commits never receive private keys. |
 
 Live endpoint validation (requires the compose stack):

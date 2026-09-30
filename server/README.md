@@ -335,7 +335,7 @@ python3 server/scripts/check_endpoints.py --wait 600 # poll until ready
 |--------------------------------------|--------------------------------------------------------------|
 | `check_endpoints.py` fails on HTTPS  | Caddy not healthy yet; run with `--wait 600`, or trust `certs/ca.crt` in the client |
 | MQTT TLS check fails with cert error | Run `./scripts/gen_dev_tls.sh`; verify `--host` matches the SAN (`home-assistance.local`) |
-| ThingsBoard crash-loops: `Unable to find resource: /certs/server_key.pem` | `server_key.pem` lost its container-readable mode (the container cannot read host 600 files over the bind mount). Run `chmod 644 certs/server_key.pem`, or re-run `./scripts/gen_dev_tls.sh --regenerate`, then `docker compose restart thingsboard` |
+| ThingsBoard crash-loops: `Unable to find resource: /certs/server_key.pem` | `server_key.pem` lost its UID 799 ACL. Re-run `./scripts/gen_dev_tls.sh --regenerate`, then `docker compose restart thingsboard` |
 | Name does not resolve                | Router DNS record or `/etc/hosts` missing (section 1.1)      |
 | `docker compose up` stops at postgres password | `.env` missing/incomplete — run `./scripts/gen_dev_tls.sh` |
 | First boot hangs on schema install   | Normal for several minutes; watch `docker compose logs -f thingsboard` |

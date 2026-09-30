@@ -30,7 +30,8 @@ schema validation, identity-token resolution and product fail-off callbacks.
 - `client_cert_path` / `client_key_path` — optional, under `/cert`; both
   required for `auth_mode: "mtls"`.
 - `client_id` — 1..64 printable ASCII.
-- `auth_mode` — `"none"` | `"access_token"` | `"mtls"`.
+- `auth_mode` — `"none"` | `"access_token"` | `"runtime"` | `"mtls"`; `runtime`
+  is used while bootstrap credentials are supplied before enrollment.
 - `skip_verify` — optional; `true` is rejected (`mqtts` always verifies the
   private CA and the DNS hostname).
 
