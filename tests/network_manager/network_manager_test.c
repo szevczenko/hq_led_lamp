@@ -143,6 +143,7 @@ static void test_connect_starts_wifi_and_reports_connected(void)
     TEST_ASSERT_EQUAL_UINT32(T_WIFI_TYPE_CLIENT, counters.last_type);
     TEST_ASSERT_TRUE(counters.type_before_start);
     TEST_ASSERT_TRUE(counters.set_type_calls >= 1U);
+    TEST_ASSERT_EQUAL_UINT(1U, counters.set_ap_credentials_calls);
     TEST_ASSERT_TRUE(counters.init_calls >= 1U);
     TEST_ASSERT_TRUE(counters.start_calls >= 1U);
     TEST_ASSERT_TRUE(counters.subscribe_calls >= 3U);

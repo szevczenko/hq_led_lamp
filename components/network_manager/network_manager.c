@@ -47,6 +47,8 @@ int network_manager_start(const network_callbacks_t *callbacks)
         .backend = HQ_NET_BACKEND_WIFI,
 #if defined(CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA)
         .startup_mode = HQ_NET_STARTUP_MODE_PROVISIONING,
+    .provisioning_ap_name = WIFI_AP_NAME,
+    .provisioning_ap_password = WIFI_AP_PASSWORD,
 #elif defined(CONFIG_KLC_WIFI_DEFAULT_MODE_CLIENT)
         .startup_mode = HQ_NET_STARTUP_MODE_STATION_ONLY,
 #else

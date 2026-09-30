@@ -242,6 +242,19 @@ void wifi_mgmt_set_wifi_type(wifi_type_t type)
   pthread_mutex_unlock(&s_mock_lock);
 }
 
+bool wifi_mgmt_set_ap_credentials(const char *name, const char *password)
+{
+  if (name == NULL || password == NULL || name[0] == '\0')
+  {
+    return false;
+  }
+
+  pthread_mutex_lock(&s_mock_lock);
+  ++s_mock.counters.set_ap_credentials_calls;
+  pthread_mutex_unlock(&s_mock_lock);
+  return true;
+}
+
 void wifi_mgmt_init(void)
 {
   pthread_mutex_lock(&s_mock_lock);

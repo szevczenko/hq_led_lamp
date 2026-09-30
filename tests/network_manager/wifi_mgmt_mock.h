@@ -117,6 +117,7 @@ int wifi_mgmt_mock_emit_with_user_data(wifi_mgmt_event_t event,
 typedef struct wifi_mock_counters
 {
   unsigned set_type_calls;
+  unsigned set_ap_credentials_calls;
   unsigned init_calls;
   unsigned start_calls;
   unsigned stop_calls;

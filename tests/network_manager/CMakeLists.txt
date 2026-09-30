@@ -67,6 +67,8 @@ target_include_directories(network_manager_tests PRIVATE
 target_compile_definitions(network_manager_tests PRIVATE
     CONFIG_KLC_WIFI_DEFAULT_MODE_APSTA=1
     HQ_NET_TEST_OBSERVABILITY=1
+    WIFI_AP_NAME="Kitchen_LED"
+    WIFI_AP_PASSWORD="SuperTrudne1!-_"
 )
 
 # Match the platform project's strict host-test flags where Unity tolerates
