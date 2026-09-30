@@ -1,10 +1,33 @@
-# ESP-IDF build output
-build/
+# ESP-IDF and host-test build output — any build* name at the repo root,
+# plus the host-test scratch build dirs (kept out of the MR)
+/build*/
+/tests/mqtt_cfg/build/
+/tests/tb_application/build/
+/tests/app_state/build/
+/tests/wifi_provisioning_manager/build/
+
+# Generated CMake build artifacts (host-test and review builds)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+managed_components/
+dependencies.lock
 sdkconfig
 sdkconfig.old
+*.map
+*.elf
 
-# Generated partition binary
+# Generated partition/firmware binaries
 *.bin
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
 
 # Editor and OS artifacts
 .DS_Store
@@ -13,11 +36,27 @@ sdkconfig.old
 *~
 .vscode/settings.json
 
-# Certificates and private keys — never commit
+# Certificates, CSRs, and private keys — never commit
 *.key
 *.pem
 *.p12
+*.csr
+*.srl
 /cert/
+
+# ThingsBoard development stack (server/) — generated runtime material
+# (development CA/certs, real environment, and durable database storage)
+/server/.env
+/server/certs/
+/server/data/
+/caredentials/**
 
 # Manufacturing secrets
 /config/manufacturing.json
+/device/device_credentials.sh
+
+# ThingsBoard test-harness device tokens — never commit
+/scripts/thingsboard/*.token
+
+# Logs
+*.log

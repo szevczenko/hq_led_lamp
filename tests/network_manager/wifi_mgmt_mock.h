@@ -1,0 +1,196 @@
+/**
+ * @file wifi_mgmt_mock.h
+ * @brief Test-only Wi-Fi manager double for network-adapter host tests
+ *        (TASK-109)
+ *
+ * Implements the platform Wi-Fi manager contract (wifi_managment.h) as an
+ * in-memory test double so the product-owned network adapter
+ * (components/network_manager) can be exercised on the host without any
+ * platform Wi-Fi driver:
+ *
+ *   - the double tracks the manager lifecycle (init/start/stop/connect/
+ *     disconnect) and the connected/ready state,
+ *   - subscriptions are recorded per event; wifi_mgmt_mock_emit() delivers
+ *     an event synchronously to every matching subscriber (the production
+ *     manager dispatches from its worker task — the synchronous double
+ *     still exercises the same adapter code paths deterministically),
+ *   - failure injection lets tests flip wait-ready / connect / subscribe
+ *     results so every adapter failure and rollback path is reachable,
+ *   - call counters expose how often each manager operation was invoked so
+ *     tests can assert the onboarding order (type selection -> init ->
+ *     subscribe -> start -> connect) and the stop behavior; the counter
+ *     snapshot also records ORDERING observations (type_before_start,
+ *     start_before_connect) so tests can assert, e.g., that the
+ *     Kconfig-selected mode is requested BEFORE wifi_mgmt_start() — an
+ *     ordering contract, not just an occurrence.
+ *
+ * Secrecy: the double contains no SSID/password API at all.  The adapter
+ * under test must not reference credential persistence (wifi_config), and
+ * these tests verify that the adapter never logs anything credential-like.
+ *
+ * This file is a test double only: it is compiled solely into the
+ * network-manager host test binary and is never part of any production
+ * build.
+ */
+
+#ifndef WIFI_MGMT_MOCK_H
+#define WIFI_MGMT_MOCK_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "osal_mutex.h"
+#include "wifi_managment.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* --------------------------------------------------------------------- */
+/* Failure injection                                                      */
+/* --------------------------------------------------------------------- */
+
+typedef struct wifi_mock_config
+{
+  bool fail_wait_ready;    /**< wifi_mgmt_wait_ready() returns false.     */
+  bool fail_connect;       /**< wifi_mgmt_connect() returns false.        */
+  bool fail_subscribe;     /**< wifi_mgmt_subscribe() returns false.      */
+  bool connected_state;    /**< Value reported by wifi_mgmt_is_connected. */
+} wifi_mock_config_t;
+
+/* --------------------------------------------------------------------- */
+/* Test control API                                                       */
+/* --------------------------------------------------------------------- */
+
+/** @brief Reset the double to a fresh, never-initialized state. */
+void wifi_mgmt_mock_reset(void);
+
+/** @brief Apply a failure/state configuration (before start typically). */
+void wifi_mgmt_mock_set_config(const wifi_mock_config_t *config);
+
+/**
+ * @brief Deliver an event synchronously to all matching subscribers.
+ * @return Number of subscribers the event was delivered to.
+ */
+int wifi_mgmt_mock_emit(wifi_mgmt_event_t event);
+
+/** @brief Set the connected state reported by wifi_mgmt_is_connected(). */
+void wifi_mgmt_mock_set_connected(bool connected);
+
+/** @brief Set whether wifi_mgmt_is_read_data() reports a saved credential. */
+void wifi_mgmt_mock_set_saved_credentials(bool saved);
+
+/**
+ * @brief First callback currently subscribed to @p event (NULL if none).
+ *
+ * Lets a test invoke the adapter's handler directly after an unsubscribe,
+ * which is exactly the documented late-callback race (the manager
+ * snapshots subscriptions before dispatching).
+ */
+wifi_mgmt_event_cb_t wifi_mgmt_mock_get_subscribed_cb(wifi_mgmt_event_t event);
+
+/**
+ * @brief user_data the first current subscriber of @p event registered with.
+ *
+ * Lets a test capture the per-start generation token of one adapter session
+ * and re-inject it after a stop/restart cycle (the stale-token race).
+ */
+void *wifi_mgmt_mock_get_subscribed_user_data(wifi_mgmt_event_t event);
+
+/**
+ * @brief Deliver @p event to the first matching subscriber with an EXPLICIT
+ *        user_data instead of the one recorded at subscription time.
+ *
+ * This models the platform dispatching a stale snapshot: the callback
+ * pointer is current, but the user_data (generation token) belongs to an
+ * older session.
+ *
+ * @return 1 if a subscriber received the event, 0 if none is registered.
+ */
+int wifi_mgmt_mock_emit_with_user_data(wifi_mgmt_event_t event,
+                                       void *user_data);
+
+/* --------------------------------------------------------------------- */
+// Call counters / observations
+/* --------------------------------------------------------------------- */
+
+typedef struct wifi_mock_counters
+{
+  unsigned set_type_calls;
+  unsigned set_ap_credentials_calls;
+  unsigned init_calls;
+  unsigned start_calls;
+  unsigned stop_calls;
+  unsigned connect_calls;
+  unsigned disconnect_calls;
+  unsigned subscribe_calls;
+  unsigned unsubscribe_calls;
+  wifi_type_t last_type;
+  bool start_before_connect; /**< start observed before first connect.     */
+  bool type_before_start;    /**< set_wifi_type observed before start.    */
+  unsigned init_before_start_violations;
+} wifi_mock_counters_t;
+
+/** @brief Snapshot of the accumulated call counters. */
+wifi_mock_counters_t wifi_mgmt_mock_get_counters(void);
+
+/**
+ * @brief Arm the transaction-park point: the NEXT wifi_mgmt_wait_ready()
+ *        call blocks until wifi_mgmt_mock_release_wait_ready() runs.
+ *
+ * Used by the start/stop transaction race regression to park a start()
+ * after it subscribed/started the manager but before wait-ready returns.
+ * Must be reset with wifi_mgmt_mock_reset() after use.
+ */
+void wifi_mgmt_mock_block_wait_ready(void);
+
+/**
+ * @brief Block until a wifi_mgmt_wait_ready() call is parked
+ *        (i.e. the armed transaction-park point was reached).
+ */
+void wifi_mgmt_mock_wait_blocked_in_wait_ready(void);
+
+/**
+ * @brief Release a wait_ready() call parked by
+ *        wifi_mgmt_mock_block_wait_ready().
+ */
+void wifi_mgmt_mock_release_wait_ready(void);
+
+/**
+ * @brief Arm the connect-window park point: the NEXT wifi_mgmt_connect()
+ *        call blocks until wifi_mgmt_mock_release_connect() runs.
+ *
+ * Used by the start/stop CONNECT-window race regression (the remaining open
+ * finding) to park a start() AFTER the post-wait_ready re-check and BEFORE
+ * its final return.  Must be reset with wifi_mgmt_mock_reset() after use.
+ */
+void wifi_mgmt_mock_block_connect(void);
+
+/**
+ * @brief Block until a wifi_mgmt_connect() call is parked
+ *        (i.e. the armed connect-window park point was reached).
+ */
+void wifi_mgmt_mock_wait_blocked_in_connect(void);
+
+/**
+ * @brief Release a connect() call parked by wifi_mgmt_mock_block_connect().
+ */
+void wifi_mgmt_mock_release_connect(void);
+
+/**
+ * @brief Test-only handle on the adapter's internal mutex (finding 4
+ *        regression support).
+ *
+ * Returns the mutex handle the adapter published for itself, or NULL while
+ * the adapter mutex has never been created.  The first-use lock-creation
+ * race regression uses this to guarantee the concurrent burst really hits
+ * the unpublished-lock window (no earlier network_manager API call in the
+ * process has created the lock yet).
+ */
+osal_mutex_id_t network_manager_test_get_lock(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* WIFI_MGMT_MOCK_H */

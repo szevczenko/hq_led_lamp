@@ -1,7 +1,39 @@
-# Name,   Type, SubType, Offset,  Size,    Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-otadata,  data, ota,     0x10000, 0x2000,
-ota_0,    app,  ota_0,   0x20000, 0x1C0000,
-ota_1,    app,  ota_1,   0x1E0000,0x1C0000,
-littlefs, data, spiffs,  0x3A0000,0x40000,
+# Kitchen LED Controller — custom OTA-capable partition table (TASK-107)
+#
+# Target module: ESP32-WROOM-32D, 4 MiB flash (CONFIG_ESPTOOLPY_FLASHSIZE_4MB).
+# Layout (all sizes in bytes, hex):
+#   0x0000-0x8000    bootloader (fixed by the 2nd-stage bootloader)
+#   0x8000-0x9000    partition table
+#   0x9000-0xf000    NVS (24 KiB — Wi-Fi credentials, calibration data)
+#   0xf000-0x10000   PHY init data
+#   0x10000-0x12000  OTA data (otadata; selects the active OTA slot)
+#   0x12000-0x20000  Coredump (56 KiB — flash backtrace storage; also pads the
+#                    region up to the 64 KiB app-slot alignment boundary)
+#   0x20000-0x1e0000 OTA app slot 0 (1792 KiB)
+#   0x1e0000-0x3a0000 OTA app slot 1 (1792 KiB)
+#   0x3a0000-0x400000 LittleFS "storage" partition (384 KiB)
+#
+# Sizing rationale: the measured application image is far below 1 MiB, so
+# 1792 KiB per OTA slot leaves a very large safety margin for future
+# firmware growth (ThingsBoard stack, TLS, Wi-Fi provisioning).  ESP-IDF
+# requires app partitions to be 64 KiB aligned, and otadata ends at 0x12000,
+# so the coredump partition fills 0x12000-0x20000 to keep the table gap-free
+# while keeping both OTA slots 64 KiB aligned.  The LittleFS partition gets
+# the whole remaining tail of the 4 MiB flash (384 KiB), which holds
+# certificates, configuration, OTA state and diagnostics (see the plan,
+# section 7.1) and exceeds the 256 KiB minimum.  The table fills the 4 MiB
+# flash exactly with no gaps: 0x0-0x9000 is the bootloader + partition-table
+# region reserved by the 2nd-stage bootloader, and every partition starts
+# where the previous one ends.  Offsets are re-validated at configure time
+# by cmake/klc_validate.cmake.
+#
+# The filesystem subtype is "littlefs" (0x83) and the label is "storage",
+# matching the OSAL LittleFS backend default partition label.
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+otadata,    data, ota,      0x10000,  0x2000,
+coredump,   data, coredump, 0x12000,  0xE000,
+ota_0,      app,  ota_0,    0x20000,  0x1C0000,
+ota_1,      app,  ota_1,    0x1E0000, 0x1C0000,
+storage,    data, littlefs, 0x3A0000, 0x60000,

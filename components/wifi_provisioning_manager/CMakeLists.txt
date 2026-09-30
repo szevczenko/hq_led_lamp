@@ -1,0 +1,27 @@
+# wifi_provisioning_manager — product-owned Wi-Fi provisioning adapter
+# (TASK-126)
+#
+# ESP-IDF compatibility facade over the generic platform provisioning API.
+# It preserves the product status/state/event enums while the platform owns
+# controller callbacks, event polling, and portal lifecycle controls.
+#
+# Dependency policy — every platform dependency is PRIVATE:
+#   - `wifi_provisioning` provides the platform provisioning application
+#     (start/stop/get_state and the test-only URL overrides); its platform
+#     state types and listen-URL machinery must not reach product-domain
+#     dependents, so it is private.
+#   - `wifi` (the platform Wi-Fi manager) supplies the saved-credentials
+#     query (wifi_mgmt_is_read_data); its credential/schema internals must
+#     not leak, so it is private.
+#   - `mongoose` supplies the shared Mongoose process query
+#     (MongooseProcess_IsRunning); the Mongoose types must not leak, so it
+#     is private.
+#   - `osal` supplies the adapter lock and logging; implementation-only.
+# Product-domain modules depend only on include/wifi_provisioning_manager.h,
+# which contains no Wi-Fi, Mongoose or provisioning platform type.
+
+idf_component_register(
+    SRCS "wifi_provisioning_manager.c"
+    INCLUDE_DIRS "include"
+    PRIV_REQUIRES wifi mongoose osal wifi_provisioning
+)

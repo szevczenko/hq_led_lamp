@@ -1,8 +1,1416 @@
+/**
+ * @file app_main.c
+ * @brief Kitchen LED Controller application entry point.
+ *
+ *  ## Boot-order contract (TASK-107 / TASK-118 / TASK-109 / TASK-115 /
+ *                        TASK-127 / TASK-136)
+ *
+ *   1. lamp_control_init() — the output is initialized off and stays off
+ *      until a valid desired state arrives.
+ *   2. The application state machine (app_state, TASK-115) is started
+ *      next: it is the explicit owner of the sequence
+ *      boot -> safe-off -> filesystem -> configuration -> Wi-Fi ->
+ *      provisioning (entered from NETWORK on the controller's fallback
+ *      decision — fresh device or exhausted-credential device) ->
+ *      verified MQTT/TLS -> state sync -> online, of every legal
+ *      transition (with an explicit transition owner per event), of the
+ *      stale-callback (generation/session) rejection, of the bounded
+ *      retry/backoff schedule and of the application watchdog.
+ *   3. lamp_fs_init() — mounts the LittleFS "storage" partition at
+ *      /littlefs through the OSAL and creates /cert, /config, /state
+ *      idempotently.  The mount never formats (TASK-118 removed the
+ *      backend's format_if_mount_failed), and lamp_fs never calls
+ *      osal_mkfs()/osal_rmfs() on the boot path: formatting is reserved
+ *      for explicit manufacturing/provisioning operations.
+ *   4. On any filesystem failure the state machine moves to SAFE_OFF
+ *      (degraded) and the fail-off invariant forces the output inactive;
+ *      storage is preserved untouched and configuration is not loaded.
+ *      A failed directory bootstrap unmounts the volume before returning.
+ *   5. Only a fully successful bootstrap reaches configuration loading.
+ *      Configuration loading itself is ordered: product documents
+ *      (device.json / manufacturing.json, TASK-108) and the broker/TLS
+ *      document (mqtt.json, TASK-110) first, then the device identity
+ *      (TASK-111).  A rejected configuration parks the machine degraded
+ *      (SAFE_OFF) with no automatic retry — recovery is an explicit
+ *      provisioning/reset/OTA action.
+ *   6. Device identity (TASK-111) is loaded after configuration validation
+ *      and before any ThingsBoard initialization.  device_identity_load()
+ *      only trusts validated manufacturing/configuration records, rejects
+ *      missing, empty, oversized or malformed identity input, never logs
+ *      the token, and is FATAL safe-off: a missing or invalid identity
+ *      forces the output inactive and blocks the ThingsBoard session.
+ *   7. Wi-Fi onboarding (TASK-109) runs at the machine's NETWORK gate,
+ *      through the product-owned network adapter.  TASK-136: the manager
+ *      (and the provisioning infrastructure of 7b) is brought up on the
+ *      gate's FIRST entry — after the FILESYSTEM gate mounted the LittleFS
+ *      storage and the CONFIGURATION gate passed — so the manager's
+ *      init-time load of saved station credentials (wifi_ap.json) reads
+ *      from the mounted volume, wifi_mgmt_is_read_data() reflects reality,
+ *      and the controller's fresh-device decision (7b) sees the truth.
+ *      The gate itself is the consumed network_manager_is_connected()
+ *      polling loop below (the successor of
+ *      network_manager_wait_connected()): ThingsBoard must never connect
+ *      before this gate passes.  A Wi-Fi loss forces the adapter to fail
+ *      the lamp off synchronously; the supervisor converts the disconnect
+ *      into the machine's DISCONNECTED event within one supervisor
+ *      cadence.
+ *   7b. Wi-Fi provisioning (TASK-127) sits between the Wi-Fi gate and TLS.
+ *      The platform fallback controller (TASK-131/132,
+ *      CONFIG_WIFI_HTTP_PROVISIONING_AUTO_FALLBACK=y with a bounded
+ *      CONFIG_WIFI_HTTP_PROVISIONING_FALLBACK_ATTEMPTS budget) owns the
+ *      portal policy: it opens the provisioning portal (HTTP + captive DNS
+ *      on the shared Mongoose process) on its own decision — a fresh device
+ *      (no saved station credential) at init, or a credentialed device
+ *      whose saved credentials exhausted the CONNECT_FAILED budget — keeps
+ *      the temporary AP up for the bounded success-grace interval
+ *      (CONFIG_WIFI_HTTP_PROVISIONING_SUCCESS_GRACE_MS, the single grace
+ *      source of truth since TASK-131; the duplicate KLC knob was dropped)
+ *      and retires it on success.  The supervisor (TASK-133) is a pure
+ *      consumer of the adapter's outcome events
+ *      (wifi_provisioning_manager_poll_event()): PROVISIONING is entered
+ *      from NETWORK on the controller's fallback decision — fresh device or
+ *      exhausted-credential device — when the supervisor delivers
+ *      PROVISIONING_STARTED (owner APP_OWNER_NETWORK), and
+ *      PROVISIONING_SUCCEEDED hands control back to the NETWORK gate (which
+ *      passes the now credentialed station to TLS) or PROVISIONING_FAILED
+ *      parks the machine degraded (SAFE_OFF with the existing bounded
+ *      retry).  The supervisor never starts or restarts the portal.  A
+ *      credentialed device that connects on the first try never enters
+ *      provisioning — it passes the NETWORK gate straight to TLS.
+ *      ThingsBoard STILL never starts before a verified network
+ *      connection: provisioning only ever hands control back to the
+ *      NETWORK gate, never past it.
+ *   8. The single re-enable transition for the lamp fail-off barrier is a
+ *      successful verified MQTT/TLS connection (mqtt_cfg_connect(),
+ *      TASK-110), consumed at the TLS gate.  A Wi-Fi connection alone, an
+ *      invalid or missing identity, or any rejected broker/TLS
+ *      configuration can never enable the output.
+ *
+ *  ## Supervisor loop and watchdog ownership (TASK-115)
+ *
+ *    app_main() never returns to an idle state: it runs a supervisor loop
+ *    that is the SINGLE watchdog-feeding task.  All machine events that
+ *    this task produces (filesystem result, configuration result, network
+ *    gate result, provisioning result, TLS gate result) are delivered from
+ *    this task; the Wi-Fi adapter's callbacks remain informational (the
+ *    adapter's own synchronous fail-off covers the safety latency, and the
+ *    supervisor picks the disconnect up within one cadence).  Blocking
+ *    constraints honored here:
+ *      - every blocking call in the loop is bounded BELOW the configured
+ *        application watchdog window (60 s): the network gate polls every
+ *        NETWORK_WAIT_POLL_INTERVAL_MS (50 ms) and calls app_state_poll()
+ *        in each iteration (same task — the single owner),
+ *      - the provisioning outcome pump
+ *        (wifi_provisioning_manager_poll_event()) is non-blocking and runs
+ *        in the same supervisor task, one iteration per poll — the portal is
+ *        owned by the platform fallback controller, and the adapter's
+ *        notification path only STORES events (never blocks on the Mongoose
+ *        /Wi-Fi callback contexts); the supervisor DELIVERS them
+ *        (TASK-133),
+ *      - the verified-TLS connect is bounded by mqtt_cfg_connect()'s own
+ *        30 s window, which is below the 60 s watchdog,
+ *      - app_state_poll() is never called from a worker callback context.
+ *    Recovery: the watchdog expiry ends in the machine's FATAL state and
+ *    leaves the app task; an explicit external reset or OTA re-arms the
+ *    sequence at boot.
+ *
+ *  The idempotent mkdir (EEXIST -> OSAL_ERR_NAME_TAKEN -> LAMP_FS_OK) is
+ *  expected after a reflash onto persistent storage and is not a defect.
+ */
+
+#include <stdbool.h>
+#include <stdatomic.h>
+
+#include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+
+#include "app_config.h"
+#include "app_state.h"
+#include "device_identity.h"
+#include "factory_reset.h"
+#include "hal_types.h"
+#include "lamp_control.h"
+#include "lamp_fs.h"
+#include "mongoose_process.h"
+#include "mqtt_cfg.h"
+#include "network_manager.h"
+#include "osal_dir.h"
+#include "osal_file.h"
+#include "osal_task.h"
+#include "ota_manager.h"
+#include "sdkconfig.h"
+#include "tb_application.h"
+#include "tb_client.h"
+#include "tb_provisioning.h"
+#include "wifi_provisioning_manager.h"
 
 static const char *TAG = "klc";
 
+static tb_client_t *s_tb_client;
+static atomic_bool s_tb_connected_pending;
+static bool s_tb_needs_provisioning;
+static tb_provisioning_config_t s_provisioning_config;
+static unsigned s_auth_reject_count;
+static bool s_reprovision_backoff_active;
+static uint32_t s_reprovision_retry_at_ms;
+
+static void thingsboard_on_connected(tb_client_t *client, void *user_data)
+{
+    (void)client;
+    (void)user_data;
+    /* Synchronization performs synchronous SUBSCRIBE calls.  Defer it to
+     * the supervisor task so the Mongoose event thread can process SUBACK. */
+    atomic_store_explicit(&s_tb_connected_pending, true,
+                          memory_order_release);
+}
+
+static void thingsboard_on_disconnected(tb_client_t *client,
+                                        tb_client_disconnect_reason_t reason,
+                                        void *user_data)
+{
+    (void)reason;
+    (void)user_data;
+    atomic_store_explicit(&s_tb_connected_pending, false,
+                          memory_order_release);
+    ota_manager_on_disconnected();
+    tb_application_on_disconnected(client);
+}
+
+static void thingsboard_on_connect_failure(
+    tb_client_t *client, tb_client_connect_failure_reason_t reason,
+    void *user_data)
+{
+    (void)reason;
+    (void)user_data;
+    atomic_store_explicit(&s_tb_connected_pending, false,
+                          memory_order_release);
+    tb_application_on_disconnected(client);
+}
+
+static void service_thingsboard_connection(void)
+{
+    if (!atomic_exchange_explicit(&s_tb_connected_pending, false,
+                                  memory_order_acq_rel))
+    {
+        return;
+    }
+
+    if (s_tb_client != NULL && tb_client_is_connected(s_tb_client))
+    {
+        tb_application_on_connected(s_tb_client);
+        if (!s_tb_needs_provisioning)
+        {
+            ota_manager_on_connected(s_tb_client);
+        }
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* ThingsBoard OTA glue                                                   */
+/* --------------------------------------------------------------------- */
+
+static void ota_on_event(ota_manager_event_t event, void *ctx)
+{
+    (void)ctx;
+    switch (event)
+    {
+    case OTA_MANAGER_EVENT_STARTED:
+        tb_application_set_output_suspended(true);
+        (void)app_state_deliver(APP_EVENT_OTA_BEGIN, APP_OWNER_OTA);
+        break;
+    case OTA_MANAGER_EVENT_FAILED:
+        (void)app_state_deliver(APP_EVENT_OTA_FAILED, APP_OWNER_OTA);
+        tb_application_set_output_suspended(false);
+        break;
+    case OTA_MANAGER_EVENT_RESTARTING:
+        (void)app_state_deliver(APP_EVENT_OTA_END, APP_OWNER_OTA);
+        break;
+    default:
+        break;
+    }
+}
+
+static void ota_on_indicator(bool on, void *ctx)
+{
+    const lamp_state_t indicator = {
+        .power = on,
+        .brightness_percent = CONFIG_KLC_OTA_BLINK_BRIGHTNESS_PERCENT,
+        .red = 255u, .green = 255u, .blue = 255u,
+    };
+
+    (void)ctx;
+    /* app_state latched fail-off on OTA entry; the indicator owns the
+     * output until the OTA ends. */
+    (void)lamp_control_release_fail_off();
+    (void)lamp_control_apply_state(&indicator, NULL);
+}
+
+static void ota_restart(void)
+{
+    esp_restart();
+}
+
+static void init_ota_manager(const esp_app_desc_t *app)
+{
+    const ota_manager_config_t cfg = {
+        .title = app->project_name,
+        .version = app->version,
+        .chunk_size = CONFIG_KLC_OTA_CHUNK_SIZE,
+        .chunk_timeout_ms = CONFIG_KLC_OTA_CHUNK_TIMEOUT_MS,
+        .chunk_retries = CONFIG_KLC_OTA_CHUNK_RETRIES,
+        .check_period_ms = CONFIG_KLC_OTA_CHECK_PERIOD_MS,
+        .reboot_delay_ms = CONFIG_KLC_OTA_REBOOT_DELAY_MS,
+        .blink_period_ms = CONFIG_KLC_OTA_BLINK_PERIOD_MS,
+        .on_event = ota_on_event,
+        .on_indicator = ota_on_indicator,
+        .restart = ota_restart,
+    };
+
+    if (ota_manager_init(&cfg) != OTA_MANAGER_OK)
+    {
+        ESP_LOGE(TAG, "OTA manager init failed; firmware updates disabled");
+    }
+}
+
+/** @brief Supervisor cadence: the watchdog feed interval. */
+#define APP_SUPERVISE_PERIOD_MS 50u
+
+/**
+ * @brief Application watchdog window (ms).
+ *
+ * Larger than the longest single blocking call in the supervisor loop:
+ * mqtt_cfg_connect() is bounded by NETWORK_CONNECT_TIMEOUT_MS (30 s) and
+ * the network gate waits in <=50 ms poll iterations while feeding, so a
+ * 60 s window keeps a healthy boot from ever tripping the watchdog while
+ * still detecting a real stall (see the blocking constraints in
+ * app_state.h).
+ */
+#define APP_SUPERVISE_WATCHDOG_MS 60000u
+
+/* --------------------------------------------------------------------- */
+/* Lazy Wi-Fi/provisioning bring-up (TASK-136)                             */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief One-shot guard for the NETWORK gate's first-run bring-up.
+ *
+ * The Wi-Fi manager and the provisioning adapter are initialized on the
+ * FIRST entry of the machine's NETWORK gate — never before it (see the
+ * boot-order contract above).  By then the FILESYSTEM gate has mounted the
+ * LittleFS storage, so the manager's init-time load of saved station
+ * credentials (wifi_mgmt_init -> _load_saved_config -> wifi_ap.json) reads
+ * from the mounted volume: a device with a saved credential passes the gate
+ * straight to TLS and a portal submission (SUCCEEDED -> NETWORK) passes the
+ * now-credentialed station to TLS without a reboot.
+ */
+static bool s_network_bringup_done;
+
+static int thingsboard_rssi(int *dbm)
+{
+    return network_manager_get_rssi(dbm);
+}
+
+#if CONFIG_KLC_FACTORY_RESET_ENABLE
+#define FACTORY_RESET_BLINK_COUNT 3u
+#define FACTORY_RESET_BLINK_MS    150u
+#define FACTORY_RESET_STATE_FILES_MAX 16u
+
+static void factory_reset_blink(void)
+{
+    const lamp_state_t on = {
+        .power = true, .brightness_percent = 100u,
+        .red = 255u, .green = 255u, .blue = 255u,
+    };
+    const lamp_state_t off = { .power = false };
+
+    (void)lamp_control_release_fail_off();
+    for (unsigned i = 0u; i < FACTORY_RESET_BLINK_COUNT; ++i) {
+        (void)lamp_control_apply_state(&on, NULL);
+        (void)osal_task_delay_ms(FACTORY_RESET_BLINK_MS);
+        (void)lamp_control_apply_state(&off, NULL);
+        (void)osal_task_delay_ms(FACTORY_RESET_BLINK_MS);
+    }
+}
+
+static bool factory_reset_clear_state_dir(void)
+{
+    for (unsigned i = 0u; i < FACTORY_RESET_STATE_FILES_MAX; ++i) {
+        osal_dirent_t entry;
+        char path[sizeof(LAMP_FS_DIR_STATE) + OSAL_MAX_PATH_LEN + 1u];
+        bool found = false;
+        const osal_dir_id_t dir = osal_dir_open(LAMP_FS_DIR_STATE);
+
+        if (dir < 0) {
+            return false;
+        }
+        while (osal_dir_read(dir, &entry) == OSAL_SUCCESS) {
+            if (entry.type == OSAL_DIRENT_TYPE_FILE) {
+                found = true;
+                break;
+            }
+        }
+        (void)osal_dir_close(dir);
+        if (!found) {
+            return true;
+        }
+        if (snprintf(path, sizeof(path), "%s/%s", LAMP_FS_DIR_STATE,
+                     entry.name) >= (int)sizeof(path) ||
+            osal_remove(path) != OSAL_SUCCESS) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool factory_reset_erase(void *context)
+{
+    (void)context;
+    factory_reset_blink();
+    (void)lamp_control_force_inactive();
+    if (!network_manager_erase_credentials()) {
+        ESP_LOGE(TAG, "Factory reset: Wi-Fi credential erase failed");
+        return false;
+    }
+    if (!factory_reset_clear_state_dir()) {
+        ESP_LOGE(TAG, "Factory reset: runtime state cleanup failed");
+        return false;
+    }
+    return true;
+}
+
+static void factory_reset_indicator(bool active, void *context)
+{
+    (void)context;
+    ESP_LOGI(TAG, "Factory reset button %s", active ? "held" : "released");
+}
+
+static void factory_reset_restart(void *context)
+{
+    (void)context;
+    ESP_LOGW(TAG, "Factory reset completed; restarting");
+    esp_restart();
+}
+
+static void init_factory_reset(void)
+{
+    const factory_reset_config_t config = {
+        .pin = (hal_pin_t)CONFIG_KLC_FACTORY_RESET_GPIO,
+        .active_low = CONFIG_KLC_FACTORY_RESET_ACTIVE_LOW,
+        .hold_ms = CONFIG_KLC_FACTORY_RESET_HOLD_MS,
+        .erase = factory_reset_erase,
+        .indicator = factory_reset_indicator,
+        .restart = factory_reset_restart,
+    };
+    if (factory_reset_init(&config) != FACTORY_RESET_OK) {
+        ESP_LOGE(TAG, "Factory reset initialization failed");
+    }
+}
+#endif
+
+static void poll_factory_reset(void)
+{
+#if CONFIG_KLC_FACTORY_RESET_ENABLE
+    /* An update in progress must not be interrupted by a factory reset. */
+    if (app_state_current() != APP_STATE_OTA) {
+        factory_reset_poll(osal_task_get_time_ms());
+    }
+#endif
+}
+
+/* --------------------------------------------------------------------- */
+/* Network adapter wiring (TASK-109)                                       */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Network connection established (Wi-Fi manager worker context).
+ *
+ * Informational: the adapter's connection state is consumed by the
+ * supervisor's NETWORK gate (the machine's single network gate — see the
+ * file header).  Nothing here touches Wi-Fi credentials — the adapter and
+ * the manager keep them private.  Fail-off re-enable is owned by
+ * mqtt_cfg_connect() (TASK-110), never by this callback.
+ */
+static void on_network_connected(void *context)
+{
+    (void)context;
+    ESP_LOGI(TAG, "Network connected; verified MQTT/TLS connect is now "
+                  "allowed (fail-off release is owned by mqtt_cfg_connect)");
+}
+
+/**
+ * @brief Network lost or connect attempts exhausted (Wi-Fi worker context).
+ *
+ * The adapter has already forced the lamp output inactive synchronously on
+ * this path (fail-off within application latency); the supervisor picks the
+ * disconnect up through the machine's DISCONNECTED event within one
+ * supervisor cadence (the machine transition itself also fails the output
+ * off — idempotent).
+ */
+static void on_network_disconnected(void *context)
+{
+    (void)context;
+    ESP_LOGW(TAG, "Network lost; lamp forced off by adapter, "
+                  "ThingsBoard stays disconnected until reconnect");
+}
+
+/**
+ * @brief Bring up the Wi-Fi manager (station mode) behind the TASK-109
+ *        gate.  Returns true when the network is started.
+ */
+static bool start_network(void)
+{
+    static const network_callbacks_t callbacks = {
+        .on_connected    = on_network_connected,
+        .on_disconnected = on_network_disconnected,
+        .context         = NULL,
+    };
+
+    const int status = network_manager_start(&callbacks);
+    if (status != NETWORK_OK)
+    {
+        ESP_LOGE(TAG, "network_manager_start failed: %d (offline, output off)",
+                 (int)status);
+        return false;
+    }
+
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
+/* Provisioning outcome events (TASK-132/133)                              */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Stop the provisioning flow through the adapter (idempotent).
+ *
+ * Ends the controller's portal lifecycle (any pending success-grace timer is
+ * cancelled and the temporary AP retirement is requested —
+ * wifi_provisioning_controller_stop() inside the adapter) and closes any
+ * remaining portal listeners.  The shared Mongoose process (and with it
+ * MQTT/TLS) is never torn down.  Safe to call at any time — the adapter
+ * stop() is idempotent and a no-op when the portal is already stopped.  Used
+ * to guarantee the portal never strands a listener or a pending grace timer
+ * on OTA entry or FATAL.
+ */
+static void stop_provisioning(void)
+{
+    (void)wifi_provisioning_manager_stop();
+}
+
+/**
+ * @brief Deliver pending provisioning outcome events (TASK-133).
+ *
+ * The platform fallback controller owns the portal policy (TASK-131/132);
+ * the adapter's notification path only STORES the controller's state-change
+ * notifications (never blocks on a Mongoose/Wi-Fi callback context), and
+ * this supervisor task DELIVERS them into the state machine with the current
+ * session identity:
+ *
+ *   - STARTED   -> APP_EVENT_PROVISIONING_STARTED   (owner NETWORK),
+ *   - SUCCEEDED -> APP_EVENT_PROVISIONING_SUCCEEDED (owner NETWORK),
+ *   - FAILED    -> APP_EVENT_PROVISIONING_FAILED    (owner NETWORK).
+ *
+ * The machine may enter PROVISIONING ONLY from NETWORK, and the
+ * SUCCEEDED/FAILED outcomes are only meaningful from PROVISIONING.
+ * wifi_provisioning_manager_poll_event() CONSUMES the head of the adapter's
+ * FIFO, so this pump polls ONLY while the machine is at the NETWORK or
+ * PROVISIONING gate and holds the event otherwise: a fresh device's
+ * controller fires STARTED at init while the machine is still in
+ * FILESYSTEM/CONFIGURATION, and polling from there would drain and drop it
+ * before the machine ever reaches the NETWORK gate (permanently wedging the
+ * device outside the portal flow).  Holding the head (by not polling)
+ * preserves the adapter's FIFO order with any following SUCCEEDED/FAILED.
+ * SUCCEEDED/FAILED only ever sit behind a consumed STARTED (the controller
+ * opens the portal before it can report an outcome), so gating on these two
+ * states cannot strand them, and a delivery from any other state is
+ * rejected (dropped and counted) by the machine itself as stale/illegal —
+ * the machine owns that decision.
+ *
+ * Non-blocking: no wait loop and no blocking call, so the single watchdog
+ * owner is preserved and the loop never blocks from a callback context.
+ */
+static void deliver_provisioning_events(void)
+{
+    for (;;)
+    {
+        const app_state_t state = app_state_current();
+
+        /* Deliver STARTED only at the NETWORK gate and the outcomes only at
+         * the PROVISIONING gate: poll_event() CONSUMES the event, so the
+         * machine-state check must happen FIRST — a poll from any other
+         * state (BOOT/FILESYSTEM/CONFIGURATION/SAFE_OFF/...) would drop the
+         * head STARTED permanently. */
+        if ((state != APP_STATE_NETWORK) && (state != APP_STATE_PROVISIONING))
+        {
+            return;
+        }
+
+        wifi_provisioning_manager_event_t event =
+            wifi_provisioning_manager_poll_event();
+
+        switch (event)
+        {
+        case WIFI_PROVISIONING_MANAGER_EVENT_STARTED:
+            if (state != APP_STATE_NETWORK)
+            {
+                /* A STARTED at the PROVISIONING gate is a stale duplicate
+                 * (the machine is already provisionable): drop it — the
+                 * machine rejects PROVISIONING_STARTED from any non-NETWORK
+                 * state as illegal, so consuming here is safe. */
+                continue;
+            }
+            ESP_LOGI(TAG, "Provisioning flow started by the controller; "
+                          "entering Wi-Fi provisioning");
+            (void)app_state_deliver(APP_EVENT_PROVISIONING_STARTED,
+                                    APP_OWNER_NETWORK);
+            continue;
+
+        case WIFI_PROVISIONING_MANAGER_EVENT_SUCCEEDED:
+            ESP_LOGI(TAG, "Provisioning succeeded; portal retired by the "
+                          "controller; NETWORK gate resumes");
+            (void)app_state_deliver(APP_EVENT_PROVISIONING_SUCCEEDED,
+                                    APP_OWNER_NETWORK);
+            continue;
+
+        case WIFI_PROVISIONING_MANAGER_EVENT_FAILED:
+            ESP_LOGW(TAG, "Provisioning failed; machine parks degraded "
+                          "(bounded retry)");
+            (void)app_state_deliver(APP_EVENT_PROVISIONING_FAILED,
+                                    APP_OWNER_NETWORK);
+            continue;
+
+        case WIFI_PROVISIONING_MANAGER_EVENT_NONE:
+        default:
+            return;
+        }
+    }
+}
+
+/**
+ * @brief The machine's NETWORK gate: a bounded wait for Wi-Fi with in-loop
+ *        watchdog feeding (blocking constraint: one task owns the feed and
+ *        polls inside every bounded wait).
+ *
+ * This is the consumed successor of network_manager_wait_connected(): it
+ * polls network_manager_is_connected() at NETWORK_WAIT_POLL_INTERVAL_MS
+ * and calls app_state_poll() in each iteration, so the watchdog is fed by
+ * the same (only) owner task while the gate is pending.
+ *
+ * TASK-139: the gate ALSO services the provisioning outcome events in-loop.
+ * The platform fallback controller can open the portal (and fire STARTED)
+ * while the machine is still inside this NETWORK gate — exactly the
+ * exhausted-credential case: the last CONNECT_FAILED of the bounded budget
+ * makes the controller start the portal a few seconds into the gate wait.
+ * Polling the adapter's events here lets the supervisor consume STARTED at
+ * once (NETWORK -> PROVISIONING) instead of letting the gate time out and
+ * park SAFE_OFF with an open portal behind it.  When that happens the loop
+ * breaks out of the wait and the gate is superseded by provisioning, not
+ * timed out — no timeout is logged, and the return value reports the
+ * radio truth (the caller re-checks the state before delivering either
+ * NETWORK event).
+ *
+ * @return true when connected; false when the wait timed out without a
+ *         connection.  On the supersession path (the machine left the
+ *         NETWORK state to provisioning mid-wait) the value reports the
+ *         radio truth — the caller re-checks the state before delivering
+ *         either NETWORK event.
+ */
+static bool supervise_network_gate(void)
+{
+    uint32_t waited_ms = 0U;
+
+    while (!network_manager_is_connected() &&
+           (waited_ms < NETWORK_CONNECT_TIMEOUT_MS))
+    {
+        app_state_poll(); /* feed — this task is the single watchdog owner */
+        poll_factory_reset();
+        /* TASK-139: consume a controller-opened-portal STARTED promptly so
+         * the gate yields to PROVISIONING instead of waiting out the window
+         * with the portal already up (see the doc comment above). */
+        deliver_provisioning_events();
+        if (app_state_current() != APP_STATE_NETWORK)
+        {
+            /* The controller's STARTED moved the machine to PROVISIONING:
+             * the gate was superseded by the provisioning stage, not timed
+             * out — neither NETWORK_CONNECTED nor NETWORK_FAILED applies.
+             * Report the radio truth: the caller re-checks the machine
+             * state before delivering either NETWORK event, so a connection
+             * that landed during the supersession window is not lost. */
+            return network_manager_is_connected();
+        }
+        (void)osal_task_delay_ms(NETWORK_WAIT_POLL_INTERVAL_MS);
+        waited_ms += NETWORK_WAIT_POLL_INTERVAL_MS;
+    }
+
+    if (!network_manager_is_connected() &&
+        (waited_ms >= NETWORK_CONNECT_TIMEOUT_MS))
+    {
+        ESP_LOGW(TAG, "No Wi-Fi connection within %u ms; "
+                      "verified TLS connect stays blocked",
+                 (unsigned)NETWORK_CONNECT_TIMEOUT_MS);
+    }
+    return network_manager_is_connected();
+}
+
+/* --------------------------------------------------------------------- */
+/* Lamp output                                                            */
+/* --------------------------------------------------------------------- */
+
+static bool init_lamp_output(void)
+{
+    /* CONFIG_KLC_* values come from the IDF Kconfig (sdkconfig.h).  A bool
+     * option that is "not set" is simply not #defined, so the polarity is
+     * selected in preprocessor context (undefined -> 0 in #if). */
+    lamp_control_config_t config = {
+#if CONFIG_KLC_LAMP_TYPE_RGB
+        .pins = {
+            (hal_pin_t)CONFIG_KLC_LED_RGB_GPIO_R,
+            (hal_pin_t)CONFIG_KLC_LED_RGB_GPIO_G,
+            (hal_pin_t)CONFIG_KLC_LED_RGB_GPIO_B,
+        },
+        .channel_count = LAMP_CONTROL_MAX_CHANNELS,
+#else
+        .pin          = (hal_pin_t)CONFIG_KLC_LED_PWM_GPIO,
+#endif
+        .frequency_hz = (uint32_t)CONFIG_KLC_LED_PWM_FREQUENCY_HZ,
+#if CONFIG_KLC_LED_PWM_ACTIVE_LOW
+        .polarity     = HAL_POLARITY_ACTIVE_LOW,
+#else
+        .polarity     = HAL_POLARITY_ACTIVE_HIGH,
+#endif
+    };
+
+    lamp_status_t status = lamp_control_init(&config);
+    if (status != LAMP_OK)
+    {
+        ESP_LOGE(TAG, "lamp_control_init failed: %d (output off)", (int)status);
+        return false;
+    }
+
+    /* The lamp is initialized with its output off; it stays off until a
+     * valid desired state arrives. */
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
+/* Filesystem bootstrap                                                   */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Fail-safe invoked on any filesystem bootstrap failure: forces the
+ *        lamp output to the logical INACTIVE level.  The state machine's
+ *        non-online transition to SAFE_OFF performs the same fail-off
+ *        (idempotent); this callback keeps the guarantee for the bootstrap
+ *        path itself.
+ */
+static void lamp_fs_fail_safe(void)
+{
+    lamp_status_t status = lamp_control_force_inactive();
+    if (status != LAMP_OK)
+    {
+        ESP_LOGE(TAG, "Filesystem fail-safe could not force output off: %d",
+                 (int)status);
+    }
+}
+
+/**
+ * @return true when the filesystem is mounted and the directory layout is
+ *         ready; false when boot must degrade (output off, no config load).
+ */
+static bool bootstrap_filesystem(void)
+{
+    lamp_fs_config_t fs_config = {
+        .fail_safe_cb = lamp_fs_fail_safe,
+    };
+
+    lamp_fs_status_t status = lamp_fs_init(&fs_config);
+    if (status != LAMP_FS_OK)
+    {
+        ESP_LOGE(TAG, "Filesystem bootstrap failed: %d "
+                      "(storage preserved, output off, configuration not loaded)",
+                 (int)status);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Filesystem ready: %s mounted at %s (cert/, config/, state/)",
+             LAMP_FS_PARTITION_LABEL, LAMP_FS_MOUNT_POINT);
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
+/* Configuration loading (TASK-108)                                        */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Load the product documents through the configuration service.
+ *
+ * @return true when both documents are usable (loaded or recovered).
+ */
+static bool load_product_configuration(void)
+{
+    app_config_device_doc_t device;
+    app_config_status_t status = app_config_load_device(&device);
+    if ((status != APP_CONFIG_OK) && (status != APP_CONFIG_OK_RECOVERED))
+    {
+        ESP_LOGE(TAG, "device.json unavailable: %d (%s)",
+                 (int)status, app_config_status_name(status));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "device.json loaded%s: product='%s' hw='%s' tb='%s'",
+             (status == APP_CONFIG_OK_RECOVERED) ? " (recovered)" : "",
+             device.product, device.hardware_revision,
+             device.thingsboard_name);
+
+    app_config_manufacturing_doc_t manufacturing;
+    status = app_config_load_manufacturing(&manufacturing);
+    if ((status != APP_CONFIG_OK) && (status != APP_CONFIG_OK_RECOVERED))
+    {
+        ESP_LOGE(TAG, "manufacturing.json unavailable: %d (%s)",
+                 (int)status, app_config_status_name(status));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "manufacturing.json loaded%s: state=%d mode=%d",
+             (status == APP_CONFIG_OK_RECOVERED) ? " (recovered)" : "",
+             (int)manufacturing.manufacturing_state,
+             (int)manufacturing.credential_mode);
+
+    return true;
+}
+
+/**
+ * @brief Load and validate the broker/TLS configuration (TASK-110).
+ *
+ * @return true only when the broker/TLS document was accepted and applied.
+ */
+static bool load_broker_tls_configuration(void)
+{
+    mqtt_cfg_status_t status = mqtt_cfg_load_and_apply();
+    if (status != MQTT_CFG_OK)
+    {
+        ESP_LOGE(TAG, "Broker/TLS configuration rejected: %d (%s)"
+                      " (output forced off, ThingsBoard blocked)",
+                 (int)status, mqtt_cfg_status_name(status));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Load the ThingsBoard access-token identity (TASK-111).
+ *
+ * @return true only when a validated identity is loaded and ready.
+ */
+static bool load_device_identity(void)
+{
+    device_identity_status_t status = device_identity_load();
+    if (status != DEVICE_IDENTITY_OK)
+    {
+        ESP_LOGE(TAG, "Device identity rejected: %d (%s)"
+                      " (output forced off, ThingsBoard blocked)",
+                 (int)status, device_identity_status_name(status));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Device identity loaded (access-token auth, client id "
+                  "ready for ThingsBoard initialization)");
+    return true;
+}
+
+static bool initialize_thingsboard_client(const char *access_token,
+                                          const char *client_id,
+                                          const char *device_name)
+{
+    tb_client_config_t configured = {
+        .on_connect = thingsboard_on_connected,
+        .on_disconnect = thingsboard_on_disconnected,
+        .on_connect_failure = thingsboard_on_connect_failure,
+    };
+
+    if (mqtt_cfg_get_server_url(configured.server_url,
+                                sizeof(configured.server_url)) != MQTT_CFG_OK) {
+        ESP_LOGE(TAG, "Configured ThingsBoard server URL unavailable");
+        return false;
+    }
+    (void)snprintf(configured.access_token, sizeof(configured.access_token),
+                   "%s", access_token);
+    (void)snprintf(configured.client_id, sizeof(configured.client_id),
+                   "%s", client_id);
+    (void)snprintf(configured.device_name, sizeof(configured.device_name),
+                   "%s", device_name);
+
+    const int client_status = tb_client_init(&s_tb_client, &configured);
+    if (client_status != 0) {
+        ESP_LOGE(TAG, "ThingsBoard client initialization failed: %d",
+                 client_status);
+        return false;
+    }
+
+    const tb_application_config_t application_config = {
+        .client = s_tb_client,
+        .sync_timeout_ms = CONFIG_KLC_THINGSBOARD_SYNC_TIMEOUT_MS,
+        .rssi_dbm = thingsboard_rssi,
+        .hardware = "ESP32",
+    };
+    tb_application_status_t application_status =
+        tb_application_init(&application_config);
+    if (application_status != TB_APPLICATION_OK) {
+        ESP_LOGE(TAG, "ThingsBoard application initialization failed: %d",
+                 (int)application_status);
+        tb_client_deinit(s_tb_client);
+        s_tb_client = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void destroy_thingsboard_session(void)
+{
+    if (s_tb_client == NULL) {
+        return;
+    }
+    tb_application_deinit();
+    tb_client_disconnect(s_tb_client);
+    tb_client_deinit(s_tb_client);
+    s_tb_client = NULL;
+}
+
+/**
+ * @brief Create the ThingsBoard client for the current mode (bootstrap
+ *        provisioning or validated device identity).
+ */
+static bool create_thingsboard_session(void)
+{
+    const char *token = "provision";
+    const char *client_id = s_provisioning_config.device_name;
+
+    if (!s_tb_needs_provisioning &&
+        (device_identity_token(&token) != DEVICE_IDENTITY_OK ||
+         device_identity_client_id(&client_id) != DEVICE_IDENTITY_OK ||
+         token == NULL || client_id == NULL || token[0] == '\0' ||
+         client_id[0] == '\0'))
+    {
+        ESP_LOGE(TAG, "Validated ThingsBoard identity unavailable");
+        return false;
+    }
+
+    /* The server URL comes from the applied broker document. */
+    if (!load_broker_tls_configuration() ||
+        !initialize_thingsboard_client(token, client_id, client_id)) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Run the ordered configuration gates.
+ *
+ * @return true only when ALL THREE gates pass: product documents, the
+ *         broker/TLS document and the device identity.  The state machine
+ *         treats a false result as CONFIG_FAIL and parks the device in the
+ *         degraded SAFE_OFF state (recovery through provisioning/reset).
+ */
+static bool load_configuration(void)
+{
+    if (!load_product_configuration())
+    {
+        return false;
+    }
+
+    s_tb_needs_provisioning = false;
+    device_identity_status_t identity_status = device_identity_load();
+    if (identity_status != DEVICE_IDENTITY_OK) {
+        tb_provisioning_status_t provisioning_status =
+            tb_provisioning_load(&s_provisioning_config);
+        if (provisioning_status != TB_PROVISIONING_OK) {
+            ESP_LOGE(TAG, "Device identity and bootstrap provisioning are "
+                          "unavailable (%s)",
+                     tb_provisioning_status_name(provisioning_status));
+            return false;
+        }
+        s_tb_needs_provisioning = true;
+        if (!create_thingsboard_session()) {
+            ESP_LOGE(TAG, "Bootstrap ThingsBoard client initialization failed");
+            return false;
+        }
+        ESP_LOGI(TAG, "Bootstrap provisioning required before ThingsBoard "
+                      "session initialization");
+        return true;
+    }
+
+    return create_thingsboard_session();
+}
+
+/* --------------------------------------------------------------------- */
+/* Verified-TLS gate (TASK-110/111)                                        */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief Run the verified MQTT/TLS connect behind the identity gate.
+ *
+ * Called only in the machine's TLS state (after the network gate passed).
+ * The boot order contract (TASK-111) is enforced here:
+ *
+ *   1. IDENTITY gate — the ThingsBoard session may only be initialized
+ *      with a validated identity (device_identity_is_loaded()).  A missing
+ *      or invalid identity is fatal safe-off.
+ *   2. VERIFIED-TLS gate (TASK-110) — mqtt_cfg_connect() drives one
+ *      verified MQTT/TLS connection over the applied transport and is the
+ *      single re-enable transition for the lamp fail-off barrier.
+ *
+ * @return true when the verified TLS transport is established; the caller
+ *         delivers TLS_CONNECTED / TLS_FAILED accordingly.
+ */
+static bool connect_verified_tls(void)
+{
+    if (s_reprovision_backoff_active) {
+        if ((int32_t)(osal_task_get_time_ms() - s_reprovision_retry_at_ms) < 0) {
+            return false;
+        }
+        s_reprovision_backoff_active = false;
+    }
+    if (!s_tb_needs_provisioning && !device_identity_is_loaded()) {
+        ESP_LOGE(TAG, "Device identity unavailable; ThingsBoard session "
+                      "blocked, output stays off");
+        return false;
+    }
+    if (s_tb_client == NULL && !create_thingsboard_session()) {
+        return false;
+    }
+
+    mqtt_cfg_status_t status = mqtt_cfg_connect(NETWORK_CONNECT_TIMEOUT_MS);
+    if (status != MQTT_CFG_OK)
+    {
+        if (status == MQTT_CFG_ERR_AUTH_REJECTED && !s_tb_needs_provisioning) {
+            ++s_auth_reject_count;
+            ESP_LOGW(TAG, "ThingsBoard credentials rejected (%u/%u)",
+                     s_auth_reject_count,
+                     (unsigned)CONFIG_KLC_AUTH_REJECT_REPROVISION_THRESHOLD);
+            if (s_auth_reject_count >= CONFIG_KLC_AUTH_REJECT_REPROVISION_THRESHOLD) {
+                s_auth_reject_count = 0u;
+                if (tb_provisioning_load(&s_provisioning_config) == TB_PROVISIONING_OK) {
+                    destroy_thingsboard_session();
+                    s_tb_needs_provisioning = true;
+                    ESP_LOGW(TAG, "Re-provisioning scheduled after auth rejection");
+                } else {
+                    ESP_LOGE(TAG, "Bootstrap provisioning credentials unavailable");
+                }
+            }
+        }
+        /* Bootstrap sessions are rebuilt by the next TLS attempt. */
+        if (s_tb_needs_provisioning) {
+            destroy_thingsboard_session();
+        }
+        ESP_LOGE(TAG, "Verified TLS connect failed: %d (%s)"
+                      " (output forced off, ThingsBoard session blocked)",
+                 (int)status, mqtt_cfg_status_name(status));
+        return false;
+    }
+
+    if (s_tb_needs_provisioning) {
+        tb_provisioning_status_t provisioning_status = tb_provisioning_enroll(
+            s_tb_client, &s_provisioning_config,
+            CONFIG_KLC_THINGSBOARD_PROVISION_TIMEOUT_MS);
+        if (provisioning_status != TB_PROVISIONING_OK ||
+            !load_device_identity()) {
+            ESP_LOGE(TAG, "Bootstrap ThingsBoard enrollment failed: %s; "
+                          "retry in %u ms",
+                     tb_provisioning_status_name(provisioning_status),
+                     (unsigned)CONFIG_KLC_REPROVISION_BACKOFF_MS);
+            destroy_thingsboard_session();
+            s_reprovision_backoff_active = true;
+            s_reprovision_retry_at_ms =
+                osal_task_get_time_ms() + CONFIG_KLC_REPROVISION_BACKOFF_MS;
+            return false;
+        }
+        const char *token = NULL;
+        const char *client_id = NULL;
+        if (device_identity_token(&token) != DEVICE_IDENTITY_OK ||
+            device_identity_client_id(&client_id) != DEVICE_IDENTITY_OK ||
+            tb_client_update_credentials(s_tb_client, token, client_id) != 0) {
+            return false;
+        }
+        if (!load_broker_tls_configuration()) {
+            destroy_thingsboard_session();
+            return false;
+        }
+        s_tb_needs_provisioning = false;
+        status = mqtt_cfg_connect(NETWORK_CONNECT_TIMEOUT_MS);
+        if (status != MQTT_CFG_OK) {
+            return false;
+        }
+    }
+
+    s_auth_reject_count = 0u;
+
+    /* Valid identity + verified TLS: the ThingsBoard session is now ready
+     * to enter the existing synchronization state. */
+    ESP_LOGI(TAG, "Verified TLS connected with validated identity; "
+                  "ThingsBoard session initialization allowed");
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
+/* State machine supervision                                              */
+/* --------------------------------------------------------------------- */
+
+/**
+ * @brief One supervisor iteration: feed the watchdog, then run the gate of
+ *        the current state.
+ *
+ * Every blocking gate polls app_state_poll() in-loop (the blocking
+ * constraint of the watchdog policy: ONE task owns the feed and never
+ * blocks longer than the watchdog window without polling).
+ */
+static void supervise_iteration(void)
+{
+    poll_factory_reset();
+    /* Log the parked/gate states only ONCE per state entry so a degraded
+     * device does not flood the log at the supervisor cadence. */
+    static app_state_t s_last_reported = APP_STATE_BOOT;
+    /* Edge tracker for the exhausted-retry notice below: logs once when
+     * app_state_retry_exhausted() turns true, independent of state-entry
+     * reporting. */
+    static bool s_last_exhausted = false;
+
+    (void)app_state_poll(); /* feed + drive bounded retries (single owner) */
+
+    service_thingsboard_connection();
+
+    /* Provisioning outcome events (TASK-132/133): the platform fallback
+     * controller owns the portal, the adapter stores its notifications and
+     * the supervisor DELIVERS them here (current session identity, machine
+     * owns the stale/illegal rejection).  Non-blocking; same task as the
+     * feed. */
+    deliver_provisioning_events();
+
+    app_state_t current = app_state_current();
+    bool report_entry = (current != s_last_reported);
+
+    switch (current)
+    {
+    case APP_STATE_FILESYSTEM:
+        if (bootstrap_filesystem())
+        {
+            (void)app_state_deliver(APP_EVENT_FS_OK, APP_OWNER_FILESYSTEM);
+        }
+        else
+        {
+            (void)app_state_deliver(APP_EVENT_FS_FAIL, APP_OWNER_FILESYSTEM);
+        }
+        break;
+
+    case APP_STATE_CONFIGURATION:
+        if (load_configuration())
+        {
+            (void)app_state_deliver(APP_EVENT_CONFIG_OK,
+                                    APP_OWNER_CONFIGURATION);
+        }
+        else
+        {
+            (void)app_state_deliver(APP_EVENT_CONFIG_FAIL,
+                                    APP_OWNER_CONFIGURATION);
+        }
+        break;
+
+    case APP_STATE_NETWORK:
+        /* First NETWORK entry — the FILESYSTEM and CONFIGURATION gates have
+         * already passed (machine-order contract), so the LittleFS storage
+         * is mounted: the Wi-Fi manager's init-time saved-credential load
+         * (wifi_mgmt_init -> _load_saved_config -> wifi_ap.json) reads the
+         * TRUTHFUL storage contents and wifi_mgmt_is_read_data() reflects
+         * reality.  TASK-136: bringing the network up here (instead of in
+         * app_main before the FILESYSTEM gate) is what lets a device with a
+         * saved credential pass this gate straight to TLS, and lets a portal
+         * submission (SUCCEEDED -> NETWORK) pass the now-credentialed
+         * station to TLS without a reboot. */
+        if (!s_network_bringup_done)
+        {
+            s_network_bringup_done = true;
+            if (!start_network())
+            {
+                /* Degraded boot: the manager never started, so there is
+                 * nothing to poll.  Fail the gate now; the machine parks
+                 * SAFE_OFF (the bounded retry re-enters the network stage,
+                 * never provisioning directly). */
+                (void)app_state_deliver(APP_EVENT_NETWORK_FAILED,
+                                        APP_OWNER_NETWORK);
+                break;
+            }
+
+            /* Provisioning infrastructure (TASK-127).  The portal rides the
+             * shared Mongoose process that also hosts MQTT/TLS; the process
+             * is initialized once here and NEVER torn down by provisioning
+             * (the adapter's stop() ends the controller lifecycle and closes
+             * only the portal listeners).  init() registers the product
+             * notification hook with the platform fallback controller
+             * (TASK-132) — now that the manager loaded the saved-credential
+             * state, the controller's fresh-device decision sees the truth.
+             * The adapter itself is idempotent; a failure here only disables
+             * the fresh-device portal, never the credentialed boot path. */
+            MongooseProcess_Init();
+            if (!MongooseProcess_IsRunning())
+            {
+                ESP_LOGW(TAG, "Shared Mongoose process failed to start; "
+                              "fresh devices will not reach the portal "
+                              "(credentialed boot unaffected)");
+            }
+            if (wifi_provisioning_manager_init() !=
+                WIFI_PROVISIONING_MANAGER_OK)
+            {
+                ESP_LOGW(TAG, "Provisioning adapter init failed; fresh "
+                              "devices will not reach the portal "
+                              "(credentialed boot unaffected)");
+            }
+        }
+        /* The network gate keeps ONLY the credentialed connect path
+         * (TASK-133): poll for the station within the bounded window, then
+         * NETWORK_CONNECTED -> TLS (or NETWORK_FAILED -> SAFE_OFF with the
+         * bounded retry).  A device without a usable saved credential never
+         * starts provisioning from here — the platform fallback controller
+         * owns that decision (fresh device at init, or exhausted
+         * CONNECT_FAILED budget) and the supervisor delivers its STARTED
+         * event above while the machine is in NETWORK.
+         *
+         * TASK-139 — bounded fallback reachability: the platform Wi-Fi
+         * manager emits at most ONE CONNECT_FAILED per connect request and
+         * then rests idle, so an unusable saved credential could never
+         * exhaust the controller's CONNECT_FAILED budget (the device would
+         * park SAFE_OFF with no AP forever).  On every credentialed NETWORK
+         * (re-)entry the gate therefore re-drives the saved-credential
+         * connect: each bounded-retry session contributes one fresh
+         * CONNECT_FAILED, the controller opens the portal after the
+         * configured budget, and the gate's in-loop event service (above)
+         * consumes the STARTED at once. */
+        {
+            const bool credentialed =
+                wifi_provisioning_manager_has_saved_credentials();
+            if (credentialed)
+            {
+                (void)network_manager_reconnect();
+                const bool connected = supervise_network_gate();
+                /* The gate may have been superseded by the controller's
+                 * STARTED (state == PROVISIONING): in that case neither
+                 * NETWORK_CONNECTED nor NETWORK_FAILED applies — the
+                 * provisioning stage owns the machine from here. */
+                if (app_state_current() == APP_STATE_NETWORK)
+                {
+                    if (connected)
+                    {
+                        (void)app_state_deliver(APP_EVENT_NETWORK_CONNECTED,
+                                                APP_OWNER_NETWORK);
+                    }
+                    else
+                    {
+                        (void)app_state_deliver(APP_EVENT_NETWORK_FAILED,
+                                                APP_OWNER_NETWORK);
+                    }
+                }
+            }
+        }
+        break;
+
+    case APP_STATE_PROVISIONING:
+        /* The controller owns the portal (TASK-131/132/133): the machine
+         * parks in this bookkeeping state while the controller keeps the
+         * temporary AP / HTTP / DNS up.  No portal-driving work happens
+         * here — the pump above delivers SUCCEEDED (-> NETWORK) or FAILED
+         * (-> SAFE_OFF, bounded retry) when the controller reports the
+         * outcome, and the portal is never restarted from the supervisor.
+         * The watchdog is fed every iteration by the loop above. */
+        if (report_entry)
+        {
+            ESP_LOGI(TAG, "Provisioning gate: portal owned by the "
+                          "controller; waiting for its outcome events");
+        }
+        break;
+
+    case APP_STATE_TLS:
+        if (s_reprovision_backoff_active &&
+            (int32_t)(osal_task_get_time_ms() - s_reprovision_retry_at_ms) < 0)
+        {
+            /* Waiting out the re-provisioning backoff: no attempt, so no
+             * retry budget is consumed. */
+            break;
+        }
+        if (connect_verified_tls())
+        {
+            (void)app_state_deliver(APP_EVENT_TLS_CONNECTED, APP_OWNER_MQTT);
+        }
+        else
+        {
+            (void)app_state_deliver(APP_EVENT_TLS_FAILED, APP_OWNER_MQTT);
+        }
+        break;
+
+    case APP_STATE_SYNC:
+        tb_application_poll(s_tb_client);
+        if (tb_application_is_synchronized(s_tb_client))
+        {
+            (void)app_state_deliver(APP_EVENT_SYNC_COMPLETE,
+                                    APP_OWNER_THINGSBOARD);
+            ota_manager_request_image_confirmation();
+            ota_manager_request_check();
+        }
+        else if (report_entry)
+        {
+            ESP_LOGI(TAG, "ThingsBoard state synchronization in progress");
+        }
+        break;
+
+    case APP_STATE_ONLINE:
+        tb_application_poll(s_tb_client);
+        if (tb_application_take_firmware_hint())
+        {
+            ota_manager_request_check();
+        }
+        ota_manager_poll();
+        if (app_state_current() != APP_STATE_ONLINE)
+        {
+            break;
+        }
+        if (!network_manager_is_connected())
+        {
+            (void)app_state_deliver(APP_EVENT_DISCONNECTED,
+                                    APP_OWNER_NETWORK);
+        }
+        break;
+
+    case APP_STATE_SAFE_OFF:
+        /* The bounded retry (app_state_poll) re-enters the failed stage
+         * when the backoff elapses.  A parked (degraded/exhausted) device
+         * waits for an explicit reset/provisioning/OTA. */
+        if (!app_state_retry_pending() && report_entry)
+        {
+            ESP_LOGW(TAG, "Safe-off (degraded): no retry scheduled; "
+                          "waiting for provisioning / reset / OTA");
+        }
+        /* Exhausted-park notice: log ONCE when the retry budget is spent,
+         * independent of the state-entry gating above.  A device that parks
+         * degraded with a retry still pending (retry_pending true) or that
+         * already reported its SAFE_OFF entry would otherwise never emit a
+         * clear "budget exhausted" diagnostic; the edge (false -> true)
+         * keeps the cadence bounded. */
+        if (app_state_retry_exhausted() && !s_last_exhausted)
+        {
+            ESP_LOGW(TAG, "Safe-off (degraded): retry budget exhausted; "
+                          "waiting for provisioning / reset / OTA");
+        }
+        s_last_exhausted = app_state_retry_exhausted();
+        /* A parked device restarts once the re-provisioning backoff expires. */
+        if (s_reprovision_backoff_active && s_last_exhausted &&
+            (int32_t)(osal_task_get_time_ms() - s_reprovision_retry_at_ms) >= 0)
+        {
+            ESP_LOGW(TAG, "Re-provisioning backoff elapsed; restarting");
+            esp_restart();
+        }
+        break;
+
+    case APP_STATE_FATAL:
+        /* Never strand the provisioning flow on FATAL: the adapter stop
+         * ends the controller lifecycle (grace timer cancelled, temporary AP
+         * retired) and closes any portal listeners on the shared Mongoose
+         * process. */
+        stop_provisioning();
+        ESP_LOGE(TAG, "Fatal: application watchdog or unrecoverable "
+                      "failure; an explicit reset is required");
+        /* Leave the supervisor; a platform-level reset/OTA path reboots
+         * the device. */
+        return;
+
+    case APP_STATE_OTA:
+        /* OTA entry: end the provisioning flow immediately so no portal
+         * listener or pending grace timer is left during the update.  The
+         * adapter stop is idempotent; this runs once per OTA entry. */
+        if (report_entry)
+        {
+            stop_provisioning();
+        }
+        tb_application_poll(s_tb_client);
+        (void)tb_application_take_firmware_hint();
+        ota_manager_poll();
+        break;
+
+    case APP_STATE_BOOT:
+    default:
+        /* BOOT without a start() is parked.  Keep the watchdog fed. */
+        break;
+    }
+
+    s_last_reported = current;
+}
+
+static void supervise(void)
+{
+    for (;;)
+    {
+        supervise_iteration();
+        (void)osal_task_delay_ms(APP_SUPERVISE_PERIOD_MS);
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* Entry point                                                            */
+/* --------------------------------------------------------------------- */
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Kitchen LED Controller starting");
+    static const app_state_config_t state_cfg = {
+        .now_ms              = NULL, /* OSAL monotonic clock */
+        .watchdog_timeout_ms = APP_SUPERVISE_WATCHDOG_MS,
+        .on_watchdog_expired = NULL, /* FATAL + log on expiry */
+        .observer            = NULL,
+    };
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+
+    ESP_LOGI(TAG, "Kitchen LED Controller starting (state-machine "
+                  "supervisor)");
+    ESP_LOGI(TAG, "Firmware: title=%s version=%s partition=%s built=%s %s "
+                  "idf=%s",
+             app->project_name, app->version,
+             (running != NULL) ? running->label : "?",
+             app->date, app->time, app->idf_ver);
+
+    if (!init_lamp_output())
+    {
+        /* The output is off; boot continues so the filesystem bootstrap
+         * (and, later, OTA state) is still available for a safe degraded
+         * run.  A PWM init failure must never block storage bring-up. */
+        ESP_LOGW(TAG, "Lamp output unavailable; continuing with output off");
+    }
+#if CONFIG_KLC_FACTORY_RESET_ENABLE
+    init_factory_reset();
+#endif
+
+    /* Application state machine + watchdog (TASK-115).  The supervisor
+     * loop below is the single watchdog-feeding task. */
+    if (app_state_init(&state_cfg) != APP_STATE_OK)
+    {
+        ESP_LOGE(TAG, "State machine init failed; running with output off");
+        return;
+    }
+    if (app_state_start() != APP_STATE_OK)
+    {
+        ESP_LOGE(TAG, "State machine start failed; running with output off");
+        return;
+    }
+
+    init_ota_manager(app);
+
+    /* Wi-Fi onboarding (TASK-109) and the provisioning infrastructure
+     * (TASK-127) are brought up lazily by the NETWORK gate on its first
+     * entry (TASK-136): the supervisor loop runs the FILESYSTEM gate
+     * (LittleFS mount) and the CONFIGURATION gate before the NETWORK gate,
+     * so the Wi-Fi manager's init-time saved-credential load
+     * (wifi_mgmt_init -> _load_saved_config) reads from the mounted storage
+     * and the platform controller's fresh-device decision sees the truth.
+     * Starting the manager here would load nothing (the OSAL file layer
+     * rejects unmounted access) and would wedge the NETWORK gate forever
+     * after a portal submission — see the boot-order contract above. */
+    supervise();
 }

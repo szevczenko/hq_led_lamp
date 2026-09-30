@@ -28,28 +28,61 @@ menu "Kitchen LED Controller"
             configure time. The final pin must be confirmed from the schematic
             before PCB release. This value is not a credential.
 
+    choice KLC_LAMP_TYPE
+        prompt "Lamp output type"
+        default KLC_LAMP_TYPE_PWM
+
+        config KLC_LAMP_TYPE_PWM
+            bool "Single-channel PWM"
+
+        config KLC_LAMP_TYPE_RGB
+            bool "RGB (three PWM channels)"
+    endchoice
+
+    config KLC_LED_RGB_GPIO_R
+        int "RGB red channel GPIO"
+        range 0 48
+        default 18
+        depends on KLC_LAMP_TYPE_RGB
+
+    config KLC_LED_RGB_GPIO_G
+        int "RGB green channel GPIO"
+        range 0 48
+        default 19
+        depends on KLC_LAMP_TYPE_RGB
+
+    config KLC_LED_RGB_GPIO_B
+        int "RGB blue channel GPIO"
+        range 0 48
+        default 21
+        depends on KLC_LAMP_TYPE_RGB
+
     config KLC_LED_PWM_FREQUENCY_HZ
         int "LED PWM frequency (Hz)"
-        range 1000 80000
-        default 20000
+        range 1000 9765
+        default 8000
         help
             PWM carrier frequency driving the MOSFET. Must be confirmed with
             the actual MOSFET switching characteristics to avoid audible noise
             or excessive switching loss.
-            Constraint: frequency * 2^resolution must not exceed 80 000 000
-            (ESP32 APB clock). CMake rejects invalid combinations at configure
-            time.
+            Constraint: the ESP HAL PWM backend (hal_pwm_esp.c) runs LEDC at
+            a fixed 13-bit duty resolution, so
+            frequency * 2^13 must not exceed the 80 000 000 Hz APB clock.
+            CMake rejects invalid values at configure time; the practical
+            maximum is 9765 Hz (8000 Hz by default keeps divider margin).
 
     config KLC_LED_PWM_RESOLUTION_BITS
         int "LED PWM duty resolution (bits)"
         range 8 15
-        default 11
+        default 13
         help
-            Duty-cycle resolution. Higher values give finer brightness steps
-            at the cost of maximum achievable frequency. See the frequency
-            option for the combined APB-clock constraint.
-            At 20 kHz the maximum valid resolution on ESP32 is 11 bits
-            (20000 * 2048 = 40 960 000 < 80 000 000).
+            Duty-cycle resolution requested by the product layer. The ESP HAL
+            PWM backend (hal_pwm_esp.c) runs LEDC at a fixed 13-bit duty
+            resolution regardless of this value, so 13 is the only value that
+            matches the hardware backend; keep it at 13.
+            Constraint: frequency * 2^13 must not exceed 80 000 000 (ESP32
+            APB clock); see KLC_LED_PWM_FREQUENCY_HZ. CMake validates the
+            combined budget at configure time.
 
     config KLC_LED_PWM_ACTIVE_LOW
         bool "LED output is active-low"
@@ -69,6 +102,29 @@ menu "Kitchen LED Controller"
             arrives regardless of this value. This is a hardware default, not
             a credential.
 
+    menu "Factory reset"
+        config KLC_FACTORY_RESET_ENABLE
+            bool "Enable factory reset button"
+            default y
+
+        config KLC_FACTORY_RESET_GPIO
+            int "Factory reset GPIO"
+            range 0 48
+            default 0
+            depends on KLC_FACTORY_RESET_ENABLE
+
+        config KLC_FACTORY_RESET_ACTIVE_LOW
+            bool "Factory reset input is active-low"
+            default y
+            depends on KLC_FACTORY_RESET_ENABLE
+
+        config KLC_FACTORY_RESET_HOLD_MS
+            int "Factory reset hold time (ms)"
+            range 1000 60000
+            default 5000
+            depends on KLC_FACTORY_RESET_ENABLE
+    endmenu
+
     config KLC_THINGSBOARD_SYNC_TIMEOUT_MS
         int "ThingsBoard state synchronization timeout (ms)"
         range 1000 60000
@@ -78,6 +134,27 @@ menu "Kitchen LED Controller"
             state after MQTT connection. If the timeout expires the output
             stays off and the device retries after reconnect backoff.
 
+    config KLC_THINGSBOARD_PROVISION_TIMEOUT_MS
+        int "ThingsBoard bootstrap provisioning response timeout (ms)"
+        range 5000 60000
+        default 20000
+        help
+            Maximum time to wait for the ThingsBoard /provision/response
+            reply during one-shot bootstrap enrollment. This is a separate,
+            longer budget than KLC_THINGSBOARD_SYNC_TIMEOUT_MS because
+            first-time device creation can take longer than routine state
+            sync round trips.
+
+    config KLC_AUTH_REJECT_REPROVISION_THRESHOLD
+        int "Consecutive auth failures before re-provisioning"
+        range 1 10
+        default 3
+
+    config KLC_REPROVISION_BACKOFF_MS
+        int "Re-provisioning backoff (ms)"
+        range 1000 86400000
+        default 600000
+
     config KLC_TELEMETRY_PERIOD_MS
         int "Periodic telemetry publish interval (ms)"
         range 1000 3600000
@@ -86,5 +163,79 @@ menu "Kitchen LED Controller"
             Interval between periodic health telemetry publishes. Telemetry
             is also published on connect and on every state change. This value
             is not a credential or token.
+
+    menu "ThingsBoard OTA"
+
+        config KLC_OTA_CHUNK_SIZE
+            int "Firmware chunk size requested from ThingsBoard (bytes)"
+            range 512 16384
+            default 4096
+            help
+                Size of each v2/fw chunk. Larger chunks download faster but
+                need more RAM in the MQTT receive path.
+
+        config KLC_OTA_CHUNK_TIMEOUT_MS
+            int "Chunk response timeout (ms)"
+            range 1000 120000
+            default 10000
+
+        config KLC_OTA_CHUNK_RETRIES
+            int "Chunk re-requests before the update fails"
+            range 1 20
+            default 3
+
+        config KLC_OTA_CHECK_PERIOD_MS
+            int "Periodic firmware check interval (ms, 0 = disabled)"
+            range 0 86400000
+            default 3600000
+            help
+                The device also checks after every ThingsBoard
+                synchronization and whenever fw_* shared attributes change.
+
+        config KLC_OTA_REBOOT_DELAY_MS
+            int "Delay between image activation and restart (ms)"
+            range 500 30000
+            default 2000
+            help
+                Lets the UPDATING telemetry reach ThingsBoard before restart.
+
+        config KLC_OTA_BLINK_PERIOD_MS
+            int "Progress blink half period (ms)"
+            range 100 10000
+            default 1000
+
+        config KLC_OTA_BLINK_BRIGHTNESS_PERCENT
+            int "Progress blink brightness (%)"
+            range 1 100
+            default 100
+
+    endmenu
+
+    choice KLC_WIFI_DEFAULT_MODE
+        prompt "Default Wi-Fi start mode"
+        default KLC_WIFI_DEFAULT_MODE_APSTA
+        help
+            Wi-Fi mode used by the network stage (network_manager, TASK-109)
+            for a fresh device. With this default, a fresh device starts in
+            AP+STA so its portal is immediately reachable. A device with a
+            saved credential starts station-only until the bounded fallback
+            controller opens the portal, preventing a visible but nonfunctional
+            provisioning AP during normal station retries.
+
+        config KLC_WIFI_DEFAULT_MODE_APSTA
+            bool "AP+STA (station plus provisioning access point)"
+            help
+                Start a fresh device in AP+STA mode (T_WIFI_TYPE_CLI_SER). A
+                device with a saved credential begins station-only and is
+                promoted to AP+STA when the provisioning portal is started.
+
+        config KLC_WIFI_DEFAULT_MODE_CLIENT
+            bool "Station-only (client)"
+            help
+                Start the Wi-Fi manager in station-only mode (T_WIFI_TYPE_
+                CLIENT) for hardened production builds. Select this only when
+                the device is provisioned out-of-band and never needs the
+                portal.
+    endchoice
 
 endmenu
