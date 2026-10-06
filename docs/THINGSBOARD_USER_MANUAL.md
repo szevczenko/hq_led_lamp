@@ -765,11 +765,11 @@ Step by step:
 ### 13.3 Claiming secret lifecycle
 
 * **Generation:** by the production process / tenant admin after manufacturing, crypto-random, unique per device.
-* **Storage:** only as the SERVER_SCOPE attribute `claimingData` (`{"secretKey": "...", "expirationTime": <ms>}`) in ThingsBoard PE, with a short validity via `expirationTime`; never in firmware, telemetry, logs, or source code.
+* **Storage:** as the SERVER_SCOPE attribute `claimingData` (`{"secretKey": "...", "expirationTime": <ms>}`) in ThingsBoard PE, with a short validity via `expirationTime`; never in firmware, telemetry, or source code. The value is also **stored by ThingsBoard itself in the server-side audit log**: writing `claimingData` via the REST API creates an `ATTRIBUTES_UPDATED` audit entry whose `actionData` contains the full attribute value including `secretKey` (verified on the test instance, CE 4.3.1.3, 2026-10-06 — see `docs/THINGSBOARD_CLAIMING_E2E_TEST.md` §11 finding 8). The audit log must therefore be treated as a secret-bearing store: access-controlled and not shipped off-platform, and `claimingData` should be invalidated (claimed / expired / re-issued) as soon as the handover completes.
 * **Device binding:** the attribute is stored on a specific device ID; the claim endpoint verifies the secret per device.
 * **Delivery:** out-of-band channel (waybill / label / e-mail), one-time, with a defined validity period.
 * **Invalidation:** the claim is one-time (the secret is consumed); `expirationTime` expires it; a wrong claim is rejected; re-issuance means the tenant admin overwrites `claimingData` with a new secret; reclaim via `DELETE /api/customer/device/{deviceName}/claim` returns the device to the tenant.
-* **Logging:** operational events may be logged, but never the secret value.
+* **Logging:** the secret never appears in device logs, in `claim_handover.sh`/`claim_customer.sh` output (except the explicit `--handover` stdout channel), or in this document (verified by grepping the captured device logs and the script outputs, CE 4.3.1.3). The exception is the ThingsBoard audit log described under "Storage" — operational logging must not add the secret anywhere else.
 
 ### 13.4 Trust boundaries
 
@@ -798,6 +798,55 @@ The repository facts and the development smoke tests are **not** proof of the ta
 6. Post-claim lifecycle (reboot, rejected/lost MQTT credentials, automatic provisioning): the plan assumes that after the claim the lamp keeps working with **no firmware action** — reconnecting with the unchanged access token after a reboot and, if the token is later rejected or lost (three consecutive rejections trigger automatic re-enrollment, section 2.1), re-provisioning exactly as before the claim. Whether any of those events changes the device's ownership (Customer assignment / claimed state) is **not** verified. Target-PE regression check: (a) after a successful claim, reboot the lamp and confirm it reconnects with its unchanged token to the same device entity and stays assigned to the Customer; (b) reject or delete the stored access token and let automatic provisioning/re-enrollment run, then confirm what device entity is created, whether the provisioning key/secret still belong to the tenant, whether the new entity is assigned to the Customer, and that neither case silently changes ownership or detaches a claimed device from its Customer.
 
 The lifecycle smoke test in `FIRMWARE_PRODUCTION_READINESS_PLAN.md` §9.5 (server-side `claimingData` + Customer User claim + reclaim) was executed on a development instance (possibly CE) and is a smoke test only; it is not proof of the target PE behavior.
+
+#### Verification status (2026-10-06, TASK-305 smoke run)
+
+The TASK-304 scenario was executed end to end as a **smoke run** on the development/test instance
+(`http://home-assistance.local:8080`, confirmed **ThingsBoard CE 4.3.1.3**) with the **physical
+lamp**; the full record is in `docs/THINGSBOARD_CLAIMING_E2E_TEST.md` §10–§11. Confirmed as facts
+on CE (this proves nothing about PE):
+
+* provisioning/`claimingData`/claim/reclaim endpoints work as described in 13.2 and 13.3;
+* the claim is one-time (retry after a successful claim is rejected), `expirationTime` and wrong
+  secrets are rejected, re-issuance = overwriting `claimingData` with a new secret works;
+* after the claim the lamp reboots and reconnects with the **unchanged** MQTT access token to the
+  **same** device entity (no firmware action, no re-provisioning — matches the PE documentation
+  assumption 13.6.2);
+* the Customer User, after the claim, can read telemetry/client attributes and execute two-way
+  RPC (`setState` applied by the lamp, verified in the device log);
+* device logs and script outputs never contain the claiming secret; **however the ThingsBoard
+  server-side audit log stores the full `claimingData` value** (see 13.3 "Storage") — a finding
+  from the smoke run;
+* lost credentials (device deleted server-side) → MQTT rejection ×3 → automatic re-provisioning
+  creates a **new tenant-owned** device entity with a new access token, exactly as documented in
+  section 2.1.
+
+**PE remains unverified.** No ThingsBoard PE environment is available in the current test
+environment (the only reachable instance is the CE dev instance); the target **PE ≥ 3.5/3.6**
+edition/version, the PE-specific assumptions 13.6.1–13.6.6, and the factory-reset-button step
+(§6.10 of the E2E document — requires physical button access) must still be confirmed on a real
+PE instance with the physical lamp. TASK-305 therefore cannot be marked done.
+
+##### PE provisioning attempt (2026-10-06, review round)
+
+A genuine attempt to obtain a PE environment for the required physical-lamp run was made and is
+recorded in `docs/THINGSBOARD_CLAIMING_E2E_TEST.md` §10.1 (facts, not assumptions):
+
+* the only reachable ThingsBoard is the CE dev instance (LAN scan of 192.168.1.0/24, no other
+  TB HTTP/MQTT port open; `/api/license` → HTTP 404 on the dev instance), and there is no shell
+  access (`ssh` refused, no Docker context) to install PE on the dev host;
+* the target PE image `thingsboard/tb-pe-node:4.3.1.6PE` (Professional Edition 4.3.1.6,
+  published 2026-09-28) exists on Docker Hub and was pulled; it satisfies the assumed target
+  "PE ≥ 3.5/3.6";
+* PE 4.3.x refuses to run without a license (`TB_LICENSE_SECRET`, verified in the image's own
+  `conf/thingsboard.conf` / `thingsboard.yml`; no default or offline/trial fallback), and the
+  license portal (https://license.thingsboard.io) issues trial/commercial licenses only through
+  an interactive signup (e-mail verification + Google reCAPTCHA) — not completable from this
+  environment (no e-mail inbox, no captcha capability), and no license material exists in the
+  workspace;
+* consequence: **the physical-lamp run on PE is not executable here**, assumptions 13.6.1–13.6.6
+  stay unverified, and **TASK-305 remains open** for an environment with a reachable licensed
+  ThingsBoard PE instance.
 
 ### 13.7 Device-side `tb_claim_device()` is not used in the product flow
 
