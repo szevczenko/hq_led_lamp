@@ -920,3 +920,203 @@ If the product conditions change (for example the lamp gains a local UI/QR capab
 ### 13.8 Rollout order and rollback
 
 Order: decision documentation (this section) → production script → integration tests on PE → firmware regression confirmation → manual update. The firmware does not change, so the functional rollback is removing `claimingData` / reclaiming the device to the tenant (`DELETE .../claim`); already-provisioned lamps keep working unchanged, because claiming is a server-side operation on an existing device.
+
+The operational runbook — rollout order with task references, the safe order of production operations, handling of already-provisioned lamps, rollback, expired/lost-secret recovery, and the ThingsBoard version/edition verification summary — is section 14.
+
+---
+
+## 14. Device Handover Runbook
+
+Operational companion to section 13: the safe order of operations for handing a provisioned lamp
+over to a ThingsBoard Customer, the handling of already-provisioned lamps, rollback, recovery from
+an expired or lost secret, and the current verification status of the ThingsBoard version/edition
+assumptions. It applies to the production target **ThingsBoard PE ≥ 3.5/3.6** — the
+version/edition summary and the (still open) PE verification are in 14.6.
+
+### 14.1 Rollout order (TASK-301 → TASK-306)
+
+The claiming rollout is a sequence of dependent tasks; each task's deliverable is a precondition
+for the next in the planned order. One recorded deviation: TASK-306's regression was executed on
+CE **before** TASK-305, because it needs only the dev instance and the physical lamp. That CE run
+was performed out of the planned PE sequence and does **not** satisfy or unblock TASK-305 ‚Äî the
+PE integration run remains open and must still be executed against the licensed target PE instance
+before mass handover (14.6). Nothing in the rollout changes the firmware or `hq_platform`:
+
+| Step | Task | Deliverable | Status |
+| --- | --- | --- | --- |
+| 1 | TASK-301 — decision documentation | §13.1–13.8: chosen method (server-side `claimingData`), actors/sequence, secret lifecycle, trust boundaries | done |
+| 2 | TASK-302 — production script | `scripts/thingsboard/claim_handover.sh` (issue / re-issue / invalidate / status / handover) | done |
+| 3 | TASK-303 — Customer User claim/reclaim helper | `scripts/thingsboard/claim_customer.sh` (claim / reclaim / `setup-test-customer`) | done |
+| 4 | TASK-304 — E2E documentation | `docs/THINGSBOARD_CLAIMING_E2E_TEST.md` (PE scenario + expected results) | done |
+| 5 | TASK-305 — integration test on PE | PE run record; executed as a **CE smoke run** on the dev instance with the physical lamp (E2E §10–11) | **open** — no licensed PE instance reachable; PE verification pending |
+| 6 | TASK-306 — firmware regression confirmation | no firmware changes; post-claim regression on the physical lamp (reconnect with unchanged token, telemetry, two-way RPC, identity unchanged, no re-provisioning) | done (on CE) |
+
+The manual update is this runbook (§14, the final step of the rollout order of §13.8).
+Production can start with the tenant-side tools (steps 1–3 and 6); step 5 guards the **first**
+PE production run and must be executed against the licensed target PE instance before mass
+handover, because the CE smoke run is not PE proof (14.6).
+
+### 14.2 Safe order of production operations
+
+The only safe order for every handover is:
+
+```text
+1. provisioning  ->  2. claimingData  ->  3. handover (claim by Customer User)
+```
+
+Step by step:
+
+**1. Provisioning (once per device, section 2.1).** The lamp is manufactured and provisioned: it
+exists as a tenant device with its MQTT access token and has proven connectivity
+(`TLS -> SYNC -> ONLINE`, sections 7 and 10).
+
+**2. `claimingData` (production process / tenant admin).** At sale time, issue the one-time secret
+and keep it in memory for the delivery channel. Issue **once**: any later issue (`--ttl`,
+`--reissue`, `--handover`) overwrites `claimingData` and permanently invalidates a secret that was
+already delivered:
+
+```bash
+# production side — issue once and capture ONLY the secret (stdout); memory-only, never a file:
+SECRET_VAL="$(scripts/thingsboard/claim_handover.sh klc-kitchen-01 --ttl 3600 --handover 2>/dev/null)"
+# verify (optional, side-effect free): the attribute is present and when it expires — not the secret:
+scripts/thingsboard/claim_handover.sh klc-kitchen-01 --status
+```
+
+The secret is generated crypto-random per device and stored as the SERVER_SCOPE attribute
+`claimingData` (13.3); ThingsBoard also records its value in the server-side audit log (14.4). The
+tenant API key is read at runtime from `TB_TENANT_API_KEY_FILE`; neither the key nor the secret is
+printed or logged — only `--handover` prints the secret (to stdout), and `--status` never shows it.
+
+**3. Handover (out-of-band delivery + Customer User claim).** Deliver the secret captured in step 2
+(`$SECRET_VAL`) through the production channel (waybill / label / e-mail), then the Customer User
+completes the transfer in their own environment. The Customer User must supply
+`TB_CUSTOMER_USERNAME` and `TB_CUSTOMER_PASSWORD` before the call; enter the password without
+placing it in shell history (e.g. `read -rsp`):
+
+```bash
+# customer side — the Customer User's own shell (NOT the tenant/production shell):
+export TB_CUSTOMER_USERNAME='customer-user@example.com'
+read -rsp 'Customer User password: ' TB_CUSTOMER_PASSWORD && export TB_CUSTOMER_PASSWORD  # not in shell history
+printf '%s' "$SECRET_VAL" | scripts/thingsboard/claim_customer.sh --secret-stdin klc-kitchen-01 claim   # exit 0 on success
+unset TB_CUSTOMER_PASSWORD SECRET_VAL   # memory-only values die with the shell
+```
+
+`claim_customer.sh` logs in with those credentials to obtain a Customer User JWT — the tenant API
+key is not accepted by the claim endpoint (§13.2). The test helper
+`scripts/thingsboard/claim_customer.sh setup-test-customer` (test instance only) can create/reuse
+the test Customer User with the tenant API key, but production handover always uses the Customer
+User's own login.
+
+Guard rails for the safe order:
+
+* **Never write `claimingData` before provisioning.** The claim endpoint operates on an existing
+  device entity; a lamp that is not provisioned cannot be claimed. If `claim_handover.sh` reports
+  `device ... was not found`, provision the device first (section 2.1).
+* **Never deliver the secret before `claimingData` is written.** The claim succeeds only while a
+  valid `claimingData` attribute exists; delivering a secret for a device without one forces an
+  unnecessary re-issue (14.4).
+* **Never use the provisioning key/secret or the MQTT access token as the claiming secret** (13.5).
+  They are not the claiming secret and do not play that role.
+* **After the claim, expect no firmware action.** The lamp keeps operating with its unchanged MQTT
+  access token (14.6, assumption 2). Verify the device now appears under the Customer and that
+  telemetry/RPC still work — the TASK-306 regression confirmed this on the physical lamp.
+
+### 14.3 Already-provisioned lamps (installed base)
+
+* **No changes required.** Claiming is a server-side operation on an existing device: it does not
+  alter provisioning credentials, MQTT connectivity, firmware, or factory-reset behavior (sections
+  12, 13.4). Already-provisioned, already-delivered lamps keep working unchanged.
+* **Claim on demand.** For each lamp that is sold, apply §14.2 steps 2–3 at sale time.
+  There is no need to prepare `claimingData` earlier: leave it absent until the handover, then
+  issue with a TTL that matches the delivery channel (short for label/e-mail delivery, longer only
+  when delivery latency requires it).
+* **Do not re-provision or re-flash an already-provisioned lamp for handover.** That would
+  create/change a device entity or token for no gain; the handover itself never touches the lamp
+  (TASK-306).
+
+### 14.4 Rollback
+
+The functional rollback of a handover is always server-side and always leaves the lamp itself
+untouched. The lamp's MQTT access token and device entity survive every rollback action — it
+reconnects as the same tenant device with the same token; no firmware action is needed.
+
+Situation → action → result:
+
+| Situation | Action | Result |
+| --- | --- | --- |
+| `claimingData` written, secret **not yet delivered** | `scripts/thingsboard/claim_handover.sh <device> --invalidate` | `claimingData` removed (idempotent); device stays with the tenant; no claim possible |
+| secret delivered but **claim not completed** | `--invalidate` (abandon the delivery) **or** re-issue and re-deliver (`--reissue` / `--handover`) | abandoned: no claim possible; re-issued: only the newest secret works |
+| device **claimed** by the Customer, must return | `scripts/thingsboard/claim_customer.sh <device> reclaim` (`DELETE /api/customer/device/{deviceName}/claim`) | device returns to the tenant; the consumed secret stops working |
+| secret **compromised, expired or lost** | `--reissue` (overwrites `claimingData` with a new secret) | old secret invalid; a fresh secret is issued for new delivery (14.5) |
+| **complete rollback** to the pre-claim state | `--invalidate`, then (if claimed) `reclaim` | device back with the tenant and no active `claimingData` |
+
+Notes:
+
+* **`--invalidate` is idempotent** — re-running it on a device without `claimingData` is a safe
+  no-op.
+* **`reclaim` requires a Customer User login (JWT)** — the tenant API key cannot reclaim
+  (§13.2, `scripts/thingsboard/README.md`). For a device that was never claimed, rollback is
+  complete with `--invalidate` alone.
+* **Audit-log residue:** writing `claimingData` stores the full attribute value (including
+  `secretKey`) in the ThingsBoard server-side audit log (13.3); invalidating the attribute does
+  not erase that historical audit entry. Treat the audit log as a secret-bearing store.
+
+### 14.5 Expired or lost secret
+
+* **Check first:** `scripts/thingsboard/claim_handover.sh <device> --status` shows whether
+  `claimingData` is present and when it expires — never the secret.
+* **Expired** (`expirationTime` passed): the claim is rejected (E2E §6.3; `claim_customer.sh`
+  exit 4 when the server reports the reason). Re-issue and deliver again:
+
+  ```bash
+  scripts/thingsboard/claim_handover.sh <device> --ttl <seconds> --handover   # new secret to stdout only
+  ```
+
+* **Lost before delivery:** re-issue (overwrite) with a fresh secret and re-deliver; the old secret
+  is invalid the moment `claimingData` is overwritten.
+* **Lost after delivery, claim not completed:** re-issue and deliver the new secret; only the
+  newest `claimingData` value is accepted.
+* **Claim already completed:** the secret is consumed (one-time, 13.3) — there is nothing to
+  re-issue for that delivery. If the device must change hands again, reclaim it (14.4) and re-issue
+  for the new handover.
+* **Never reuse or log secrets:** each re-issue generates a new crypto-random secret; secrets
+  appear only in the out-of-band delivery and — while valid — in the ThingsBoard audit log
+  (13.3). Do not put them in tickets, logs, or source control.
+
+### 14.6 ThingsBoard version/edition and assumption verification status
+
+**Version/edition summary:**
+
+* **Development/test instance** (all smoke runs): **ThingsBoard CE 4.3.1.3** at
+  `http://home-assistance.local:8080` — results obtained there are smoke tests only and are not
+  proof of the target PE behavior.
+* **Target production edition:** **ThingsBoard PE ≥ 3.5/3.6** (the PE image
+  `thingsboard/tb-pe-node:4.3.1.6PE` pulled during TASK-305 satisfies this assumption but requires
+  a license; no licensed PE instance is reachable from the development environment — E2E
+  §10.1, §11.10). **No PE run exists yet.** The confirmed PE version/edition of the
+  running production instance must be recorded here after the first PE verification (TASK-305).
+
+**Verification status of assumptions 1–5 (§13.6):**
+
+Legend: ✔ = confirmed on the dev instance (CE smoke run / TASK-306 regression); ⛔ = PE
+unverified (TASK-305 open).
+
+| # | Assumption (§13.6) | Status on CE 4.3.1.3 (dev) | Status on target PE ≥ 3.5/3.6 |
+| --- | --- | --- | --- |
+| 1 | `claimingData` format (`secretKey` + `expirationTime` in ms) and `POST`/`DELETE /api/customer/device/{deviceName}/claim` endpoints | ✔ working end to end (E2E §6.1–6.9) | ⛔ unverified |
+| 2 | MQTT access token unchanged after claim | ✔ lamp rebooted and reconnected with the same token/entity, no re-provisioning (E2E §6.6; TASK-306) | ⛔ unverified |
+| 3 | Customer User visibility of telemetry/attributes/RPC/OTA | ✔ telemetry, client attributes and two-way RPC readable/executable by the Customer User (E2E §6.7); OTA not tested | ⛔ unverified |
+| 4 | Claiming enabled at tenant/profile level | ✔ claim worked without explicit claiming-related enablement (E2E §11.4) | ⛔ unverified |
+| 5 | Reclaim (`DELETE .../claim`) and factory-reset interaction | ✔ reclaim and re-issuance work (E2E §6.9); factory-reset-button step not executed (no physical button access) | ⛔ unverified |
+
+Additional smoke-run findings (E2E §11) relevant to operations: the ThingsBoard audit log
+stores `secretKey` while valid (§13.3, treat as a secret-bearing store); CE rejects
+wrong/expired claims with a generic `FAILURE` body, so `claim_customer.sh`'s reason-specific exit
+codes (3/4/6) must be re-verified on PE; post-claim lost credentials (device deleted server-side)
+trigger automatic re-provisioning to a **new tenant-owned** entity exactly as for a never-claimed
+device. Assumption 13.6.6 (post-claim lifecycle) is tracked separately in §13.6 and E2E
+§11 item 6.
+
+Because assumptions 1–5 are PE-unverified, **TASK-305 remains open**: before mass production
+handover, execute the E2E scenario (`docs/THINGSBOARD_CLAIMING_E2E_TEST.md`) against the licensed
+target PE instance, record the confirmed PE version/edition above, and re-verify the assumptions.
