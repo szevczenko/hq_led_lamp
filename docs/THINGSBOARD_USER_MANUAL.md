@@ -976,27 +976,45 @@ and keep it in memory for the delivery channel. Issue **once**: any later issue 
 already delivered:
 
 ```bash
-# production side — issue once and capture ONLY the secret (stdout); memory-only, never a file:
-SECRET_VAL="$(scripts/thingsboard/claim_handover.sh klc-kitchen-01 --ttl 3600 --handover 2>/dev/null)"
+# production side — issue once; capture ONLY the secret (stdout; memory-only, never a file)
+# plus the exit status. stderr is NOT redirected: an API/device/credential failure prints
+# its reason there and must abort the handover:
+SECRET_VAL="$(scripts/thingsboard/claim_handover.sh klc-kitchen-01 --ttl 3600 --handover)"
+rc=$?
+# abort unless the issue succeeded AND returned a non-empty secret (see the prose below):
+if [ "$rc" -ne 0 ] || [ -z "$SECRET_VAL" ]; then
+  echo "ERROR: claimingData issue failed (rc=$rc) — aborting the handover, nothing delivered" >&2
+  exit 1
+fi
 # verify (optional, side-effect free): the attribute is present and when it expires — not the secret:
 scripts/thingsboard/claim_handover.sh klc-kitchen-01 --status
 ```
+
+**Abort unless the issue succeeded.** `claim_handover.sh --handover` exits non-zero and prints the
+reason to stderr when the device lookup, the ThingsBoard API call, or the tenant credentials fail
+(e.g. `device ... was not found`). If that happens — or `SECRET_VAL` is empty, meaning no secret
+was captured — **abort the handover here**: deliver nothing and do not continue to `--status` /
+step 3 with an empty or unknown secret. Diagnose (provisioning, section 2.1; key file; §14.4) and
+retry. Continue to the `--status` check and the delivery step (3) only after the issue command
+exited `0` **and** returned a non-empty secret.
 
 The secret is generated crypto-random per device and stored as the SERVER_SCOPE attribute
 `claimingData` (13.3); ThingsBoard also records its value in the server-side audit log (14.4). The
 tenant API key is read at runtime from `TB_TENANT_API_KEY_FILE`; neither the key nor the secret is
 printed or logged — only `--handover` prints the secret (to stdout), and `--status` never shows it.
 
-**3. Handover (out-of-band delivery + Customer User claim).** Deliver the secret captured in step 2
-(`$SECRET_VAL`) through the production channel (waybill / label / e-mail), then the Customer User
-completes the transfer in their own environment. The Customer User must supply
-`TB_CUSTOMER_USERNAME` and `TB_CUSTOMER_PASSWORD` before the call; enter the password without
-placing it in shell history (e.g. `read -rsp`):
+**3. Handover (out-of-band delivery + Customer User claim).** Deliver the secret's *value* from
+step 2 (`SECRET_VAL`) through the production channel (waybill / label / e-mail) — only the value
+travels, never the shell variable — then the Customer User completes the transfer in their own
+shell and re-enters the received secret locally (the two shells share nothing). The Customer User
+must supply `TB_CUSTOMER_USERNAME` and `TB_CUSTOMER_PASSWORD` before the call; enter the password
+and the received secret without placing them in shell history (e.g. `read -rsp`):
 
 ```bash
 # customer side — the Customer User's own shell (NOT the tenant/production shell):
 export TB_CUSTOMER_USERNAME='customer-user@example.com'
 read -rsp 'Customer User password: ' TB_CUSTOMER_PASSWORD && export TB_CUSTOMER_PASSWORD  # not in shell history
+read -rsp 'Claiming secret: ' SECRET_VAL                                                  # paste the received value here; not in shell history
 printf '%s' "$SECRET_VAL" | scripts/thingsboard/claim_customer.sh --secret-stdin klc-kitchen-01 claim   # exit 0 on success
 unset TB_CUSTOMER_PASSWORD SECRET_VAL   # memory-only values die with the shell
 ```
@@ -1005,7 +1023,9 @@ unset TB_CUSTOMER_PASSWORD SECRET_VAL   # memory-only values die with the shell
 key is not accepted by the claim endpoint (§13.2). The test helper
 `scripts/thingsboard/claim_customer.sh setup-test-customer` (test instance only) can create/reuse
 the test Customer User with the tenant API key, but production handover always uses the Customer
-User's own login.
+User's own login. On the customer side, `--secret-stdin` treats an empty or missing paste as a
+usage error (exit 2) and aborts before the claim call — an empty secret is never sent to the claim
+endpoint, so a failed paste fails loudly instead of claiming with an empty value.
 
 Guard rails for the safe order:
 
