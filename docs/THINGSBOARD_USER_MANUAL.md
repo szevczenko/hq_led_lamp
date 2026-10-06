@@ -705,3 +705,106 @@ Hold the factory-reset button (default GPIO0, the **BOOT** button on development
 4. restarts into the Wi-Fi provisioning portal.
 
 The ThingsBoard identity and provisioning credentials are kept, so the device reconnects as the same ThingsBoard device after new Wi-Fi credentials are entered. The button is ignored during an OTA update. The GPIO, polarity and hold time are configured under **Factory reset** in `menuconfig`. The button GPIO must not be one of the lamp output pins; the build fails with `conflicts with KLC_FACTORY_RESET_GPIO` otherwise.
+---
+
+## 13. Handing the Device Over to the Customer (Claiming)
+
+This section documents the chosen claiming flow: how a manufactured and provisioned lamp (registered under the tenant, section 2.1) is handed over to the end customer as a ThingsBoard **Customer** entity. Claiming is a server-side transfer of ownership after provisioning, not an initial registration step.
+
+### 13.1 Chosen method: server-side claiming via `claimingData`
+
+The product uses **server-side claiming** with the `claimingData` attribute. The production process writes `claimingData` as a SERVER_SCOPE attribute of the device, and the Customer User completes the transfer with the Customer Claiming endpoint.
+
+Reasons:
+
+* The lamp has no screen or local UI that could safely display a one-time secret, and the firmware must not generate or store a claiming secret.
+* The Wi-Fi provisioning portal exists but does **not** expose the secret and is not a channel for claiming data.
+* Device-side claiming would require the device to generate the secret itself and someone to read it from the device — there is no secure channel for that on this product.
+
+The flow requires only ThingsBoard configuration and the production process; no firmware or `hq_platform` changes are needed.
+
+### 13.2 Actors and sequence
+
+```text
+production process / tenant (tenant admin)
+    |
+    | 1. device already provisioned and registered under the tenant (section 2.1)
+    v
+production backend
+    | 2. generates a crypto-random one-time secret, unique per device
+    | 3. writes claimingData (SERVER_SCOPE attribute) via the REST API as tenant admin
+    v
+out-of-band channel (waybill / label / e-mail)
+    | 4. secret delivered to the customer, one-time, with a defined validity period
+    v
+Customer User (ThingsBoard PE)
+    | 5. POST /api/customer/device/{deviceName}/claim with the secret
+    v
+device transferred to the Customer
+    |
+    | 6. (customer return / re-issue) DELETE /api/customer/device/{deviceName}/claim
+    v
+device returns to the tenant (reclaim)
+```
+
+Step by step:
+
+1. **Production/tenant:** the device is provisioned exactly as in section 2.1 and exists as a tenant device with its MQTT access token.
+2. **`claimingData`:** the production process generates the secret and writes the `claimingData` SERVER_SCOPE attribute (see 13.3):
+   ```bash
+   curl -X POST "$TB_BASE_URL/api/plugins/telemetry/DEVICE/$DEVICE_ID/attributes/SERVER_SCOPE" \
+     -H "Content-Type: application/json" \
+     -H "X-Authorization: ApiKey <tenant-admin-api-key-from-secure-store>" \
+     -d '{"claimingData":"{\"secretKey\":\"<one-time-secret>\",\"expirationTime\":<expiration-ms>}"}'
+   ```
+   Never put a real API key or a real secret into scripts, documentation, logs, or source control; read keys from a secure store at runtime.
+3. **Out-of-band secret delivery:** the secret reaches the customer through a production channel (shipping label / waybill / e-mail). It is one-time and has a defined validity period.
+4. **Claim by Customer User:** the Customer User calls `POST /api/customer/device/{deviceName}/claim` with `{"secretKey": ...}` (a Customer User JWT is required; the tenant API key cannot perform the claim).
+5. **Reclaim:** `DELETE /api/customer/device/{deviceName}/claim` returns the device to the tenant. Its interaction with the lamp's factory reset (section 12) is an unresolved assumption (13.6).
+
+### 13.3 Claiming secret lifecycle
+
+* **Generation:** by the production process / tenant admin after manufacturing, crypto-random, unique per device.
+* **Storage:** only as the SERVER_SCOPE attribute `claimingData` (`{"secretKey": "...", "expirationTime": <ms>}`) in ThingsBoard PE, with a short validity via `expirationTime`; never in firmware, telemetry, logs, or source code.
+* **Device binding:** the attribute is stored on a specific device ID; the claim endpoint verifies the secret per device.
+* **Delivery:** out-of-band channel (waybill / label / e-mail), one-time, with a defined validity period.
+* **Invalidation:** the claim is one-time (the secret is consumed); `expirationTime` expires it; a wrong claim is rejected; re-issuance means the tenant admin overwrites `claimingData` with a new secret; reclaim via `DELETE /api/customer/device/{deviceName}/claim` returns the device to the tenant.
+* **Logging:** operational events may be logged, but never the secret value.
+
+### 13.4 Trust boundaries
+
+* **Firmware `hq_led_lamp` (no functional changes):** provisioning and MQTT connectivity remain unchanged. The firmware neither initiates nor completes the claim and never knows the claiming secret. Post-claim operation (RPC/telemetry) must require no firmware action; this is confirmed by a regression check, not by a code change. The post-claim lifecycle behavior — reboot, rejected/lost MQTT credentials, and the automatic re-enrollment of section 2.1 — is unverified with respect to device ownership and is listed as unresolved assumption 13.6.6. No local UI is added and the Wi-Fi portal is not modified.
+* **ThingsBoard PE (configuration, not code):** device profile, `claimingData` attribute, Customer + Customer User entities, and the `POST/DELETE /api/customer/device/{deviceName}/claim` endpoints. Edition/version-dependent settings must be confirmed on the target PE (13.6).
+* **Backend/production process:** generates the per-device secret, writes `claimingData` via the REST API as tenant admin, delivers the secret out-of-band, and logs events without the secret value. The production process and customer handle the plaintext secret; ThingsBoard PE also stores and processes it as `claimingData`, so access to that attribute and its tenant-admin/API credentials must be protected.
+* **Customer User:** completes the claim and afterwards has the operational access granted to Customers on the target PE (telemetry, attributes, RPC, OTA — see the unresolved assumptions in 13.6).
+* **`hq_platform`:** no changes. `tb_claim_device()` remains in the platform code but is not part of the product flow (13.7).
+
+### 13.5 Provisioning/MQTT credentials are not the claiming secret
+
+* The provisioning device key/secret (`TB_PROVISION_DEVICE_KEY`, `TB_PROVISION_DEVICE_SECRET`, section 2.1) and the MQTT access token are **never** used as the claiming secret and do not play that role.
+* Per the assumed PE behavior, claiming does not change MQTT credentials (13.6): the device keeps connecting with the same access token after the transfer.
+
+### 13.6 Assumed ThingsBoard version/edition and unresolved assumptions
+
+Target edition/version: **ThingsBoard PE (Professional Edition) ≥ 3.5/3.6**.
+
+The repository facts and the development smoke tests are **not** proof of the target PE behavior. The following must be confirmed on the target PE (https://thingsboard.io/docs/pe/user-guide/claiming/):
+
+1. The `claimingData` format (`secretKey` + `expirationTime` in ms) and the `POST`/`DELETE /api/customer/device/{deviceName}/claim` endpoints were verified in code/tests on CE; confirm them on PE.
+2. MQTT access token behavior after the claim: the PE documentation indicates that claiming does **not** change MQTT credentials (the device keeps connecting with the same token) — confirm on the target PE version.
+3. Visibility of telemetry/attributes/RPC/OTA for the Customer User after the claim (PE vs CE permissions) — test on PE.
+4. Whether PE requires claiming to be enabled at the tenant/profile level — to be confirmed.
+5. Reclaim (`DELETE .../claim`) and its interaction with the lamp's factory reset (section 12) — to be confirmed on PE.
+6. Post-claim lifecycle (reboot, rejected/lost MQTT credentials, automatic provisioning): the plan assumes that after the claim the lamp keeps working with **no firmware action** — reconnecting with the unchanged access token after a reboot and, if the token is later rejected or lost (three consecutive rejections trigger automatic re-enrollment, section 2.1), re-provisioning exactly as before the claim. Whether any of those events changes the device's ownership (Customer assignment / claimed state) is **not** verified. Target-PE regression check: (a) after a successful claim, reboot the lamp and confirm it reconnects with its unchanged token to the same device entity and stays assigned to the Customer; (b) reject or delete the stored access token and let automatic provisioning/re-enrollment run, then confirm what device entity is created, whether the provisioning key/secret still belong to the tenant, whether the new entity is assigned to the Customer, and that neither case silently changes ownership or detaches a claimed device from its Customer.
+
+The lifecycle smoke test in `FIRMWARE_PRODUCTION_READINESS_PLAN.md` §9.5 (server-side `claimingData` + Customer User claim + reclaim) was executed on a development instance (possibly CE) and is a smoke test only; it is not proof of the target PE behavior.
+
+### 13.7 Device-side `tb_claim_device()` is not used in the product flow
+
+`platform/hq_platform/src/thingsboard/tb_claim.c` provides `tb_claim_device()`, which publishes `{"secretKey": "...", "durationMs": ...}` to `v1/devices/me/claim` and returns only the result of the **MQTT publish**. It has no callback confirming that the device was transferred to the Customer — publish success is not claim success. The lamp's product flow (`main/`) does **not** invoke claiming, so `tb_claim_device()` is unused in the product.
+
+If the product conditions change (for example the lamp gains a local UI/QR capable of safely displaying a one-time secret, or device-initiated claiming becomes a requirement), the device-side helper would need to be reinterpreted (contract: publish-only, no claim confirmation) and the change would extend into `hq_platform` as a separate repository, together with the `git.repositories` configuration of the automation.
+
+### 13.8 Rollout order and rollback
+
+Order: decision documentation (this section) → production script → integration tests on PE → firmware regression confirmation → manual update. The firmware does not change, so the functional rollback is removing `claimingData` / reclaiming the device to the tenant (`DELETE .../claim`); already-provisioned lamps keep working unchanged, because claiming is a server-side operation on an existing device.
