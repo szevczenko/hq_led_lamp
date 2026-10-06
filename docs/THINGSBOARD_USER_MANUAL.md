@@ -848,6 +848,69 @@ recorded in `docs/THINGSBOARD_CLAIMING_E2E_TEST.md` §10.1 (facts, not assumptio
   stay unverified, and **TASK-305 remains open** for an environment with a reachable licensed
   ThingsBoard PE instance.
 
+#### Firmware regression confirmation (TASK-306, 2026-10-06)
+
+Firmware regression check after the claim: **no firmware code changes are required**. The standard
+lamp test was run on the physical lamp (`/dev/ttyUSB1`) exactly per the `test_commands` of the
+project configuration: `idf.py fullclean && idf.py build`, then
+`idf.py flash -p /dev/ttyUSB1 && timeout 1m idf.py -p /dev/ttyUSB1 monitor`, with the monitor
+output captured to `/tmp/hq_led_lamp_esp.log` and read (grepped, not assumed):
+
+* **Build/flash:** `kitchen_led_controller v0.1.1` builds and flashes cleanly (no warnings
+  fatal, partition fits, 37% free).
+* **No backtrace/panic:** `grep -E 'Backtrace|Guru Meditation|abort\(\)|PANIC|assert failed'`
+  → no matches in `/tmp/hq_led_lamp_esp.log` (and in the RPC-phase log, see below); the only
+  "failure" line is the normal debug probe `Failed to stat path "/mqtt.json"` during startup.
+* **Normal operation, state machine:** `Firmware: title=kitchen_led_controller version=0.1.1`;
+  `mqtt_cfg: verified transport configured: mqtts://home-assistance.local:8883
+  client_id=klc-kitchen-99`; `Verified TLS connected with validated identity`;
+  `MQTT connected` / `[tb] Connected to ThingsBoard`; `sync source=client` →
+  `sync --sync-complete(thingsboard)--> online (session 1)` — the expected
+  `TLS -> SYNC -> ONLINE` sequence (section 10).
+* **Telemetry:** cross-checked server-side via the test-instance API
+  (`http://home-assistance.local:8080`, tenant API key read at runtime from
+  `/home/dima/projects/hq_workspace/thingboard_tenant_api_key`): fresh telemetry from this run
+  is present for device `klc-kitchen-99` (`connection_state=online`, `uptime_ms≈93 s` matching
+  the fresh boot, `rssi=-37`, `power=false`, `brightness=100`, `pwm_duty=0`, timestamp of this
+  run), and the client attributes (`power`, `brightness`, `red/green/blue`) are readable.
+* **RPC handling:** a live two-way RPC was executed while monitoring the device:
+  `POST /api/rpc/twoway/{deviceId}` with `setState {power:true, brightness:60}` returned
+  `{"success":true,"applied":{...}}`; the device log shows
+  `MQTT RX topic=v1/devices/me/rpc/request/0 payload={"method":"setState",...}` and the state
+  was applied; the restore RPC (`power:false, brightness:100`) was applied the same way and the
+  client attributes returned to the pre-test values. No errors/backtrace in the RPC-phase log.
+* **Device identity unchanged:** the device entity `klc-kitchen-99` was not recreated by this
+  regression run (same entity id and `createdTime` as before, `lamp_controller` type,
+  tenant-owned/public customer, `provisionState=provisioned` — the value from the previous
+  provisioning, not refreshed by any new provisioning). It reconnected with its stored
+  ACCESS_TOKEN (server credential type `ACCESS_TOKEN`, token value never printed); a successful
+  TLS/MQTT connect with the stored identity proves the device token still matches the server
+  credential, and **no re-provisioning occurred** in this run (no `credentials rejected` /
+  `Re-provisioning scheduled` / `/provision/response` log lines).
+* **MQTT access token after claim:** the non-changing behaviour of the MQTT access token after a
+  claim is **confirmed on the development instance (CE 4.3.1.3)** by the TASK-305 smoke run
+  (post-claim reboot: same `client_id`, same device id, same credentials, no re-provisioning —
+  E2E record §6.6) and by this regression run (connect with the stored token, `sync -> online`).
+  It is **not confirmed on PE**: the target **PE ≥ 3.5/3.6** assumption 13.6.2 remains
+  unverified because no licensed PE instance is reachable from this environment (see the PE
+  provisioning attempt above). The statement "the MQTT access token does not change after claim"
+  in the manual therefore holds as *confirmed on CE / documented PE behaviour, to be re-verified
+  on the target PE*.
+* **Firmware does not initiate the claim / does not store the claiming secret:** confirmed —
+  the regression run produced only provisioning/MQTT/telemetry/RPC traffic; no
+  `v1/devices/me/claim` topic activity, no claiming-secret material in the device logs, and no
+  firmware code path invoking claiming (13.1, 13.4, 13.7). The firmware and its configuration
+  are unchanged from the pre-claim state.
+* **`hq_platform` unchanged:** the platform code remains unchanged in this task —
+  `platform/hq_platform` is untouched (`tb_claim_device()` stays in `hq_platform`, unused in the
+  lamp product flow, 13.7); no commit inside `hq_platform` and no `git.repositories` change to
+  the automation configuration were needed because no platform change is required.
+
+The result: the claimed/handed-over lamp operates post-claim with **no firmware action** —
+connectivity, provisioning, telemetry, client attributes, and two-way RPC all work exactly as
+before the claim. The only remaining unpinned item is the PE-specific verification
+(assumptions 13.6.1–13.6.6) on a real licensed PE instance.
+
 ### 13.7 Device-side `tb_claim_device()` is not used in the product flow
 
 `platform/hq_platform/src/thingsboard/tb_claim.c` provides `tb_claim_device()`, which publishes `{"secretKey": "...", "durationMs": ...}` to `v1/devices/me/claim` and returns only the result of the **MQTT publish**. It has no callback confirming that the device was transferred to the Customer — publish success is not claim success. The lamp's product flow (`main/`) does **not** invoke claiming, so `tb_claim_device()` is unused in the product.
