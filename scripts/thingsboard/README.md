@@ -77,6 +77,37 @@ script, with `0600` permissions. The token file is git-ignored
 Use `--device-name` to provision a differently named device, and
 `--device-profile` to select a non-default device profile.
 
+## Claim handover (`claim_handover.sh`)
+
+Tenant-side helper that prepares a device for customer claiming: it generates
+a crypto-random one-time secret and publishes `claimingData` as a
+SERVER_SCOPE attribute (`POST
+/api/plugins/telemetry/DEVICE/{id}/attributes/SERVER_SCOPE`, format per
+`FIRMWARE_PRODUCTION_READINESS_PLAN.md` §9.5). The Customer User later calls
+`POST /api/customer/device/{deviceName}/claim` with the secret (TASK-303).
+
+```bash
+scripts/thingsboard/claim_handover.sh <device-name>              # issue (or re-issue)
+scripts/thingsboard/claim_handover.sh <device-name> --reissue    # explicit re-issuance
+scripts/thingsboard/claim_handover.sh <device-name> --invalidate # delete claimingData
+scripts/thingsboard/claim_handover.sh <device-name> --status     # claim state, never the secret
+scripts/thingsboard/claim_handover.sh <device-name> --handover   # issue + print the secret to stdout
+```
+
+| Variable | Description |
+| --- | --- |
+| `TB_BASE_URL` | ThingsBoard base URL; default `http://home-assistance.local:8080`. |
+| `TB_TENANT_API_KEY_FILE` | Tenant-admin API key file read at runtime; default `/home/dima/projects/hq_workspace/thingboard_tenant_api_key`. |
+| `TB_CLAIM_TTL` | Claim validity in seconds; default 3600 (overridable with `--ttl`). |
+
+The tenant API key and the generated secret are never printed or logged: the
+secret is written to stdout only in the explicit `--handover` mode (all status
+goes to stderr), so it can be piped into the out-of-band delivery channel
+(waybill / label / e-mail). The smoke test (create a throwaway device, issue,
+re-issue, invalidate, handover, delete the device) is described in the script
+header; it is a development smoke test only and not proof of the target PE
+behavior (`docs/THINGSBOARD_USER_MANUAL.md` §13.6).
+
 ## Running the functional tests
 
 The tests are opt-in and skipped by default so they don't run without
