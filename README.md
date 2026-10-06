@@ -17,7 +17,7 @@ are documented in [docs/THINGSBOARD_USER_MANUAL.md](docs/THINGSBOARD_USER_MANUAL
 ```bash
 git clone --recurse-submodules <REPO_URL>
 cd kitchen-led-controller
-source ../esp-idf-v5.5.4/export.sh
+source ${IDF_PATH}/export.sh
 idf.py build
 ```
 

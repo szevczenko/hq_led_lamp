@@ -14,6 +14,53 @@ used to simulate a device.
   (ThingsBoard UI: **Security settings → API keys**, or reuse an existing one).
 - Python 3.10+. No third-party packages are required (standard library only).
 
+## Environment variables
+
+### Lamp LittleFS image (`provision_lamp.sh`)
+
+The five credential variables below are required. Copy
+`device/device_credentials.example.sh` to `device/device_credentials.sh`, fill
+in the values, then source the private file from the project root:
+
+```bash
+source device/device_credentials.sh
+```
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `WIFI_SSID` | Yes | SSID written to the initial `wifi_ap.json`. |
+| `WIFI_PASSWORD` | Yes | Password written with the initial Wi-Fi credential. |
+| `TB_DEVICE_NAME` | Yes | Lamp device name; written as its serial and ThingsBoard name. |
+| `TB_PROVISION_DEVICE_KEY` | Yes | ThingsBoard device-provisioning key written to `provisioning.json`. |
+| `TB_PROVISION_DEVICE_SECRET` | Yes | ThingsBoard device-provisioning secret written to `provisioning.json`. |
+| `TB_DEVICE_PORT` | No | Serial port used to flash; default: `/dev/ttyUSB1`. |
+| `TB_PAYLOAD_DIR` | No | Temporary LittleFS payload directory; default: `/tmp/klc_payload`. |
+| `TB_STORAGE_IMAGE` | No | Output LittleFS image; default: `/tmp/klc_storage.littlefs`. |
+| `LITTLEFS_TOOL` | No | `littlefs_util` command or executable path; default: `littlefs_util` found in `PATH`. |
+| `TB_LITTLEFS_TOOL` | No | Legacy alias for `LITTLEFS_TOOL`; ignored when `LITTLEFS_TOOL` is set. |
+| `TB_SKIP_FLASH` | No | Set to `1` to generate the image without flashing it; default: `0`. |
+
+The provisioner deletes `TB_PAYLOAD_DIR` and `TB_STORAGE_IMAGE` before
+creating them. Use paths that contain only disposable generated data. If
+`littlefs_util` is not installed or is not in `PATH`, set `LITTLEFS_TOOL` to
+its executable path.
+
+### ThingsBoard tools and functional tests
+
+| Variable | Used by | Description |
+| --- | --- | --- |
+| `TB_API_KEY` | `provision_test_device.py`, `ota_deploy.py`, functional tests | Tenant API key. Required by device provisioning and functional tests. OTA uses it in preference to its API-key file option. |
+| `TB_BASE_URL` | Device provisioning, lamp reset, OTA, functional tests | ThingsBoard base URL; default: `http://home-assistance.local:8080`. A command-line `--base-url` overrides it in the command-line tools. |
+| `TB_DEVICE_NAME` | `provision_lamp.sh`, `reset_provisioned_lamp.py` | Required lamp name for image provisioning; optional default for reset (otherwise pass `--device-name`). |
+| `TB_TENANT_API_KEY_FILE` | `reset_provisioned_lamp.py` | Tenant API-key file; default: `thingboard_tenant_api_key` in the project root. `--api-key-file` overrides this value. |
+| `TB_TEST_DEVICE_NAME` | Functional tests | Test device name; default: `klc-test-01`. |
+| `RUN_TB_FUNCTIONAL_TESTS` | Functional tests | Set to `1` to enable network tests; otherwise they are skipped. `TB_API_KEY` must also be set. |
+
+`provision_test_device.py` and `ota_deploy.py` also accept `--device-name`
+or `--device` as applicable; those command-line arguments are not controlled
+by `TB_DEVICE_NAME`. `ota_deploy.py` accepts `--api-key-file` (default:
+`caredentials/thingboard_token`) when `TB_API_KEY` is not set.
+
 ## Provisioning the test device
 
 ```bash

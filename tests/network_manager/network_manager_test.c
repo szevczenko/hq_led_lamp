@@ -768,6 +768,26 @@ static void test_start_rejects_invalid_callbacks(void)
     TEST_ASSERT_EQUAL_UINT(0U, counters.subscribe_calls);
 }
 
+static void test_provisioning_accepts_open_ap_password(void)
+{
+    const hq_net_config_t config = {
+        .backend = HQ_NET_BACKEND_WIFI,
+        .startup_mode = HQ_NET_STARTUP_MODE_PROVISIONING,
+        .provisioning_ap_name = "Kitchen_LED",
+        .provisioning_ap_password = "",
+    };
+    const hq_net_callbacks_t callbacks = {
+        .on_connected = on_connected,
+        .before_disconnected = NULL,
+        .on_disconnected = on_disconnected,
+        .context = NULL,
+    };
+
+    TEST_ASSERT_EQUAL_INT(HQ_NET_OK, hq_net_start(&config, &callbacks));
+    TEST_ASSERT_EQUAL_UINT(1U,
+                           wifi_mgmt_mock_get_counters().set_ap_credentials_calls);
+}
+
 static void test_double_start_is_rejected(void)
 {
     network_callbacks_t cb = make_callbacks(NULL);
@@ -1237,6 +1257,7 @@ int main(void)
 
     /* 7. API contract */
     RUN_TEST(test_start_rejects_invalid_callbacks);
+    RUN_TEST(test_provisioning_accepts_open_ap_password);
     RUN_TEST(test_double_start_is_rejected);
     RUN_TEST(test_failed_start_rolls_back_and_allows_restart);
     RUN_TEST(test_synchronous_connect_rejection_is_startup_failure);
