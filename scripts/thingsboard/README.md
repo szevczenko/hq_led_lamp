@@ -108,6 +108,51 @@ re-issue, invalidate, handover, delete the device) is described in the script
 header; it is a development smoke test only and not proof of the target PE
 behavior (`docs/THINGSBOARD_USER_MANUAL.md` §13.6).
 
+## Claim as a Customer User (`claim_customer.sh`)
+
+Customer-side half of the claiming toolset: logs in as a Customer User
+(`POST /api/auth/login`), claims a device prepared by `claim_handover.sh`
+(`POST /api/customer/device/{deviceName}/claim` with
+`{"secretKey":"<secret>"}`) and releases it back to the tenant
+(`DELETE /api/customer/device/{deviceName}/claim`). The claim/reclaim calls use
+the Customer User JWT, never the tenant API key.
+
+```bash
+scripts/thingsboard/claim_customer.sh <device-name> claim          # default action
+scripts/thingsboard/claim_customer.sh <device-name> reclaim        # return to tenant
+scripts/thingsboard/claim_customer.sh setup-test-customer          # test-env helper (tenant API key)
+```
+
+| Variable | Description |
+| --- | --- |
+| `TB_BASE_URL` | ThingsBoard base URL; default `http://home-assistance.local:8080`. |
+| `TB_CUSTOMER_USERNAME` | Customer User login (e-mail) for claim/reclaim and `setup-test-customer`. |
+| `TB_CUSTOMER_PASSWORD` | Customer User password for claim/reclaim; when set, `setup-test-customer` activates the new user with it. |
+| `TB_CLAIM_SECRET` | One-time claiming secret for `claim` (alternatively `--secret-stdin`). |
+| `TB_CUSTOMER_TITLE` | Test Customer title for `setup-test-customer`; default `KLC Test Customer`. |
+| `TB_TENANT_API_KEY_FILE` | Tenant-admin API key file, used **only** by `setup-test-customer`; default `/home/dima/projects/hq_workspace/thingboard_tenant_api_key`. |
+
+`setup-test-customer` is a test-environment helper that creates/reuses the test
+Customer + Customer User with the tenant API key (per the "Test environment"
+section) and either activates the user with `TB_CUSTOMER_PASSWORD` or prints the
+activation link to stdout. Expected claim rejections are mapped to distinct exit
+codes and the server's reason is logged without the secret: wrong secret (3),
+expired `claimingData` (4), retry after a successful claim (5), device not
+available (6), other HTTP 400 reason (7). On instances that report generic
+rejections ("FAILURE") the reason cannot be told apart and the generic code 7 is
+used. The password, the secret and the JWT are never printed or persisted:
+request bodies travel through process-substitution pipes (`/dev/fd/*`, not
+files on disk), the JWT/API-key header through a process-substitution curl
+config, and responses are held only in memory — nothing sensitive is written
+to a file, so no temporary file has to be cleaned up. Exception: without
+`TB_CUSTOMER_PASSWORD`, `setup-test-customer` prints the activation link (which
+contains the one-time activation token) to stdout — treat it as a credential and
+don't log it. The one-time claiming secret is kept in a shell variable or piped
+via `--secret-stdin`, never written to a file. The smoke test (claim OK, retry,
+reclaim, wrong secret, expired data) is described in the script header; results
+on the dev/test instance are smoke tests only, not proof of the target PE
+behavior (`docs/THINGSBOARD_USER_MANUAL.md` §13.6).
+
 ## Running the functional tests
 
 The tests are opt-in and skipped by default so they don't run without
