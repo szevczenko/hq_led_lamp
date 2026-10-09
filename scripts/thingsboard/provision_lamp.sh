@@ -3,12 +3,18 @@ set -Eeuo pipefail
 umask 077
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PLATFORM_DIR="$PROJECT_DIR/platform/hq_platform"
 PORT="${TB_DEVICE_PORT:-/dev/ttyUSB1}"
 PAYLOAD_DIR="${TB_PAYLOAD_DIR:-/tmp/klc_payload}"
 IMAGE_PATH="${TB_STORAGE_IMAGE:-/tmp/klc_storage.littlefs}"
-LITTLEFS_TOOL="${TB_LITTLEFS_TOOL:-/tmp/littlefs_util}"
+LITTLEFS_TOOL="${LITTLEFS_TOOL:-${TB_LITTLEFS_TOOL:-littlefs_util}}"
 SKIP_FLASH="${TB_SKIP_FLASH:-0}"
+
+if ! command -v "$LITTLEFS_TOOL" >/dev/null 2>&1; then
+  echo "littlefs_util was not found or is not executable: $LITTLEFS_TOOL" >&2
+  echo "Install/build it, then set LITTLEFS_TOOL to its executable path." >&2
+  echo "Source: $PROJECT_DIR/platform/hq_platform/tools/littlefs_util.c" >&2
+  exit 1
+fi
 
 if fuser -s "$PORT"; then
   echo "Serial port $PORT is busy. Stop idf.py monitor before provisioning." >&2
@@ -42,68 +48,7 @@ rm -rf "$PAYLOAD_DIR" "$IMAGE_PATH"
 mkdir -p "$PAYLOAD_DIR/config" "$PAYLOAD_DIR/cert"
 cp "$PROJECT_DIR/server/certs/ca.crt" "$PAYLOAD_DIR/cert/ca.crt"
 
-python3 - "$PAYLOAD_DIR" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-device_name = os.environ["TB_DEVICE_NAME"]
-provision_key = os.environ["TB_PROVISION_DEVICE_KEY"]
-provision_secret = os.environ["TB_PROVISION_DEVICE_SECRET"]
-wifi_ssid = os.environ["WIFI_SSID"]
-wifi_password = os.environ["WIFI_PASSWORD"]
-
-documents = {
-    "config/device.json": {
-        "schema_version": 1,
-        "product": "HQ Lamp",
-        "hardware_revision": "B",
-        "serial": device_name,
-        "thingsboard_name": device_name,
-    },
-    "config/manufacturing.json": {
-        "schema_version": 1,
-        "manufacturing_state": 1,
-        "credential_mode": 1,
-    },
-    "config/mqtt.json": {
-        "schema_version": 1,
-        "hostname": "home-assistance.local",
-        "port": 8883,
-        "tls_mode": "mqtts",
-        "ca_path": "/cert/ca.crt",
-        "client_id": device_name,
-        "auth_mode": "runtime",
-        "skip_verify": False,
-    },
-      "config/provisioning.json": {
-        "schema_version": 1,
-        "device_name": device_name,
-        "provision_device_key": provision_key,
-        "provision_device_secret": provision_secret,
-    },
-    "wifi_ap.json": {
-      "last_use": 0,
-      "credentials": [
-        {"nb": 0, "ssid": wifi_ssid, "password": wifi_password},
-      ],
-    },
-}
-
-for relative_path, document in documents.items():
-    path = root / relative_path
-    path.write_text(json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8")
-PY
-
-cd "$PLATFORM_DIR/tools"
-gcc -std=gnu99 -o "$LITTLEFS_TOOL" littlefs_util.c \
-  ../third_party/littlefs/lfs.c \
-  ../third_party/littlefs/lfs_util.c \
-  ../third_party/littlefs/bd/lfs_filebd.c \
-  -I ../third_party/littlefs \
-  -I ../third_party/littlefs/bd
+python3 "$PROJECT_DIR/scripts/thingsboard/generate_lamp_payload.py" "$PAYLOAD_DIR"
 
 "$LITTLEFS_TOOL" --create "$PAYLOAD_DIR" \
   --out "$IMAGE_PATH" \

@@ -27,6 +27,14 @@ set(KLC_WIFI_AP_NAME "$ENV{KLC_WIFI_AP_NAME}" CACHE STRING
 set(KLC_WIFI_AP_PASSWORD "$ENV{KLC_WIFI_AP_PASSWORD}" CACHE STRING
     "Provisioning AP password for this device build")
 
+if(KLC_WIFI_AP_NAME STREQUAL "")
+    set(KLC_WIFI_AP_NAME "wifi_provisioning")
+endif()
+
+if(KLC_WIFI_AP_PASSWORD STREQUAL "")
+    set(KLC_WIFI_AP_PASSWORD "wifi_provisioning")
+endif()
+
 add_compile_definitions(
     WIFI_AP_NAME="${KLC_WIFI_AP_NAME}"
     WIFI_AP_PASSWORD="${KLC_WIFI_AP_PASSWORD}"
